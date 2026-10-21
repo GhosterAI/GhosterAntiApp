@@ -77,6 +77,10 @@ jobs:
 
       - name: Prepare the desktop bundle
         shell: pwsh
+        env:
+          # GitHub runners already ship the standard x64 Bun runtime, so compile
+          # against it instead of downloading the baseline cross-compile target.
+          GHOSTERANTI_SIDECAR_TARGET: bun-windows-x64
         run: |
           $ErrorActionPreference = "Continue"
           for ($attempt = 1; $attempt -le 3; $attempt++) {

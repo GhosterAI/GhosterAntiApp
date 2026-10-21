@@ -256,7 +256,7 @@ export async function prepareWindowsBundle(
   mkdirSync(binaries, { recursive: true });
   mkdirSync(resources, { recursive: true });
 
-  await (options.compileSidecar ?? ((output) => compileSidecar(cwd, output)))(sidecar);
+  await (options.compileSidecar ?? ((output) => compileSidecar(cwd, output, process.env.GHOSTERANTI_SIDECAR_TARGET || WINDOWS_SIDECAR_TARGET)))(sidecar);
   if (!statSync(sidecar).isFile()) throw new Error("sidecar compiler did not create the expected Windows executable");
 
   const firefox = await installFirefoxRuntime(
