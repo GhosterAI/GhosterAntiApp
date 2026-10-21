@@ -504,7 +504,7 @@ bun run desktop:build:linux
 
 ### Готовый установщик:
 
-Скачайте `GhosterAnti_<версия>_x64-setup.exe` со страницы [Releases](https://github.com/GhosterAI/GhosterAnti/releases). Установщик не подписан сертификатом Authenticode, поэтому SmartScreen может показать предупреждение — это ожидаемо для открытых сборок.
+Скачайте `GhosterAnti_<версия>_x64-setup.exe` со страницы [Releases](https://github.com/GhosterAI/GhosterAntiApp/releases). Установщик не подписан сертификатом Authenticode, поэтому SmartScreen может показать предупреждение — это ожидаемо для открытых сборок.
 
 ---
 

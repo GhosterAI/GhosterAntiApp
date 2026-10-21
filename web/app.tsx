@@ -369,12 +369,12 @@ type IconName = keyof typeof ICONS;
  */
 const PROJECT_LINKS = [
   {
-    href: "https://github.com/GhosterAI/GhosterAnti",
+    href: "https://github.com/GhosterAI/GhosterAntiApp",
     label: "GitHub",
     path: "M12 .3a12 12 0 00-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.9 1.2 1.9 1.2 1.1 1.9 2.9 1.3 3.6 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 016 0C17.4 5.4 18.4 5.7 18.4 5.7c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0012 .3z",
   },
   {
-    href: "https://github.com/GhosterAI/GhosterAnti/issues",
+    href: "https://github.com/GhosterAI/GhosterAntiApp/issues",
     label: "Issues",
     path: "M12 2a10 10 0 100 20 10 10 0 000-20zm0 4a2 2 0 110 4 2 2 0 010-4zm4 11H8v-1.6c0-1.6 2.7-2.4 4-2.4s4 .8 4 2.4V17z",
   },
@@ -3380,7 +3380,7 @@ function App() {
         <div className="sidefoot">
           <a
             className="navitem"
-            href="https://github.com/GhosterAI/GhosterAnti/issues"
+            href="https://github.com/GhosterAI/GhosterAntiApp/issues"
             target="_blank"
             rel="noreferrer"
             data-tip={t("Support")}

@@ -118,7 +118,7 @@ jobs:
             platforms = [ordered]@{
               "windows-x86_64" = [ordered]@{
                 signature = (Get-Content $signature -Raw).Trim()
-                url = "https://github.com/GhosterAI/GhosterAnti/releases/download/$tag/$($installer.Name)"
+                url = "https://github.com/GhosterAI/GhosterAntiApp/releases/download/$tag/$($installer.Name)"
               }
             }
           }

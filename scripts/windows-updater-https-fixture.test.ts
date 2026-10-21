@@ -10,7 +10,7 @@ import {
 const version = "0.1.0-beta.46";
 const tag = `v${version}`;
 const installerName = `GhosterAnti_${version}_x64-setup.exe`;
-const releaseBase = `/GhosterAI/GhosterAnti/releases/download/${tag}`;
+const releaseBase = `/GhosterAI/GhosterAntiApp/releases/download/${tag}`;
 const config = normalizeFixtureConfig({
   candidateVersion: version,
   manifestUrl: `https://github.com${releaseBase}/latest-v2.json`,
@@ -54,7 +54,7 @@ describe("Windows updater HTTPS fixture", () => {
     for (const request of [
       ["POST", "api.github.com", RELEASES_ROUTE],
       ["GET", "api.github.com:443", RELEASES_ROUTE],
-      ["GET", "api.github.com", "/repos/GhosterAI/GhosterAnti/releases?per_page=100"],
+      ["GET", "api.github.com", "/repos/GhosterAI/GhosterAntiApp/releases?per_page=100"],
       ["GET", "github.com", `${config.manifestRoute}?download=1`],
       ["GET", "github.com", `${config.installerRoute}.sig`],
       ["GET", "objects.githubusercontent.com", config.installerRoute],

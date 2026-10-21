@@ -862,8 +862,8 @@ test("the second accent marks identity, and the credit matches the website", () 
 
 test("the project links match the site footer and this repository", () => {
   // The GitHub URL is this repo's own origin — the two cannot drift apart.
-  expect(app).toContain('href: "https://github.com/GhosterAI/GhosterAnti"');
-  expect(app).toContain('href: "https://github.com/GhosterAI/GhosterAnti/issues"');
+  expect(app).toContain('href: "https://github.com/GhosterAI/GhosterAntiApp"');
+  expect(app).toContain('href: "https://github.com/GhosterAI/GhosterAntiApp/issues"');
   // Outbound links from a desktop shell must not hand the opener over.
   const links = app.slice(app.indexOf("const PROJECT_LINKS"), app.indexOf("] as const;", app.indexOf("const PROJECT_LINKS")));
   expect(links).toContain("github.com");
@@ -914,7 +914,7 @@ test("the sidebar offers extension management in both modes and a support link",
   const extensions = nav.slice(nav.lastIndexOf("<button", nav.indexOf('data-tip={t("Manage extensions")}')), nav.indexOf("</button>", nav.indexOf('data-tip={t("Manage extensions")}')));
   expect(extensions).not.toContain("isCloudMode");
   // Small support entry that opens the issue tracker.
-  expect(app).toContain('href="https://github.com/GhosterAI/GhosterAnti/issues"');
+  expect(app).toContain('href="https://github.com/GhosterAI/GhosterAntiApp/issues"');
   expect(app).toContain('<Icon name="help" /><span className="navlabel">{t("Support")}</span>');
   expect(styles).toContain("a.navitem");
 });

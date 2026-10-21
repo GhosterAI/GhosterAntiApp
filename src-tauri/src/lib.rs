@@ -29,8 +29,8 @@ use tauri_plugin_shell::ShellExt;
 const IMPORT_RESTRICTION: &str = "Windows DPAPI protects persisted browser secrets, so this import works only for the same Windows machine and account. Persisted persona fields are preserved, but runtime or browser differences can change the account-visible fingerprint.";
 
 const ALLOWED_EXTERNAL_URLS: [&str; 6] = [
-    "https://github.com/GhosterAI/GhosterAnti",
-    "https://github.com/GhosterAI/GhosterAnti/issues",
+    "https://github.com/GhosterAI/GhosterAntiApp",
+    "https://github.com/GhosterAI/GhosterAntiApp/issues",
     "https://ghosteranti.com/terms/",
     "https://ghosteranti.com/privacy/",
     "https://ghosteranti.com/acceptable-use/",
@@ -282,8 +282,8 @@ mod tests {
     #[test]
     fn allows_only_explicit_external_pages() {
         for url in [
-            "https://github.com/GhosterAI/GhosterAnti",
-            "https://github.com/GhosterAI/GhosterAnti/issues",
+            "https://github.com/GhosterAI/GhosterAntiApp",
+            "https://github.com/GhosterAI/GhosterAntiApp/issues",
             "https://ghosteranti.com/terms/",
             "https://ghosteranti.com/privacy/",
             "https://ghosteranti.com/acceptable-use/",

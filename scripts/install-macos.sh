@@ -4,7 +4,7 @@
 # --agent-setup also connects installed AI agent clients and prints the helper's JSON result.
 set -euo pipefail
 
-repo="https://github.com/GhosterAI/GhosterAnti"
+repo="https://github.com/GhosterAI/GhosterAntiApp"
 # A local file:// base lets the build pipeline test an unpublished release.
 base="${GHOSTERANTI_RELEASE_BASE:-$repo/releases/download}"
 version=""
@@ -27,7 +27,7 @@ done
 
 if [[ -z "$version" ]]; then
   # The newest release that has a macOS build; the API lists releases newest first.
-  version="$(curl -fsSL "https://api.github.com/repos/GhosterAI/GhosterAnti/releases?per_page=20" \
+  version="$(curl -fsSL "https://api.github.com/repos/GhosterAI/GhosterAntiApp/releases?per_page=20" \
     | grep -o 'GhosterAnti_[^"/]*_aarch64\.app\.tar\.gz' | head -n 1 \
     | sed -e 's/^GhosterAnti_//' -e 's/_aarch64\.app\.tar\.gz$//')" || true
   [[ -n "$version" ]] || fail "no macOS release was found"

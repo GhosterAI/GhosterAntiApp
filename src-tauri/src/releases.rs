@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 const RELEASES_API: &str =
-    "https://api.github.com/repos/GhosterAI/GhosterAnti/releases?per_page=10";
+    "https://api.github.com/repos/GhosterAI/GhosterAntiApp/releases?per_page=10";
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const UPDATE_MANIFEST: &str = "latest-v2.json";
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -143,7 +143,7 @@ fn is_release_asset_url(url: &Url, tag: &str, name: &str) -> bool {
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
-        && url.path() == format!("/GhosterAI/GhosterAnti/releases/download/{tag}/{name}")
+        && url.path() == format!("/GhosterAI/GhosterAntiApp/releases/download/{tag}/{name}")
 }
 
 fn release_manifest_url(release: &GithubRelease) -> Option<Url> {
@@ -639,7 +639,7 @@ mod tests {
 
     fn manifest_url(tag: &str) -> String {
         format!(
-            "https://github.com/GhosterAI/GhosterAnti/releases/download/{tag}/{UPDATE_MANIFEST}"
+            "https://github.com/GhosterAI/GhosterAntiApp/releases/download/{tag}/{UPDATE_MANIFEST}"
         )
     }
 
@@ -776,10 +776,10 @@ mod tests {
         let valid = Url::parse(&manifest_url(tag)).unwrap();
         assert!(is_release_asset_url(&valid, tag, UPDATE_MANIFEST));
         for invalid in [
-            "http://github.com/GhosterAI/GhosterAnti/releases/download/v0.1.0-beta.36/latest-v2.json",
-            "https://example.com/GhosterAI/GhosterAnti/releases/download/v0.1.0-beta.36/latest-v2.json",
+            "http://github.com/GhosterAI/GhosterAntiApp/releases/download/v0.1.0-beta.36/latest-v2.json",
+            "https://example.com/GhosterAI/GhosterAntiApp/releases/download/v0.1.0-beta.36/latest-v2.json",
             "https://github.com/other/ghosteranti/releases/download/v0.1.0-beta.36/latest-v2.json",
-            "https://github.com/GhosterAI/GhosterAnti/releases/download/v0.1.0-beta.36/latest-v2.json?raw=1",
+            "https://github.com/GhosterAI/GhosterAntiApp/releases/download/v0.1.0-beta.36/latest-v2.json?raw=1",
         ] {
             assert!(!is_release_asset_url(
                 &Url::parse(invalid).unwrap(),
@@ -801,7 +801,7 @@ mod tests {
             assets: vec![GithubAsset {
                 name: "latest.json".to_owned(),
                 browser_download_url: format!(
-                    "https://github.com/GhosterAI/GhosterAnti/releases/download/{tag}/latest.json"
+                    "https://github.com/GhosterAI/GhosterAntiApp/releases/download/{tag}/latest.json"
                 ),
             }],
         };
@@ -813,7 +813,7 @@ mod tests {
     fn binds_manifest_to_release_version_target_and_installer() {
         let candidate = candidate("0.1.0-beta.36");
         let installer = format!(
-            "https://github.com/GhosterAI/GhosterAnti/releases/download/v0.1.0-beta.36/{}",
+            "https://github.com/GhosterAI/GhosterAntiApp/releases/download/v0.1.0-beta.36/{}",
             update_artifact_name(&candidate.version)
         );
         let installer = installer.as_str();

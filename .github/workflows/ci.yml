@@ -945,7 +945,7 @@ jobs:
             Pop-Location
           }
       - name: Smoke-test authenticated Cloud proxies
-        if: github.repository != 'GhosterAI/GhosterAnti'
+        if: github.repository != 'GhosterAI/GhosterAntiApp'
         shell: pwsh
         env:
           GHOSTERANTI_LIVE_PROXY_HOST: ${{ secrets.GHOSTERANTI_LIVE_PROXY_HOST }}

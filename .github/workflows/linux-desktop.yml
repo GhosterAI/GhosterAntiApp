@@ -521,7 +521,7 @@ jobs:
           tar --hard-dereference -czf "$work/$archive" -C "$work" GhosterAnti
           rm -rf "$work/GhosterAnti" src-tauri/target/release/bundle/deb
           TAURI_SIGNING_PRIVATE_KEY="$(cat "$work/update.key")" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" bunx tauri signer sign "$work/$archive" > /dev/null
-          url="https://github.com/GhosterAI/GhosterAnti/releases/download/v$successor/$archive"
+          url="https://github.com/GhosterAI/GhosterAntiApp/releases/download/v$successor/$archive"
           jq -n --arg version "$successor" --arg url "$url" --arg signature "$(cat "$work/$archive.sig")" \
             '{version: $version, platforms: {"linux-x86_64": {url: $url, signature: $signature}}}' > "$work/latest-linux.json"
           {
@@ -545,8 +545,8 @@ jobs:
             candidateVersion: $version,
             manifestName: "latest-linux.json",
             installerName: $archive,
-            manifestUrl: "https://github.com/GhosterAI/GhosterAnti/releases/download/v\($version)/latest-linux.json",
-            installerUrl: "https://github.com/GhosterAI/GhosterAnti/releases/download/v\($version)/\($archive)",
+            manifestUrl: "https://github.com/GhosterAI/GhosterAntiApp/releases/download/v\($version)/latest-linux.json",
+            installerUrl: "https://github.com/GhosterAI/GhosterAntiApp/releases/download/v\($version)/\($archive)",
             manifestPath: "\($work)/latest-linux.json",
             installerPath: "\($work)/\($archive)",
             certificatePath: "\($work)/leaf.pem",
@@ -557,7 +557,7 @@ jobs:
           echo "127.0.0.1 github.com api.github.com" | sudo tee -a /etc/hosts > /dev/null
           sudo -b "$(command -v node)" "$GITHUB_WORKSPACE/scripts/windows-updater-https-fixture.mjs" "$work/fixture.json"
           for attempt in $(seq 1 30); do [[ -f fixture-state.json ]] && break; sleep 1; done
-          curl --fail --silent --show-error "https://api.github.com/repos/GhosterAI/GhosterAnti/releases?per_page=10" | jq -e --arg tag "v$SUCCESSOR" '.[0].tag_name == $tag'
+          curl --fail --silent --show-error "https://api.github.com/repos/GhosterAI/GhosterAntiApp/releases?per_page=10" | jq -e --arg tag "v$SUCCESSOR" '.[0].tag_name == $tag'
       - name: Update through the dashboard and verify the relaunched app
         timeout-minutes: 15
         shell: bash

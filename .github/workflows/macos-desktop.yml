@@ -421,7 +421,7 @@ jobs:
           archive="GhosterAnti_${successor}_aarch64.app.tar.gz"
           tar -czf "$work/$archive" -C "$BUNDLE/macos" GhosterAnti.app
           TAURI_SIGNING_PRIVATE_KEY="$(cat "$work/update.key")" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" bunx tauri signer sign "$work/$archive" > /dev/null
-          url="https://github.com/GhosterAI/GhosterAnti/releases/download/v$successor/$archive"
+          url="https://github.com/GhosterAI/GhosterAntiApp/releases/download/v$successor/$archive"
           jq -n --arg version "$successor" --arg url "$url" --arg signature "$(cat "$work/$archive.sig")" \
             '{version: $version, platforms: {"darwin-aarch64": {url: $url, signature: $signature}}}' > "$work/latest-macos.json"
           {
@@ -444,8 +444,8 @@ jobs:
             candidateVersion: $version,
             manifestName: "latest-macos.json",
             installerName: $archive,
-            manifestUrl: "https://github.com/GhosterAI/GhosterAnti/releases/download/v\($version)/latest-macos.json",
-            installerUrl: "https://github.com/GhosterAI/GhosterAnti/releases/download/v\($version)/\($archive)",
+            manifestUrl: "https://github.com/GhosterAI/GhosterAntiApp/releases/download/v\($version)/latest-macos.json",
+            installerUrl: "https://github.com/GhosterAI/GhosterAntiApp/releases/download/v\($version)/\($archive)",
             manifestPath: "\($work)/latest-macos.json",
             installerPath: "\($work)/\($archive)",
             certificatePath: "\($work)/leaf.pem",
@@ -458,7 +458,7 @@ jobs:
           sudo killall -HUP mDNSResponder || true
           sudo -b "$(command -v node)" "$GITHUB_WORKSPACE/scripts/windows-updater-https-fixture.mjs" "$work/fixture.json"
           for attempt in $(seq 1 30); do [[ -f fixture-state.json ]] && break; sleep 1; done
-          curl --fail --silent --show-error --cacert ca.pem "https://api.github.com/repos/GhosterAI/GhosterAnti/releases?per_page=10" | jq -e --arg tag "v$SUCCESSOR" '.[0].tag_name == $tag'
+          curl --fail --silent --show-error --cacert ca.pem "https://api.github.com/repos/GhosterAI/GhosterAntiApp/releases?per_page=10" | jq -e --arg tag "v$SUCCESSOR" '.[0].tag_name == $tag'
       - name: Update through the dashboard and verify the relaunched app
         timeout-minutes: 15
         shell: bash
