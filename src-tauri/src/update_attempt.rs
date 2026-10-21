@@ -1077,7 +1077,11 @@ mod linux_tests {
             fs::read_to_string(root.join("bin").join("ghosteranti")).unwrap(),
             "new"
         );
-        assert!(!root.join("lib").join("GhosterAnti").join("old-only").exists());
+        assert!(!root
+            .join("lib")
+            .join("GhosterAnti")
+            .join("old-only")
+            .exists());
         let mode = fs::metadata(root.join("lib/GhosterAnti/firefox/ghosteranti"))
             .unwrap()
             .permissions()

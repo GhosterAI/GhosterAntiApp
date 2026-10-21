@@ -14,7 +14,8 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 use url::Url;
 
-const RELEASES_API: &str = "https://api.github.com/repos/GhosterAI/GhosterAnti/releases?per_page=10";
+const RELEASES_API: &str =
+    "https://api.github.com/repos/GhosterAI/GhosterAnti/releases?per_page=10";
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const UPDATE_MANIFEST: &str = "latest-v2.json";
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -235,7 +236,9 @@ fn validate_manifest_result(
         &candidate.tag,
         &update_artifact_name(&candidate.version),
     ) {
-        return Err("release manifest installer URL was not an GhosterAnti release asset".to_owned());
+        return Err(
+            "release manifest installer URL was not an GhosterAnti release asset".to_owned(),
+        );
     }
 
     let raw_version = raw_json
@@ -374,7 +377,9 @@ pub fn last_update_result(app: AppHandle) -> Result<Option<LastUpdateResult>, St
 fn restart_after_install_failure(app: AppHandle, error: impl std::fmt::Display) {
     eprintln!("GhosterAnti update installation failed: {error}");
     app.dialog()
-        .message("GhosterAnti could not start the verified update. The current version will restart.")
+        .message(
+            "GhosterAnti could not start the verified update. The current version will restart.",
+        )
         .title("GhosterAnti update failed")
         .kind(MessageDialogKind::Error)
         .buttons(MessageDialogButtons::Ok)
@@ -633,7 +638,9 @@ mod tests {
     use url::Url;
 
     fn manifest_url(tag: &str) -> String {
-        format!("https://github.com/GhosterAI/GhosterAnti/releases/download/{tag}/{UPDATE_MANIFEST}")
+        format!(
+            "https://github.com/GhosterAI/GhosterAnti/releases/download/{tag}/{UPDATE_MANIFEST}"
+        )
     }
 
     fn release(tag: &str, draft: bool, prerelease: bool, manifest_count: usize) -> GithubRelease {

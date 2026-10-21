@@ -1,0 +1,118 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish (must match package.json)
+        required: true
+        type: string
+      prerelease:
+        description: Publish as a pre-release
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the requested version
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $desktop = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($env:VERSION -cne $package -or $env:VERSION -cne $desktop) {
+            throw "requested version '$env:VERSION' does not match package.json '$package' and tauri.conf.json '$desktop'"
+          }
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download the pinned Firefox engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/aliasmode/aliasmode-firefox/releases/download/aliasmode-runtime-156.0.1-beta.36-r7/aliasmode-156.0.1-beta.36-win.x86_64.zip"
+          $dest = Join-Path $env:RUNNER_TEMP "aliasmode-156.0.1-beta.36-win.x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $dest
+          $hash = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "83ccb1a266e0c65cb195f60ed9e647a15ba5781710c3aab6882d602dc8c49f27") {
+            throw "engine archive SHA-256 mismatch: $hash"
+          }
+          "GHOSTERANTI_FIREFOX_ARCHIVE=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GHOSTERANTI_FIREFOX_ARCHIVE_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GHOSTERANTI_FIREFOX_EXECUTABLE_SHA256=acea9ae405d02240a7a610a0048ba7c3fcaf21bd3c6dd6eb4eaf1d58fc87719a" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Prepare the desktop bundle
+        run: bun run desktop:prepare
+
+      - name: Build the installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bunx tauri build --bundles nsis --no-sign
+
+      - name: Collect release assets
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = "src-tauri/target/release/bundle/nsis"
+          $installer = Get-ChildItem $bundle -Filter "*_x64-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "installer was not produced" }
+          $signature = "$($installer.FullName).sig"
+          if (-not (Test-Path $signature)) { throw "installer signature was not produced" }
+          $manifest = Join-Path $bundle "latest.json"
+          if (-not (Test-Path $manifest)) { throw "updater manifest was not produced" }
+          Copy-Item $manifest (Join-Path $bundle "latest-v2.json") -Force
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          Copy-Item $installer.FullName release-assets/
+          Copy-Item $signature release-assets/
+          Copy-Item (Join-Path $bundle "latest-v2.json") release-assets/
+          Get-ChildItem release-assets | Select-Object Name, Length
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $notes = @"
+          Windows x64 build of GhosterAnti $env:VERSION.
+
+          - NSIS installer for Windows 10 and 11 (x64)
+          - Signed updater manifest for in-app updates
+
+          The installer bundles GhosterAnti Chromium support, the GhosterAnti Firefox engine, and the local agent runtime. CloakBrowser profiles download their engine on first use.
+          "@
+          $notes | Out-File -FilePath release-notes.md -Encoding utf8
+          $args = @("release", "create", "v$env:VERSION", "--title", "GhosterAnti $env:VERSION", "--notes-file", "release-notes.md")
+          if ($env:PRERELEASE -eq "true") { $args += "--prerelease" }
+          $args += (Get-ChildItem release-assets | ForEach-Object { $_.FullName })
+          & gh @args
+          if ($LASTEXITCODE -ne 0) { throw "release creation failed" }
