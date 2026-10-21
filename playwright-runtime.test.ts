@@ -1,0 +1,2249 @@
+import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { runInNewContext } from "node:vm";
+import {
+  playwrightWorkerCommand,
+  playwrightWorkerEnvironment,
+  resolvePlaywrightRuntime,
+  runPlaywrightWorker,
+  verifyPlaywrightRuntime,
+} from "./playwright-runtime.ts";
+import { captureSession, operatePersistentContext, restoreSession } from "./playwright-worker.mjs";
+
+const PACKAGED_NODE = process.platform === "win32" ? "node.exe" : "node";
+
+/** Bun started under the name `node` drops process.argv[1] after --eval, so this Node is a wrapper script. */
+async function fakePackagedNode(root: string): Promise<void> {
+  await writeFile(join(root, "node", PACKAGED_NODE), `#!/bin/sh\nexec '${process.execPath}' "$@"\n`, { mode: 0o755 });
+}
+
+const bunAsNodeTest = process.platform === "win32" ? test.skip : test;
+
+test("Firefox capture distinguishes a closed window from a live blank page", async () => {
+  for (const urls of [[], ["about:blank"], ["https://one.example/", "https://one.example/"]]) {
+    const context = {
+      pages: () => urls.map((url) => ({ url: () => url, evaluate: async () => ({ origin: new URL(url).origin, localStorage: [] }) })),
+      cookies: async () => [],
+    };
+    const captured = JSON.parse(await captureSession({ contexts: () => [context] }, {}, { nativeStorage: true }));
+    expect(captured.tabs).toEqual(urls.length ? urls.filter((url) => url !== "about:blank") : undefined);
+    expect(captured.cookies).toEqual([]);
+  }
+});
+
+test("uses packaged Node bootstrap and keeps requests off argv", () => {
+  const runtime = "C:\\GhosterAnti\\playwright";
+  const command = playwrightWorkerCommand(runtime);
+  expect(command[0]).toBe(join(runtime, "node", PACKAGED_NODE));
+  expect(command.slice(1, 3)).toEqual(["--input-type=module", "--eval"]);
+  expect(command[3]).toContain("await import");
+  expect(command[4]).toBe(join(runtime, "worker.mjs"));
+});
+
+test("resolves source workers beside the Bun entrypoint under Node from PATH", () => {
+  const sourceRoot = join("source", "ghosteranti");
+  expect(resolvePlaywrightRuntime({ env: {}, sourceRoot })).toEqual({
+    kind: "source",
+    root: sourceRoot,
+    nodeExecutable: "node",
+    workerPath: join(sourceRoot, "playwright-worker.mjs"),
+  });
+});
+
+test("resolves source workers beside the runtime module, not the command entrypoint", () => {
+  expect(resolvePlaywrightRuntime({ env: {} })).toEqual({
+    kind: "source",
+    root: import.meta.dir,
+    nodeExecutable: "node",
+    workerPath: join(import.meta.dir, "playwright-worker.mjs"),
+  });
+});
+
+test("worker inherits normal environment without Node hooks or app secrets", () => {
+  expect(playwrightWorkerEnvironment({
+    SystemRoot: "C:\\Windows",
+    PATH: "C:\\Windows\\System32",
+    Node_Options: "--require injected.js",
+    NODE_PATH: "C:\\untrusted",
+    GHOSTERANTI_DESKTOP_NONCE: "private",
+    cloakbrowser_license_key: "private",
+    HUB_PASSWORD: "private",
+  })).toEqual({
+    SystemRoot: "C:\\Windows",
+    PATH: "C:\\Windows\\System32",
+  });
+});
+
+function textStream(value: string): ReadableStream<Uint8Array> {
+  return new Response(value).body as ReadableStream<Uint8Array>;
+}
+
+function fakeWorker(output: string, exit = 0, onKill?: () => void, errorOutput = "") {
+  return {
+    stdin: { write() {}, end() {} },
+    stdout: textStream(output),
+    stderr: textStream(errorOutput),
+    exited: Promise.resolve(exit),
+    kill() { onKill?.(); },
+  };
+}
+
+const success = (result: unknown) => JSON.stringify({ version: 1, ok: true, result });
+
+test("worker request uses stdin and keeps endpoint and secrets off argv", async () => {
+  const endpoint = "ws://user:secret@127.0.0.1/browser";
+  let argv: string[] = [];
+  let input = "";
+  const runtime = "/fake/runtime";
+  const payload = {
+    endpoint,
+    token: "private",
+    captureSeed: { origins: ["https://private-origin.example"] },
+  };
+  await runPlaywrightWorker("session-capture", payload, {
+    runtimeRoot: runtime,
+    spawn(command) {
+      argv = command;
+      const worker = fakeWorker(success("bundle"));
+      worker.stdin.write = ((value: string) => { input += value; }) as typeof worker.stdin.write;
+      return worker;
+    },
+  });
+  expect(argv[0]).toBe(join(runtime, "node", PACKAGED_NODE));
+  expect(argv.slice(1, 3)).toEqual(["--input-type=module", "--eval"]);
+  expect(argv[4]).toBe(join(runtime, "worker.mjs"));
+  expect(argv.join(" ")).not.toContain("secret");
+  expect(argv.join(" ")).not.toContain("private");
+  expect(argv.join(" ")).not.toContain("private-origin");
+  expect(JSON.parse(input).payload).toEqual(payload);
+});
+
+test("worker timeout kills only the worker and waits for its exit", async () => {
+  let killed = false;
+  let resolveExit!: (code: number) => void;
+  const exited = new Promise<number>((resolve) => { resolveExit = resolve; });
+  let closeOutput!: () => void;
+  const stdout = new ReadableStream<Uint8Array>({ start(controller) { closeOutput = () => controller.close(); } });
+  const result = runPlaywrightWorker("page", { endpoint: "ws://browser" }, {
+    timeoutMs: 5,
+    spawn: () => ({
+      stdin: { write() {}, end() {} },
+      stdout, stderr: textStream(""), exited,
+      kill() { killed = true; closeOutput(); },
+    }),
+  }).then(() => null, (error) => error);
+  await Bun.sleep(10);
+  expect(killed).toBe(true);
+  resolveExit(137);
+  expect(await result).toMatchObject({ code: "timeout" });
+});
+
+test("capture worker timeout reports only the outer deadline, not a guessed browser stage", async () => {
+  const error = await runPlaywrightWorker("session-capture", { endpoint: "ws://private" }, {
+    timeoutMs: 5,
+    spawn: () => ({
+      ...fakeWorker(""),
+      exited: new Promise<number>(() => {}),
+    }),
+  }).then(() => null, (failure) => failure);
+  expect(error).toMatchObject({
+    code: "timeout",
+    details: { operation: "worker_timeout", outcome: "timeout", workerOperation: "session-capture" },
+  });
+  expect(JSON.stringify(error)).not.toContain("private");
+});
+
+test("worker timeout returns when kill and exit confirmation fail", async () => {
+  let killed = false;
+  const hangingStream = () => new ReadableStream<Uint8Array>({ start() {} });
+  const result = runPlaywrightWorker("page", { endpoint: "ws://browser" }, {
+    timeoutMs: 5,
+    spawn: () => ({
+      stdin: { write() {}, end() {} },
+      stdout: hangingStream(),
+      stderr: hangingStream(),
+      exited: new Promise<number>(() => {}),
+      kill() { killed = true; throw new Error("failed"); },
+    }),
+  }).then(() => null, (error) => error);
+  const outcome = await Promise.race([result, Bun.sleep(100).then(() => "hung")]);
+  expect(killed).toBe(true);
+  expect(outcome).not.toBe("hung");
+  expect(outcome).toMatchObject({ code: "timeout" });
+});
+
+test("worker reports secret-safe response diagnostics without affecting the parent", async () => {
+  const abrupt = await runPlaywrightWorker("page", { endpoint: "ws://browser" }, {
+    spawn: () => fakeWorker("", 9, undefined, "private stderr"),
+  }).then(() => null, (error) => error);
+  expect(abrupt).toMatchObject({
+    code: "runtime_unavailable",
+    details: {
+      workerOperation: "page",
+      responseCategory: "empty_stdout",
+      stdoutBytes: 0,
+      exitCode: 9,
+      stderrPresent: true,
+    },
+  });
+  expect(abrupt.message).toBe("Playwright worker page failed: empty_stdout, 0 stdout bytes, exit 9, stderr present");
+  expect(abrupt.message).not.toContain("private");
+
+  const malformed = await runPlaywrightWorker("page", { endpoint: "ws://browser" }, {
+    spawn: () => fakeWorker("{broken", 0),
+  }).then(() => null, (error) => error);
+  expect(malformed).toMatchObject({
+    code: "invalid_response",
+    details: {
+      workerOperation: "page",
+      responseCategory: "malformed_json",
+      stdoutBytes: 7,
+      exitCode: 0,
+      stderrPresent: false,
+    },
+  });
+  expect(1 + 1).toBe(2);
+});
+
+test("worker distinguishes a wrong protocol shape", async () => {
+  const error = await runPlaywrightWorker("page", { endpoint: "ws://browser" }, {
+    spawn: () => fakeWorker(JSON.stringify({ version: 2, ok: true, result: null }), 0),
+  }).then(() => null, (failure) => failure);
+  expect(error).toMatchObject({
+    code: "invalid_response",
+    details: {
+      workerOperation: "page",
+      responseCategory: "wrong_protocol_shape",
+      stdoutBytes: 37,
+      exitCode: 0,
+      stderrPresent: false,
+    },
+  });
+});
+
+test("worker distinguishes success output with a nonzero exit", async () => {
+  const error = await runPlaywrightWorker("page", { endpoint: "ws://browser" }, {
+    spawn: () => fakeWorker(success("sentinel result"), 9, undefined, "sentinel stderr"),
+  }).then(() => null, (failure) => failure);
+  expect(error).toMatchObject({
+    code: "operation_failed",
+    details: {
+      workerOperation: "page",
+      responseCategory: "success_nonzero_exit",
+      exitCode: 9,
+      stderrPresent: true,
+    },
+  });
+  expect(JSON.stringify(error)).not.toContain("sentinel");
+});
+
+bunAsNodeTest("bootstrap returns a structured error when the worker cannot load", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-bootstrap-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await fakePackagedNode(root);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const error = await runPlaywrightWorker("page", { endpoint: "ws://browser" }, {
+      runtimeRoot: root,
+      timeoutMs: 1_000,
+    }).then(() => null, (failure) => failure);
+    expect(error).toMatchObject({ code: "runtime_unavailable" });
+    expect(error.details).toBeUndefined();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("source worker loads pinned dependencies under Node from PATH", async () => {
+  const error = await runPlaywrightWorker("page", {}, { timeoutMs: 10_000 })
+    .then(() => null, (failure) => failure);
+  expect(error).toMatchObject({ code: "invalid_request" });
+});
+
+bunAsNodeTest("importing the worker has no stdin or stdout side effects", async () => {
+  const worker = pathToFileURL(join(import.meta.dir, "playwright-worker.mjs")).href;
+  const child = Bun.spawn(["node", "--input-type=module", "--eval", `await import(${JSON.stringify(worker)})`], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  expect(exitCode).toBe(0);
+  expect(stdout).toBe("");
+  expect(stderr).toBe("");
+});
+
+test("native capture reads closed observed origins through storageState without CDP", async () => {
+  let storageStateCalls = 0;
+  const registered: string[] = [];
+  const context = {
+    pages: () => [],
+    _connection: {
+      toImpl(value: unknown) {
+        expect(value).toBe(context);
+        return { addVisitedOrigin: (origin: string) => registered.push(origin) };
+      },
+    },
+    async cookies() { return []; },
+    async storageState(options: unknown) {
+      storageStateCalls++;
+      expect(options).toEqual({ indexedDB: false });
+      return {
+        origins: [{
+          origin: "https://closed.example",
+          localStorage: [{ name: "session", value: "fresh" }],
+          indexedDB: [{ name: "unrelated", version: 1, stores: [] }],
+        }],
+      };
+    },
+    async newCDPSession() { throw new Error("Firefox capture must not use CDP"); },
+  };
+  const result = JSON.parse(await captureSession({ contexts: () => [context] }, {
+    captureSeed: { origins: ["https://closed.example"] },
+  }, { nativeStorage: true }));
+  expect(storageStateCalls).toBe(1);
+  expect(registered).toEqual(["https://closed.example"]);
+  expect(result).toEqual({
+    cookies: [],
+    origins: [{ origin: "https://closed.example", localStorage: [{ name: "session", value: "fresh" }] }],
+  });
+});
+
+test("native closed-origin capture reads each closed origin once until it loads again", async () => {
+  let storageStateCalls = 0;
+  let value = "first";
+  const pages: { url: () => string }[] = [];
+  const context = {
+    pages: () => pages,
+    async cookies() { return []; },
+    async storageState() {
+      storageStateCalls++;
+      return { origins: [{ origin: "https://closed.example", localStorage: [{ name: "session", value }] }] };
+    },
+  };
+  const storageCache = new Map();
+  const capture = async () => JSON.parse(await captureSession({ contexts: () => [context] }, {
+    captureSeed: { origins: ["https://closed.example"] },
+  }, { nativeStorage: true, storageCache })).origins[0].localStorage[0].value;
+  expect(await capture()).toBe("first");
+  value = "changed without a page";
+  expect(await capture()).toBe("first");
+  expect(storageStateCalls).toBe(1);
+  storageCache.delete("https://closed.example");
+  expect(await capture()).toBe("changed without a page");
+  expect(storageStateCalls).toBe(2);
+  // A read taken while a page is still open is not reused.
+  pages.push({ url: () => "https://closed.example/" });
+  storageCache.clear();
+  await capture();
+  pages.length = 0;
+  await capture();
+  expect(storageStateCalls).toBe(4);
+});
+
+test("native closed-origin capture scopes storageState to the requested origin", async () => {
+  const origins = new Set(["https://live.example"]);
+  const context = {
+    pages: () => [],
+    _connection: {
+      toImpl(value: unknown) {
+        expect(value).toBe(context);
+        return { _origins: origins, addVisitedOrigin: (origin: string) => origins.add(origin) };
+      },
+    },
+    async cookies() { return []; },
+    async storageState(options: unknown) {
+      expect(options).toEqual({ indexedDB: false });
+      expect([...origins]).toEqual(["https://closed.example"]);
+      origins.add("https://observed-during-capture.example");
+      return { origins: [{ origin: "https://closed.example", localStorage: [{ name: "session", value: "fresh" }] }] };
+    },
+    async newCDPSession() { throw new Error("Firefox capture must not use CDP"); },
+  };
+  await captureSession({ contexts: () => [context] }, {
+    captureSeed: { origins: ["https://closed.example"] },
+  }, { nativeStorage: true });
+  expect([...origins]).toEqual([
+    "https://live.example",
+    "https://closed.example",
+    "https://observed-during-capture.example",
+  ]);
+});
+
+test("native closed-origin capture records a scoped successful empty state", async () => {
+  const origins = new Set<string>();
+  const context = {
+    pages: () => [],
+    _connection: {
+      toImpl() {
+        return { _origins: origins, addVisitedOrigin: (origin: string) => origins.add(origin) };
+      },
+    },
+    async cookies() { return []; },
+    async storageState() {
+      expect([...origins]).toEqual(["https://closed.example"]);
+      return { origins: [] };
+    },
+  };
+  const result = JSON.parse(await captureSession({ contexts: () => [context] }, {
+    captureSeed: { origins: ["https://closed.example"] },
+  }, { nativeStorage: true }));
+  expect(result.origins).toEqual([{ origin: "https://closed.example", localStorage: [] }]);
+});
+
+test("native closed-origin capture uses IndexedDB only for Telegram", async () => {
+  const origins = new Set<string>();
+  const context = {
+    pages: () => [],
+    _connection: {
+      toImpl() {
+        return { _origins: origins, addVisitedOrigin: (origin: string) => origins.add(origin) };
+      },
+    },
+    async cookies() { return []; },
+    async storageState(options: unknown) {
+      expect(options).toEqual({ indexedDB: true });
+      return {
+        origins: [{
+          origin: "https://web.telegram.org",
+          localStorage: [],
+          indexedDB: [{
+            name: "tweb-common",
+            version: 1,
+            stores: [{
+              name: "localStorage__encrypted",
+              autoIncrement: false,
+              indexes: [],
+              records: [{ key: "data", value: "synthetic-auth" }],
+            }],
+          }],
+        }],
+      };
+    },
+  };
+  const result = JSON.parse(await captureSession({ contexts: () => [context] }, {
+    captureSeed: { origins: ["https://web.telegram.org"], telegramClient: "k" },
+  }, { nativeStorage: true }));
+  expect(result.origins[0].indexedDB).toHaveLength(1);
+});
+
+test("native closed-origin capture restores tracked origins after storageState fails", async () => {
+  const origins = new Set(["https://live.example"]);
+  const context = {
+    pages: () => [],
+    _connection: {
+      toImpl() {
+        return { _origins: origins, addVisitedOrigin: (origin: string) => origins.add(origin) };
+      },
+    },
+    async cookies() { return []; },
+    async storageState() {
+      origins.add("https://observed-during-capture.example");
+      throw new Error("storage failed");
+    },
+  };
+  // An origin that the browser does not open must not stop the capture. The worker names it, and
+  // the caller keeps the storage that it saved for this origin before.
+  const captured = JSON.parse(await captureSession({ contexts: () => [context] }, {
+    captureSeed: { origins: ["https://closed.example"] },
+  }, { nativeStorage: true }));
+  expect(captured.unreadableOrigins).toEqual(["https://closed.example"]);
+  expect(captured.origins.map((entry: { origin: string }) => entry.origin)).not.toContain("https://closed.example");
+  expect([...origins]).toEqual([
+    "https://live.example",
+    "https://closed.example",
+    "https://observed-during-capture.example",
+  ]);
+});
+
+test("native capture fails when native origin tracking cannot scope a closed observed origin", async () => {
+  const context = {
+    pages: () => [],
+    _connection: { toImpl() { return {}; } },
+    async cookies() { return []; },
+    async storageState() { return { origins: [] }; },
+    async newPage() { throw new Error("native capture must not create a visible page"); },
+  };
+  await expect(captureSession({ contexts: () => [context] }, {
+    captureSeed: { origins: ["https://closed.example"] },
+  }, { nativeStorage: true })).rejects.toMatchObject({
+    code: "operation_failed",
+    details: { operation: "origin_storage", outcome: "failed" },
+  });
+});
+
+test("native restore does not call Firefox CDP methods", async () => {
+  let handler: ((route: { fulfill: () => Promise<void> }) => Promise<void>) | undefined;
+  let routeUrl = "";
+  let closed = false;
+  const page = {
+    async goto(url: string) {
+      routeUrl = url;
+      await handler?.({ fulfill: async () => {} });
+    },
+    url: () => routeUrl,
+    async waitForURL() {},
+    // The restore page loads its document with location.replace.
+    async evaluate(_script: unknown, input?: unknown) { if (typeof input === "string") await page.goto(input); },
+    async close() { closed = true; },
+  };
+  const context = {
+    pages: () => [],
+    async newPage() { return page; },
+    async route(_url: string, value: typeof handler) { handler = value; },
+    async unroute() { handler = undefined; },
+    async clearCookies() {},
+    async addCookies() {},
+    async newCDPSession() { throw new Error("Firefox restore must not use CDP"); },
+  };
+  await restoreSession({}, context, {
+    bundle: JSON.stringify({ cookies: [], origins: [{
+      origin: "https://restored.example",
+      localStorage: [{ name: "session", value: "restored" }],
+    }] }),
+    urls: [],
+  }, { nativeStorage: true });
+  expect(closed).toBe(true);
+});
+
+test("native restore uses the empty first window for every origin and opens no other window", async () => {
+  let handler: ((route: { fulfill: () => Promise<void> }) => Promise<void>) | undefined;
+  let currentUrl = "about:blank";
+  const visited: string[] = [];
+  let opened = 0;
+  let closed = false;
+  const page = {
+    async goto(url: string) {
+      currentUrl = url;
+      visited.push(new URL(url).origin);
+      await handler?.({ fulfill: async () => {} });
+    },
+    async waitForURL() {},
+    url: () => currentUrl,
+    async evaluate(_script: unknown, input?: unknown) { if (typeof input === "string") await page.goto(input); },
+    async close() { closed = true; },
+  };
+  const context = {
+    pages: () => [page],
+    async newPage() { opened++; return page; },
+    async route(_url: string, value: typeof handler) { handler = value; },
+    async unroute() { handler = undefined; },
+    async clearCookies() {},
+    async addCookies() {},
+  };
+  await restoreSession({}, context, {
+    bundle: JSON.stringify({ cookies: [], origins: [
+      { origin: "https://one.example", localStorage: [{ name: "a", value: "1" }] },
+      { origin: "https://two.example", localStorage: [{ name: "b", value: "2" }] },
+    ] }),
+    urls: [],
+  }, { nativeStorage: true });
+  expect(opened).toBe(0);
+  expect(closed).toBe(false);
+  expect(visited).toEqual(["https://one.example", "https://two.example", "null"]);
+  expect(currentUrl).toBe("about:blank");
+});
+
+test("native restore applies an explicit empty localStorage capture", async () => {
+  let handler: ((route: { fulfill: () => Promise<void> }) => Promise<void>) | undefined;
+  let currentUrl = "about:blank";
+  const localStorage = { stale: "value" } as Record<string, unknown>;
+  Object.defineProperties(localStorage, {
+    getItem: { value(name: string) { return typeof this[name] === "string" ? this[name] : null; } },
+    setItem: { value(name: string, value: string) { this[name] = value; } },
+    clear: { value() { for (const name of Object.keys(this)) delete this[name]; } },
+  });
+  const page = {
+    async goto(url: string) {
+      currentUrl = url;
+      await handler?.({ fulfill: async () => {} });
+    },
+    url: () => currentUrl,
+    async waitForURL() {},
+    async evaluate(script: (input: unknown) => Promise<void>, input: unknown) {
+      if (typeof input === "string") return page.goto(input);
+      await runInNewContext(`(${script.toString()})(input)`, { input, localStorage });
+    },
+    async close() {},
+  };
+  const context = {
+    pages: () => [],
+    async newPage() { return page; },
+    async route(_url: string, value: typeof handler) { handler = value; },
+    async unroute() { handler = undefined; },
+    async clearCookies() {},
+    async addCookies() {},
+  };
+  await restoreSession({}, context, {
+    bundle: JSON.stringify({ cookies: [], origins: [{ origin: "https://restored.example", localStorage: [] }] }),
+    urls: [],
+  }, { nativeStorage: true });
+  expect(Object.keys(localStorage)).toEqual([]);
+  expect(localStorage.stale).toBeUndefined();
+});
+
+// Chromium shows the search engine's new tab page as chrome://newtab/, but Playwright reports the
+// address that the page loads from. The CDP target has the address that the tab shows.
+const SEARCH_NEW_TAB_URL = "https://duckduckgo.com/chrome_newtab";
+const cdpShowingNewTab = async (page: { url: () => string }) => ({
+  async send(method: string) {
+    return method === "Target.getTargetInfo"
+      ? { targetInfo: { url: page.url() === SEARCH_NEW_TAB_URL ? "chrome://newtab/" : page.url() } }
+      : {};
+  },
+  async detach() {},
+});
+
+test("a Cloud open keeps the search engine's new tab page and does not leave a blank page", async () => {
+  let handler: ((route: { fulfill: () => Promise<void> }) => Promise<void>) | undefined;
+  const events: string[] = [];
+  const makePage = (name: string, url: string) => {
+    const page = {
+      url: () => url,
+      async goto(target: string) {
+        url = target;
+        events.push(`goto ${name} ${target}`);
+        await handler?.({ fulfill: async () => {} });
+      },
+      async evaluate() {},
+      async close() { events.push(`close ${name}`); },
+    };
+    return page;
+  };
+  const pages = [makePage("new-tab", SEARCH_NEW_TAB_URL), makePage("stale", "https://stale.example/")];
+  const context = {
+    pages: () => pages,
+    async newPage() { events.push("new page"); return makePage("restore", "about:blank"); },
+    async route(_url: string, value: typeof handler) { handler = value; },
+    async unroute() { handler = undefined; },
+    async clearCookies() {},
+    async addCookies() {},
+    newCDPSession: cdpShowingNewTab,
+  };
+  // An empty Cloud session for a new profile, and a saved session with DuckDuckGo storage.
+  for (const origins of [[], [{ origin: "https://duckduckgo.com", localStorage: [{ name: "theme", value: "dark" }] }]]) {
+    events.length = 0;
+    await restoreSession({}, context, { bundle: JSON.stringify({ cookies: [], origins }), urls: [], replacePages: true });
+    expect(events.filter((event) => event.includes("new-tab"))).toEqual([]);
+    // The only new page is the one that restores the storage; no blank page replaces the new tab page.
+    expect(events.filter((event) => event === "new page")).toHaveLength(origins.length);
+    expect(events).toContain("close stale");
+  }
+});
+
+test("a Chromium capture keeps site tabs and leaves out the search engine's new tab page", async () => {
+  const page = (url: string) => ({
+    url: () => url,
+    async evaluate() { return { origin: new URL(url).origin, localStorage: [] }; },
+  });
+  const context = {
+    pages: () => [page(SEARCH_NEW_TAB_URL), page("https://site.example/")],
+    async cookies() { return []; },
+    newCDPSession: cdpShowingNewTab,
+  };
+  expect(JSON.parse(await captureSession({ contexts: () => [context] }, {}))).toEqual({
+    cookies: [],
+    origins: [{ origin: "https://site.example", localStorage: [] }],
+    tabs: ["https://site.example/"],
+  });
+});
+
+bunAsNodeTest("worker imports all sites without replacing existing cookies and restores complete Cloud jars", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-cookie-import-"));
+  const existing = { name: "session", value: "rotated", domain: "example.org", path: "/", secure: true };
+  const partitioned = { ...existing, domain: "example.net", partitionKey: "https://example.org", _crHasCrossSiteAncestor: true };
+  const imported = [
+    { ...existing, value: "stale" },
+    { ...partitioned, value: "stale", _crHasCrossSiteAncestor: undefined },
+    { ...existing, domain: ".example.org", value: "domain-session" },
+    { ...existing, path: "/account", value: "path-session" },
+    { ...existing, partitionKey: "https://example.net", _crHasCrossSiteAncestor: false },
+    { ...existing, partitionKey: "https://example.net", _crHasCrossSiteAncestor: true },
+    { name: "SID", value: "google-session", domain: ".google.com", path: "/", httpOnly: true, secure: true, sameSite: "None", expires: 4_070_908_800 },
+    ...["bcookie", "bscookie", "li_rm"].flatMap((name) => [".linkedin.com", "example.net"].map((domain) => ({
+      name, value: "device", domain, path: "/",
+    }))),
+  ];
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    const jar = join(root, "jar.json");
+    const events = join(root, "events.json");
+    await writeFile(jar, JSON.stringify([existing, partitioned]));
+    await writeFile(events, "[]");
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      import { readFileSync, writeFileSync } from "node:fs";
+      const jar = ${JSON.stringify(jar)}, events = ${JSON.stringify(events)};
+      const read = (path) => JSON.parse(readFileSync(path, "utf8"));
+      const write = (path, value) => writeFileSync(path, JSON.stringify(value));
+      const context = {
+        pages: () => [],
+        async cookies(...args) {
+          if (args.length) throw new Error("cookie read must cover every domain");
+          return read(jar);
+        },
+        async addCookies(cookies) {
+          write(jar, [...read(jar), ...cookies]);
+          write(events, [...read(events), cookies]);
+        },
+        async clearCookies() { write(jar, []); write(events, [...read(events), "clear"]); },
+      };
+      export const chromium = { async connectOverCDP() {
+        return { contexts: () => [context], async close() {} };
+      } };
+    `);
+    const options = { runtimeRoot: root, timeoutMs: 5_000 };
+    const payload = { endpoint: "ws://browser", cookies: imported };
+    expect(await runPlaywrightWorker<{ injected: boolean }>("ensure-cookies", payload, options)).toEqual({ injected: true });
+    expect(await Bun.file(jar).json()).toEqual([existing, partitioned, ...imported.slice(2)]);
+    expect(await runPlaywrightWorker<{ injected: boolean }>("ensure-cookies", payload, options)).toEqual({ injected: false });
+    expect(await Bun.file(events).json()).toEqual([imported.slice(2)]);
+
+    await runPlaywrightWorker("session-restore", { endpoint: "ws://browser", bundle: JSON.stringify({ cookies: imported }), urls: [] }, options);
+    expect(await Bun.file(jar).json()).toEqual(imported);
+    const captured = JSON.parse(await runPlaywrightWorker<string>("session-capture", { endpoint: "ws://browser" }, options));
+    expect(captured.cookies).toEqual(imported);
+    await runPlaywrightWorker("session-restore", { endpoint: "ws://browser", bundle: JSON.stringify({ cookies: [] }), urls: [], authoritative: true }, options);
+    expect(await Bun.file(jar).json()).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker adds exactly one cookie without clearing the live jar", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-cookie-add-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      let added = false;
+      const expected = ${JSON.stringify({
+        name: "session",
+        value: "private-cookie-value",
+        domain: "example.com",
+        path: "/",
+        expires: 4_070_908_800,
+        secure: true,
+        sameSite: "Lax",
+      })};
+      const context = {
+        pages: () => [],
+        async clearCookies() { throw new Error("must not clear existing cookies"); },
+        async addCookies(cookies) {
+          if (cookies.length !== 1 || JSON.stringify(cookies[0]) !== JSON.stringify(expected)) {
+            throw new Error("wrong cookie payload");
+          }
+          added = true;
+        },
+      };
+      export const chromium = { async connectOverCDP() {
+        return {
+          contexts: () => [context],
+          async close() { if (!added) throw new Error("cookie was not added before detach"); },
+        };
+      } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    await expect(runPlaywrightWorker("cookie-add", {
+      endpoint: "ws://browser",
+      cookies: [{
+        name: "session",
+        value: "private-cookie-value",
+        domain: "example.com",
+        path: "/",
+        expires: 4_070_908_800,
+        secure: true,
+        sameSite: "Lax",
+      }],
+      connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toBeNull();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("installed Playwright storage source uses the supported direct export shape", async () => {
+  const module = await import(pathToFileURL(join(import.meta.dir, "node_modules", "playwright-core", "lib", "generated", "storageScriptSource.js")).href);
+  expect(typeof module.source).toBe("string");
+  const commonJs = { exports: {} as Record<string, unknown> };
+  Function("module", "exports", module.source)(commonJs, commonJs.exports);
+  const StorageScript = commonJs.exports.StorageScript as (() => new (isFirefox: boolean) => unknown);
+  expect(typeof StorageScript).toBe("function");
+  expect(() => new (StorageScript())(false)).not.toThrow();
+});
+
+bunAsNodeTest("installed worker loads its packaged ESM dependency", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-layout-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), "export const chromium = {};\n");
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const error = await runPlaywrightWorker("page", { endpoint: "ws://browser", connectTimeoutMs: 10 }, {
+      runtimeRoot: root,
+      timeoutMs: 1_000,
+    }).then(() => null, (failure) => failure);
+    expect(error).toMatchObject({ code: "timeout" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker retries until the persistent context appears without creating an incognito context", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-delayed-context-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      let connects = 0;
+      const page = { evaluate: async () => "delayed-context" };
+      const context = { pages: () => [page] };
+      export const chromium = { async connectOverCDP() {
+        connects++;
+        return {
+          contexts: () => connects === 1 ? [] : [context],
+          async newContext() { throw new Error("must not create incognito context"); },
+          async close() {},
+        };
+      } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    expect(await runPlaywrightWorker<string>("page", { endpoint: "ws://browser", kind: "user-agent", connectTimeoutMs: 2_000 }, {
+      runtimeRoot: root,
+      timeoutMs: 5_000,
+    })).toBe("delayed-context");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("search provider uses the managed browser and closes only its temporary settings page", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-search-provider-managed-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      import { appendFile } from "node:fs/promises";
+      let mode = "";
+      const log = (event) => appendFile(${JSON.stringify(join(root, "events.log"))}, event + "\\n");
+      const userPage = {
+        url: () => "https://restored.example/account",
+        async goto() { throw new Error("search setup navigated a user page"); },
+        async close() { throw new Error("search setup closed a user page"); },
+      };
+      const settingsPage = {
+        async goto(url) {
+          if (url !== "chrome://settings/searchEngines") throw new Error("wrong settings URL");
+          await log("goto:settings");
+        },
+        async evaluate(configure) {
+          const source = String(configure);
+          if (source.includes("kept-existing")) throw new Error("non-DuckDuckGo default would be preserved");
+          if (!source.includes('hostname === "duckduckgo.com"')) throw new Error("DuckDuckGo URL was not verified");
+          if (mode === "failure") throw new Error("settings unavailable");
+          return mode === "configured"
+            ? { status: "configured", engine: "DuckDuckGo" }
+            : { status: "already-default", engine: "DuckDuckGo" };
+        },
+        async close() { await log("close:settings"); },
+      };
+      const context = {
+        pages: () => [userPage],
+        async newPage() { await log("new:settings"); return settingsPage; },
+      };
+      export const chromium = {
+        async launchPersistentContext() { throw new Error("search setup launched a second browser"); },
+        async connectOverCDP(endpoint) {
+          mode = endpoint.split("/").at(-1);
+          await log("connect:" + mode);
+          return {
+            contexts: () => [context],
+            async close() { await log("detach:" + mode); },
+          };
+        },
+      };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const executablePath = join(root, "cloakbrowser.exe");
+    const executableContents = "approved CloakBrowser";
+    await writeFile(executablePath, executableContents);
+    const executableSha256 = createHash("sha256")
+      .update(executableContents)
+      .digest("hex");
+    await expect(runPlaywrightWorker("search-provider", {
+      executablePath,
+      executableSha256,
+      userDataDir: "C:/Profiles/configured",
+      endpoint: "ws://browser/configured",
+      connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({
+      status: "configured",
+      engine: "DuckDuckGo",
+    });
+    await expect(runPlaywrightWorker("search-provider", {
+      executablePath,
+      executableSha256,
+      userDataDir: "C:/Profiles/existing",
+      endpoint: "ws://browser/existing",
+      connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({
+      status: "already-default",
+      engine: "DuckDuckGo",
+    });
+    const changedBinary = await runPlaywrightWorker("search-provider", {
+      executablePath,
+      executableSha256: "0".repeat(64),
+      userDataDir: "C:/Profiles/configured",
+      endpoint: "ws://browser/changed-binary",
+      connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (error) => error);
+    expect(changedBinary).toMatchObject({ code: "operation_failed" });
+    const failure = await runPlaywrightWorker("search-provider", {
+      executablePath,
+      executableSha256,
+      userDataDir: "C:/Profiles/failure",
+      endpoint: "ws://browser/failure",
+      connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (error) => error);
+    expect(failure).toMatchObject({ code: "operation_failed" });
+
+    expect((await Bun.file(join(root, "events.log")).text()).trim().split("\n")).toEqual([
+      "connect:configured", "new:settings", "goto:settings", "close:settings", "detach:configured",
+      "connect:existing", "new:settings", "goto:settings", "close:settings", "detach:existing",
+      "connect:failure", "new:settings", "goto:settings", "close:settings", "detach:failure",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("profile card setup preserves a minimized browser window", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-profile-card-window-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      let mode = "normal";
+      let created = false;
+      let raised = false;
+      let detached = false;
+      let browserDetached = false;
+      let targetCreated;
+      let targetDestroyed;
+      const browserCdp = {
+        on(method, listener) {
+          if (method === "Target.targetCreated") targetCreated = listener;
+          else if (method === "Target.targetDestroyed") targetDestroyed = listener;
+          else throw new Error("wrong browser CDP event");
+        },
+        async send(method, params) {
+          if (method === "Target.getTargets") {
+            return { targetInfos: [{ targetId: "existing-page", type: "page" }] };
+          }
+          if (method === "Target.setDiscoverTargets") {
+            if (params?.discover && mode === "arming-race") {
+              targetCreated?.({ targetInfo: { targetId: "existing-page", type: "page" } });
+              targetCreated?.({ targetInfo: { targetId: "during-arm-page", type: "page" } });
+            }
+            return {};
+          }
+          throw new Error("wrong browser CDP command");
+        },
+        async detach() { browserDetached = true; },
+      };
+      const automation = {
+        url() { return mode === "existing-card" ? "http://127.0.0.1/profile-card" : "about:blank"; },
+        async bringToFront() {
+          if (mode !== "normal") throw new Error("minimized window was raised");
+          raised = true;
+        },
+      };
+      const context = {
+        pages: () => mode === "missing-page" ? [] : [automation],
+        async newCDPSession(page) {
+          if (page !== automation) throw new Error("wrong CDP target");
+          return {
+            async send(method) {
+              if (method !== "Browser.getWindowForTarget") throw new Error("wrong CDP command");
+              if (mode === "query-failed") throw new Error("window state unavailable");
+              if (mode === "transient-target") {
+                targetCreated?.({ targetInfo: { targetId: "transient-page", type: "page" } });
+              }
+              return { bounds: { windowState: ["transient-target", "arming-race"].includes(mode) ? "minimized" : mode } };
+            },
+            async detach() { detached = true; },
+          };
+        },
+        async newPage() {
+          if (mode === "temporary") {
+            created = true;
+            targetCreated?.({ targetInfo: { targetId: "temporary-page", type: "page" } });
+            return {
+              async goto() {},
+              async close() { targetDestroyed?.({ targetId: "temporary-page" }); },
+            };
+          }
+          if (mode !== "normal") throw new Error("card created without known visible state");
+          created = true;
+          return { async goto() {} };
+        },
+      };
+      export const chromium = { async connectOverCDP(endpoint) {
+        mode = endpoint.split("//")[1];
+        created = false;
+        raised = false;
+        detached = false;
+        browserDetached = false;
+        targetCreated = undefined;
+        targetDestroyed = undefined;
+        return {
+          contexts: () => [context],
+          async newBrowserCDPSession() { return browserCdp; },
+          async close() {
+            if (mode === "existing-card") {
+              if (created || raised || detached || browserDetached) throw new Error("existing profile card was changed");
+              return;
+            }
+            if (!browserDetached) throw new Error("browser CDP session was not detached");
+            if (!["missing-page", "temporary"].includes(mode) && !detached) throw new Error("CDP session was not detached");
+            if (mode === "normal" && !created) throw new Error("visible profile card setup was incomplete");
+            if (raised) throw new Error("the user's tab was activated, which focuses it");
+            if (mode === "temporary" && (!created || raised)) throw new Error("temporary profile card setup was incomplete");
+            if (!["normal", "temporary"].includes(mode) && (created || raised)) throw new Error("browser with unknown or minimized state was changed");
+          },
+        };
+      } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    await expect(runPlaywrightWorker("profile-card", {
+      endpoint: "ws://normal", url: "http://127.0.0.1/profile-card", connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({ createdPageTargetIds: [] });
+    await expect(runPlaywrightWorker("profile-card", {
+      endpoint: "ws://minimized", url: "http://127.0.0.1/profile-card", connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({ createdPageTargetIds: [] });
+    await expect(runPlaywrightWorker("profile-card", {
+      endpoint: "ws://query-failed", url: "http://127.0.0.1/profile-card", connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({ createdPageTargetIds: [] });
+    await expect(runPlaywrightWorker("profile-card", {
+      endpoint: "ws://missing-page", url: "http://127.0.0.1/profile-card", connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({ createdPageTargetIds: [] });
+    await expect(runPlaywrightWorker("profile-card", {
+      endpoint: "ws://transient-target", url: "http://127.0.0.1/profile-card", connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({ createdPageTargetIds: ["transient-page"] });
+    await expect(runPlaywrightWorker("profile-card", {
+      endpoint: "ws://arming-race", url: "http://127.0.0.1/profile-card", connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({ createdPageTargetIds: ["during-arm-page"] });
+    await expect(runPlaywrightWorker("profile-card", {
+      endpoint: "ws://existing-card", url: "http://127.0.0.1/profile-card", connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({ createdPageTargetIds: [] });
+    await expect(runPlaywrightWorker("profile-card", {
+      endpoint: "ws://temporary", url: "about:blank", temporary: true, connectTimeoutMs: 2_000,
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toEqual({
+      createdPageTargetIds: ["temporary-page"],
+      destroyedPageTargetIds: ["temporary-page"],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker restore failures preserve operation and outcome details", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-error-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      const context = { pages: () => [], async clearCookies() { throw new Error("secret"); } };
+      export const chromium = { async connectOverCDP() { return { contexts: () => [context], async close() {} }; } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const error = await runPlaywrightWorker("session-restore", {
+      endpoint: "ws://browser", bundle: JSON.stringify({ cookies: [{ name: "a" }], origins: [] }), urls: [],
+    }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+    expect(error).toMatchObject({ code: "operation_failed", details: { operation: "cookie_clear", outcome: "failed" } });
+    expect(error.message).not.toContain("secret");
+
+    const emptyAuthoritativeError = await runPlaywrightWorker("session-restore", {
+      endpoint: "ws://browser",
+      bundle: JSON.stringify({ cookies: [], origins: [], tabs: ["https://x.com/home"] }),
+      urls: [],
+      authoritative: true,
+    }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+    expect(emptyAuthoritativeError).toMatchObject({
+      code: "operation_failed",
+      details: { operation: "cookie_clear", outcome: "failed" },
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("capture failures identify connection, context, cookies, and detach without raw errors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-capture-stages-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      export const chromium = { async connectOverCDP(endpoint) {
+        const mode = endpoint.split("//")[1];
+        if (mode === "connect") throw new Error("private connection detail");
+        return {
+          contexts: () => mode === "context" ? [] : [{
+            pages: () => [],
+            async cookies() {
+              if (mode === "cookies" || mode === "cookies-and-disconnect") throw new Error("private cookie detail");
+              return [];
+            },
+          }],
+          async close() { if (mode.includes("disconnect")) throw new Error("private detach detail"); },
+        };
+      } };
+    `);
+    for (const [mode, operation, code] of [
+      ["connect", "connect", "timeout"], ["context", "context", "timeout"],
+      ["cookies", "cookies", "operation_failed"], ["disconnect", "disconnect", "timeout"],
+      ["cookies-and-disconnect", "cookies", "operation_failed"],
+    ]) {
+      const error = await runPlaywrightWorker("session-capture", {
+        endpoint: `ws://${mode}`, connectTimeoutMs: 20,
+      }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+      expect(error).toMatchObject({ code, details: { operation, outcome: code === "timeout" ? "timeout" : "failed" } });
+      expect(JSON.stringify(error)).not.toContain("private");
+      expect(error.message).not.toContain("private");
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker captures arbitrary web sessions, rejects malformed captures, and restores safely", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-web-session-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      const cookie = { name: "custom_auth", value: "value", domain: ".example.com", path: "/", partitionKey: "https://example.com", _crHasCrossSiteAncestor: false };
+      let captureMode = "valid";
+      let bypassServiceWorker = false;
+      let liveUrl = "https://example.com/dashboard";
+      const livePage = {
+        url() { return liveUrl; },
+        async goto(url) { liveUrl = url; },
+        async evaluate(_fn, expectedOrigin) {
+          return {
+            origin: expectedOrigin,
+            localStorage: [{ name: "session", value: captureMode === "malformed-storage" ? 42 : "active" }],
+          };
+        },
+      };
+      const extraPages = [
+        { url: () => "https://example.com/dashboard" },
+        { url: () => "https://example.com/?__ghosteranti_session_capture__=7" },
+        { url: () => "https://example.com/?__ghosteranti_session_restore__=8" },
+        { url: () => "http://127.0.0.1:50400/card?id=profile1" },
+        { url: () => "about:blank" },
+      ];
+      const routes = new Map();
+      const context = {
+        async cookies() {
+          return captureMode === "malformed-cookie" ? [{ name: "broken" }]
+            : captureMode === "bad-partition-key" ? [{ ...cookie, partitionKey: true }]
+            : captureMode === "bad-cross-site-ancestor" ? [{ ...cookie, _crHasCrossSiteAncestor: "false" }]
+            : [cookie];
+        },
+        async storageState() { throw new Error("capture used storageState"); },
+        pages() { return [livePage, ...extraPages]; },
+        async newPage() {
+          return {
+            currentUrl: "about:blank",
+            async goto(url) {
+              const handler = routes.get(url);
+              if (!handler) throw new Error("route missing");
+              this.currentUrl = url;
+              if (captureMode !== "service-worker" || bypassServiceWorker) await handler({ fulfill: async () => {} });
+            },
+            url() { return this.currentUrl; },
+            async evaluate(_fn, input) {
+              if (input) {
+                if (input.entries?.length !== 1 || input.entries[0].name !== "session" || input.entries[0].value !== "active") throw new Error("wrong localStorage");
+                if (input.databases?.length) throw new Error("unexpected IndexedDB");
+                return true;
+              }
+              return { localStorage: [{ name: "session", value: captureMode === "malformed-storage" ? 42 : "active" }] };
+            },
+            async close() {},
+          };
+        },
+        async newCDPSession() {
+          return {
+            async send(method, params) {
+              if (method === "Network.setBypassServiceWorker" && params?.bypass === true) bypassServiceWorker = true;
+            },
+            async detach() {},
+          };
+        },
+        async route(url, handler) {
+          if (!url.startsWith("https://example.com/?__ghosteranti_session_")) throw new Error("wrong session URL");
+          routes.set(url, handler);
+        },
+        async unroute(url) { routes.delete(url); },
+        async clearCookies() { if (liveUrl !== "about:blank") throw new Error("live target page was not blanked"); },
+        async addCookies(cookies) { if (JSON.stringify(cookies) !== JSON.stringify([cookie])) throw new Error("wrong cookies"); },
+      };
+      export const chromium = { async connectOverCDP(endpoint) {
+        bypassServiceWorker = false;
+        if (endpoint.includes("malformed-cookie")) captureMode = "malformed-cookie";
+        else if (endpoint.includes("bad-partition-key")) captureMode = "bad-partition-key";
+        else if (endpoint.includes("bad-cross-site-ancestor")) captureMode = "bad-cross-site-ancestor";
+        else if (endpoint.includes("malformed-storage")) captureMode = "malformed-storage";
+        else if (endpoint.includes("internal-origin")) captureMode = "internal-origin";
+        else if (endpoint.includes("service-worker")) captureMode = "service-worker";
+        else captureMode = "valid";
+        return { contexts: () => [context], async close() {} };
+      } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const captured = JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://browser",
+    }, { runtimeRoot: root, timeoutMs: 5_000 }));
+    expect(captured).toEqual({
+      cookies: [{
+        name: "custom_auth", value: "value", domain: ".example.com", path: "/",
+        partitionKey: "https://example.com", _crHasCrossSiteAncestor: false,
+      }],
+      origins: [{ origin: "https://example.com", localStorage: [{ name: "session", value: "active" }] }],
+      tabs: ["https://example.com/dashboard", "https://example.com/dashboard"],
+    });
+    for (const endpoint of ["ws://malformed-cookie", "ws://bad-partition-key", "ws://bad-cross-site-ancestor"]) {
+      const malformedCookie = await runPlaywrightWorker("session-capture", {
+        endpoint,
+      }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+      expect(malformedCookie).toMatchObject({ code: "operation_failed", details: { operation: "validation" } });
+    }
+
+    for (const endpoint of ["ws://malformed-storage", "ws://internal-origin"]) {
+      const invalidOrigin = await runPlaywrightWorker("session-capture", {
+        endpoint,
+        ...(endpoint.endsWith("internal-origin")
+          ? { captureSeed: { origins: ["chrome-extension://abc"] } }
+          : {}),
+      }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+      expect(invalidOrigin).toMatchObject({ code: "operation_failed", details: { operation: "validation" } });
+    }
+
+    expect(JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://service-worker",
+    }, { runtimeRoot: root, timeoutMs: 5_000 }))).toEqual(captured);
+
+    await expect(runPlaywrightWorker("session-restore", {
+      endpoint: "ws://browser",
+      bundle: JSON.stringify({
+        cookies: captured.cookies,
+        origins: [
+          ...captured.origins,
+          { origin: "chrome-extension://abc", localStorage: [{ name: "private", value: "drop" }] },
+        ],
+      }),
+      urls: [],
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toBeNull();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker replaces stale pages and attempts every restored tab after a failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-tabs-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      import { appendFile } from "node:fs/promises";
+      const log = (event) => appendFile(${JSON.stringify(join(root, "events.log"))}, event + "\\n");
+      const makePage = (initialUrl, name) => ({
+        currentUrl: initialUrl,
+        url() { return this.currentUrl; },
+        async goto(url) {
+          this.currentUrl = url;
+          await log("goto:" + url);
+          if (url === "https://fails.example/") throw new Error("offline");
+        },
+        async close() { await log("close:" + name); },
+      });
+      const stale = makePage("https://stale.example/", "stale");
+      const blank = makePage("about:blank", "blank");
+      const extraBlank = makePage("about:blank", "extra-blank");
+      const firstRun = makePage("chrome://ungoogled-first-run/", "first-run");
+      const newTab = makePage("chrome://newtab/", "new-tab");
+      const newTabPage = makePage("chrome://new-tab-page/", "new-tab-page");
+      const thirdPartyNewTabPage = makePage("chrome://new-tab-page-third-party/", "new-tab-page-third-party");
+      const settings = makePage("chrome://settings/privacy", "settings");
+      const card = makePage("http://127.0.0.1:50400/card?id=profile1", "card");
+      const pages = [stale, blank, extraBlank, firstRun, newTab, newTabPage, thirdPartyNewTabPage, settings, card];
+      const context = {
+        pages: () => pages,
+        async newPage() { const page = makePage("about:blank", "created"); pages.push(page); return page; },
+        async clearCookies() {},
+      };
+      export const chromium = { async connectOverCDP() {
+        return { contexts: () => [context], async close() { await log("detach"); } };
+      } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const error = await runPlaywrightWorker("session-restore", {
+      endpoint: "ws://browser",
+      bundle: JSON.stringify({ cookies: [], origins: [] }),
+      urls: ["https://fails.example/", "https://ok.example/", "https://fails.example/"],
+      replacePages: true,
+    }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+    expect(error).toMatchObject({ details: { operation: "navigation", outcome: "failed" } });
+
+    const events = (await Bun.file(join(root, "events.log")).text()).trim().split("\n");
+    expect(events.filter((event) => event.startsWith("goto:"))).toEqual([
+      "goto:https://fails.example/",
+      "goto:https://ok.example/",
+      "goto:https://fails.example/",
+    ]);
+    expect(events).toContain("close:stale");
+    expect(events).toContain("close:extra-blank");
+    expect(events).toContain("close:first-run");
+    expect(events).toContain("close:new-tab");
+    expect(events).toContain("close:new-tab-page");
+    expect(events).toContain("close:new-tab-page-third-party");
+    expect(events).not.toContain("close:settings");
+    expect(events).not.toContain("close:card");
+    expect(events.at(-1)).toBe("detach");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker reuses startup pages and removes only the exact first-run page", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-first-run-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      import { appendFile } from "node:fs/promises";
+      const log = (event) => appendFile(${JSON.stringify(join(root, "events.log"))}, event + "\\n");
+      const firstRun = {
+        url: () => "chrome://ungoogled-first-run/",
+        async goto(url) { await log("goto:first-run:" + url); },
+        async close() { await log("close:first-run"); },
+      };
+      const settings = {
+        url: () => "chrome://settings/privacy",
+        async goto(url) { await log("goto:settings:" + url); },
+        async close() { await log("close:settings"); },
+      };
+      const restored = {
+        url: () => "https://restored.example/account",
+        async goto(url) { await log("goto:restored:" + url); },
+        async close() { await log("close:restored"); },
+      };
+      export const chromium = { async connectOverCDP(endpoint) {
+        const newTabUrls = {
+          "ws://new-tab": "chrome://newtab/",
+          "ws://new-tab-page": "chrome://new-tab-page/",
+          "ws://new-tab-page-third-party": "chrome://new-tab-page-third-party/",
+        };
+        const newTabUrl = newTabUrls[endpoint];
+        const newTab = newTabUrl && {
+          url: () => newTabUrl,
+          async goto(url) { await log("goto:" + newTabUrl + ":" + url); },
+          async close() { await log("close:" + newTabUrl); },
+        };
+        const pages = endpoint === "ws://restored"
+          ? [restored, firstRun, settings]
+          : endpoint === "ws://first-run-only"
+            ? [firstRun]
+            : newTab
+              ? [newTab, settings]
+              : [firstRun, settings];
+        const context = {
+          pages: () => pages,
+          async newPage() { await log("new-page"); throw new Error("first-run page was not reused"); },
+          async clearCookies() {},
+        };
+        return { contexts: () => [context], async close() { await log("detach"); } };
+      } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    await expect(runPlaywrightWorker("session-restore", {
+      endpoint: "ws://browser",
+      bundle: JSON.stringify({ cookies: [], origins: [] }),
+      urls: ["https://x.com/home"],
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toBeNull();
+
+    await expect(runPlaywrightWorker("navigate", {
+      endpoint: "ws://restored",
+      urls: [],
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toBeNull();
+
+    await expect(runPlaywrightWorker("navigate", {
+      endpoint: "ws://first-run-only",
+      urls: [],
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toBeNull();
+
+    for (const [endpoint, startupTabUrl] of [
+      ["ws://new-tab", "chrome://newtab/"],
+      ["ws://new-tab-page", "chrome://new-tab-page/"],
+      ["ws://new-tab-page-third-party", "chrome://new-tab-page-third-party/"],
+    ]) {
+      await expect(runPlaywrightWorker("navigate", {
+        endpoint,
+        urls: ["https://x.com/home"],
+      }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toBeNull();
+    }
+
+    expect((await Bun.file(join(root, "events.log")).text()).trim().split("\n")).toEqual([
+      "goto:first-run:https://x.com/home",
+      "detach",
+      "close:first-run",
+      "detach",
+      "goto:first-run:about:blank",
+      "detach",
+      "goto:chrome://newtab/:https://x.com/home",
+      "detach",
+      "goto:chrome://new-tab-page/:https://x.com/home",
+      "detach",
+      "goto:chrome://new-tab-page-third-party/:https://x.com/home",
+      "detach",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker fails closed on Telegram IndexedDB reads and applies empty tombstones", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-telegram-tombstone-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      let mode = "capture";
+      const routes = new Map();
+      const livePage = { url: () => "https://web.telegram.org/a/" };
+      const context = {
+        pages: () => mode === "capture" ? [livePage] : [],
+        async newPage() {
+          return {
+            currentUrl: "about:blank",
+            async goto(url) {
+              const handler = routes.get(url);
+              if (!handler) throw new Error("route missing");
+              this.currentUrl = url;
+              await handler({ fulfill: async () => {} });
+            },
+            url() { return this.currentUrl; },
+            async evaluate(fn, input) {
+              if (mode === "capture") {
+                if (Array.isArray(input)) throw new Error("IndexedDB request failed");
+                return { localStorage: [{ name: "dc2_auth_key", value: "live" }] };
+              }
+              const databases = new Set(["tt-passcode", "tweb-common", "tweb-account-2", "cache-db"]);
+              const deleted = [];
+              const values = new Map([["dc2_auth_key", "stale"]]);
+              globalThis.indexedDB = {
+                async databases() { return [...databases].map((name) => ({ name })); },
+                deleteDatabase(name) {
+                  const request = {};
+                  queueMicrotask(() => { databases.delete(name); deleted.push(name); request.onsuccess?.(); });
+                  return request;
+                },
+              };
+              globalThis.localStorage = {};
+              Object.defineProperties(globalThis.localStorage, {
+                getItem: { value: (name) => values.get(name) ?? null },
+                setItem: { value: (name, value) => values.set(name, value) },
+                clear: { value: () => values.clear() },
+              });
+              await fn(input);
+              if (JSON.stringify(deleted.sort()) !== JSON.stringify(["tt-passcode", "tweb-account-2", "tweb-common"])) throw new Error("wrong databases deleted");
+              if (databases.size !== 1 || !databases.has("cache-db")) throw new Error("unrelated database deleted");
+              if (values.size !== 0) throw new Error("localStorage not cleared");
+              return true;
+            },
+            async close() {},
+          };
+        },
+        async route(url, handler) { routes.set(url, handler); },
+        async unroute(url) { routes.delete(url); },
+        async storageState() { return { cookies: [], origins: [] }; },
+        async clearCookies() {},
+      };
+      export const chromium = { async connectOverCDP(endpoint) {
+        mode = endpoint.includes("restore") ? "restore" : "capture";
+        return { contexts: () => [context], async close() {} };
+      } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const captureError = await runPlaywrightWorker("session-capture", {
+      endpoint: "ws://capture",
+    }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+    expect(captureError).toMatchObject({ code: "operation_failed" });
+
+    await expect(runPlaywrightWorker("session-restore", {
+      endpoint: "ws://restore",
+      bundle: JSON.stringify({ cookies: [], origins: [{ origin: "https://web.telegram.org" }] }),
+      urls: [],
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toBeNull();
+
+    await expect(runPlaywrightWorker("session-restore", {
+      endpoint: "ws://restore",
+      bundle: JSON.stringify({ cookies: [], origins: [{ origin: "https://web.telegram.org", localStorage: [] }] }),
+      urls: [],
+    }, { runtimeRoot: root, timeoutMs: 5_000 })).resolves.toBeNull();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker captures current localStorage for a closed known origin", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-closed-origin-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      const storage = {
+        "https://closed.example": [{ name: "token", value: "fresh-closed-value" }],
+        "https://live.example": [{ name: "live", value: "current-value" }],
+      };
+      const livePage = {
+        url: () => "https://live.example/dashboard",
+        async goto() { throw new Error("live user page was navigated"); },
+        async evaluate() {
+          return { origin: "https://live.example", localStorage: storage["https://live.example"] };
+        },
+      };
+      let hiddenPage;
+      let routeHandler;
+      let storageDetached = false;
+      let browserDetached = false;
+      const context = {
+        pages: () => hiddenPage ? [livePage, hiddenPage] : [livePage],
+        async newPage() { throw new Error("capture used context.newPage"); },
+        async route(_url, handler) { routeHandler = handler; },
+        async unroute() { routeHandler = undefined; },
+        async storageState() { throw new Error("capture used mutating storageState"); },
+        async cookies(...urls) { if (urls.length) throw new Error("capture cookies were targeted"); return []; },
+        async newCDPSession(page) {
+          if (page !== hiddenPage) throw new Error("wrong storage CDP target");
+          return {
+            async send(method, params) {
+              if (method === "Target.getTargetInfo") {
+                if (params !== undefined) throw new Error("candidate identity used a targetId");
+                return { targetInfo: { targetId: "hidden-target", type: "other" } };
+              }
+              if (["Network.enable", "Network.setBypassServiceWorker", "DOMStorage.enable"].includes(method)) return {};
+              if (method === "DOMStorage.getDOMStorageItems") {
+                return { entries: (storage[params.storageId.securityOrigin] ?? []).map(({ name, value }) => [name, value]) };
+              }
+              throw new Error("unexpected storage CDP method " + method);
+            },
+            async detach() { storageDetached = true; },
+          };
+        },
+      };
+      const browserCdp = {
+        async send(method, params) {
+          if (method === "Browser.getVersion") return { product: "Chrome/146.0.7680.153" };
+          if (method === "Target.getTargetInfo") return { targetInfo: { targetId: params.targetId, type: "other", url: "about:blank#__ghosteranti_hidden_capture__" } };
+          if (method === "Browser.getWindowForTarget") throw new Error("Protocol error (Browser.getWindowForTarget): Browser window not found");
+          if (method === "Target.closeTarget") { hiddenPage = undefined; return { success: true }; }
+          if (method !== "Target.createTarget" || params.url !== "about:blank#__ghosteranti_hidden_capture__"
+            || params.browserContextId !== undefined || params.background !== true || params.hidden !== true
+            || process.env.PW_CHROMIUM_ATTACH_TO_OTHER !== "1") {
+            throw new Error("wrong hidden target command");
+          }
+          hiddenPage = {
+            currentUrl: params.url,
+            url() { return this.currentUrl; },
+            async goto(url) {
+              this.currentUrl = url;
+              if (!routeHandler) throw new Error("capture route missing");
+              await routeHandler({ fulfill: async () => {} });
+            },
+            async close() { hiddenPage = undefined; },
+          };
+          return { targetId: "hidden-target" };
+        },
+        async detach() { browserDetached = true; },
+      };
+      export const chromium = { async connectOverCDP() { return {
+        contexts: () => [context],
+        async newBrowserCDPSession() { return browserCdp; },
+        async close() {
+          if (hiddenPage || routeHandler || !storageDetached || !browserDetached
+            || process.env.PW_CHROMIUM_ATTACH_TO_OTHER !== undefined) {
+            throw new Error("hidden storage target cleanup was incomplete");
+          }
+        },
+      }; } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const captured = JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://browser",
+      captureSeed: { origins: ["https://closed.example", "https://empty.example"] },
+    }, { runtimeRoot: root, timeoutMs: 5_000 }));
+    expect(captured).toEqual({
+      cookies: [],
+      origins: [
+        { origin: "https://closed.example", localStorage: [{ name: "token", value: "fresh-closed-value" }] },
+        { origin: "https://empty.example", localStorage: [] },
+        { origin: "https://live.example", localStorage: [{ name: "live", value: "current-value" }] },
+      ],
+      tabs: ["https://live.example/dashboard"],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker proves hidden target identity through marker collisions and cleans independently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-hidden-proof-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      import { appendFile } from "node:fs/promises";
+      import { join } from "node:path";
+      const root = ${JSON.stringify(root)};
+      let mode;
+      let hiddenPage;
+      let collisionPage;
+      let routeHandler;
+      let browserSessionRequested = false;
+      let bypassed = false;
+      let collisionDetached = false;
+      let collisionNavigated = false;
+      let collisionClosed = false;
+      let targetDetached = false;
+      let pageClosed = false;
+      let targetClosed = false;
+      let browserDetached = false;
+      let creates = 0;
+      let navigations = 0;
+      let fulfillments = 0;
+      const commands = [];
+      const note = (value) => appendFile(join(root, mode + ".log"), value + "\\n");
+      const cleanupFailure = () => mode === "cleanup";
+      const context = {
+        pages: () => [collisionPage, hiddenPage].filter(Boolean),
+        async newPage() { await note("newPage"); throw new Error("capture used context.newPage"); },
+        async cookies(...urls) { if (urls.length) throw new Error("capture cookies were targeted"); return []; },
+        async storageState() { throw new Error("capture used storageState"); },
+        async route(_url, handler) {
+          await note("route");
+          if (commands.at(-1) !== "Browser.getWindowForTarget") throw new Error("route preceded hidden-target proof");
+          routeHandler = handler;
+        },
+        async unroute() { routeHandler = undefined; },
+        async newCDPSession(page) {
+          if (page === collisionPage) return {
+            async send(method, params) {
+              if (method !== "Target.getTargetInfo" || params !== undefined) throw new Error("collision target was used");
+              return { targetInfo: { targetId: "visible-target", type: "page" } };
+            },
+            async detach() { collisionDetached = true; await note("collision-detach"); },
+          };
+          if (page !== hiddenPage) throw new Error("wrong hidden page");
+          let identityProved = false;
+          return {
+            async send(method, params) {
+              if (method === "Target.getTargetInfo") {
+                if (params !== undefined) throw new Error("candidate identity used a targetId");
+                identityProved = true;
+                return { targetInfo: { targetId: "hidden-target", type: "other" } };
+              }
+              if (!identityProved) throw new Error("hidden target used before identity proof");
+              if (method === "Network.enable" || method === "DOMStorage.enable") return {};
+              if (method === "Network.setBypassServiceWorker") { bypassed = params?.bypass === true; return {}; }
+              if (method === "DOMStorage.getDOMStorageItems") {
+                if (mode === "origin_storage") throw new Error("private storage detail");
+                const origin = params.storageId.securityOrigin;
+                return { entries: [["token", origin]] };
+              }
+              throw new Error("unexpected target CDP method " + method);
+            },
+            async detach() {
+              targetDetached = true;
+              await note("target-detach");
+              if (cleanupFailure()) throw new Error("target detach failed");
+            },
+          };
+        },
+      };
+      const browserCdp = {
+        async send(method, params) {
+          if (["Browser.getVersion", "Target.createTarget", "Target.getTargetInfo", "Browser.getWindowForTarget"].includes(method)) commands.push(method);
+          if (method === "Browser.getVersion") {
+            if (mode === "unsupported") return { product: "Chrome/136.0.7103.0" };
+            if (mode === "unparseable") return { product: "Chrome/dev" };
+            return { product: "Chromium/146.0.7680.153" };
+          }
+          if (method === "Target.createTarget") {
+            creates++;
+            await note("create");
+            if (commands.slice(0, 2).join(",") !== "Browser.getVersion,Target.createTarget"
+              || params?.url !== "about:blank#__ghosteranti_hidden_capture__"
+              || params?.background !== true || params?.hidden !== true || params?.browserContextId !== undefined) {
+              throw new Error("wrong hidden target command");
+            }
+            if (mode === "supported") collisionPage = {
+              currentUrl: params.url,
+              url() { return this.currentUrl; },
+              async goto() { collisionNavigated = true; await note("collision-goto"); },
+              async close() { collisionClosed = true; await note("collision-close"); },
+            };
+            hiddenPage = {
+              currentUrl: params.url,
+              url() { return this.currentUrl; },
+              async goto(url) {
+                navigations++;
+                await note("goto");
+                if (mode === "navigation") throw new Error("private navigation detail");
+                if (commands.at(-1) !== "Browser.getWindowForTarget") throw new Error("navigation preceded hidden-target proof");
+                this.currentUrl = url;
+                await routeHandler?.({ fulfill: async () => { fulfillments++; } });
+              },
+              async close() {
+                pageClosed = true;
+                await note("page-close");
+                if (cleanupFailure()) throw new Error("page close failed");
+                hiddenPage = undefined;
+              },
+            };
+            return { targetId: "hidden-target" };
+          }
+          if (method === "Target.getTargetInfo") {
+            if (mode === "target-error") throw new Error("target verification unavailable");
+            return { targetInfo: {
+              targetId: mode === "wrong-id" ? "other-target" : params.targetId,
+              type: mode === "wrong-type" ? "page" : "other",
+              url: mode === "wrong-url" ? "about:blank#other" : "about:blank#__ghosteranti_hidden_capture__",
+            } };
+          }
+          if (method === "Browser.getWindowForTarget") {
+            if (mode === "attached-window") return { windowId: 17 };
+            if (mode === "window-error") throw new Error("Protocol error (Browser.getWindowForTarget): Permission denied");
+            const prefix = mode === "supported" ? "cdpSession.send: " : "";
+            throw new Error(prefix + "Protocol error (Browser.getWindowForTarget): Browser window not found");
+          }
+          if (method === "Target.closeTarget") {
+            targetClosed = true;
+            hiddenPage = undefined;
+            await note("target-close");
+            if (cleanupFailure()) throw new Error("target close failed");
+            return { success: true };
+          }
+          throw new Error("unexpected browser CDP method " + method);
+        },
+        async detach() {
+          browserDetached = true;
+          await note("browser-detach");
+          if (cleanupFailure()) throw new Error("browser detach failed");
+        },
+      };
+      export const chromium = { async connectOverCDP(endpoint) {
+        mode = endpoint.split("//")[1];
+        return {
+          contexts: () => [context],
+          async newBrowserCDPSession() {
+            browserSessionRequested = true;
+            if (mode === "empty") throw new Error("empty capture created a browser CDP session");
+            return browserCdp;
+          },
+          async close() {
+            if (mode === "empty") {
+              if (browserSessionRequested || commands.length) throw new Error("empty capture created a target");
+              return;
+            }
+            if (["supported", "cleanup"].includes(mode)) {
+              const expectedNavigations = mode === "supported" ? 2 : 1;
+              if (creates !== 1 || navigations !== expectedNavigations || fulfillments !== expectedNavigations
+                || !bypassed || routeHandler || hiddenPage || !targetDetached || !pageClosed || !targetClosed || !browserDetached
+                || (mode === "supported" && (!collisionDetached || collisionNavigated || collisionClosed
+                  || collisionPage?.url() !== "about:blank#__ghosteranti_hidden_capture__"))) {
+                throw new Error("hidden capture target lifecycle was incomplete");
+              }
+            }
+          },
+        };
+      } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    expect(JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://supported",
+      captureSeed: { origins: ["https://a.example", "https://b.example"] },
+    }, { runtimeRoot: root, timeoutMs: 5_000 }))).toEqual({
+      cookies: [],
+      origins: ["https://a.example", "https://b.example"].map((origin) => ({
+        origin, localStorage: [{ name: "token", value: origin }],
+      })),
+      tabs: [],
+    });
+    expect(JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://empty",
+    }, { runtimeRoot: root, timeoutMs: 5_000 }))).toEqual({ cookies: [], origins: [], tabs: [] });
+    expect(JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://cleanup",
+      captureSeed: { origins: ["https://closed.example"] },
+    }, { runtimeRoot: root, timeoutMs: 5_000 }))).toEqual({
+      cookies: [],
+      origins: [{ origin: "https://closed.example", localStorage: [{ name: "token", value: "https://closed.example" }] }],
+      tabs: [],
+    });
+
+    const modes = [
+      "unsupported", "unparseable", "wrong-id", "wrong-type", "wrong-url",
+      "target-error", "attached-window", "window-error",
+    ];
+    for (const mode of modes) {
+      const error = await runPlaywrightWorker("session-capture", {
+        endpoint: `ws://${mode}`,
+        captureSeed: { origins: ["https://closed.example"] },
+      }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+      expect(error).toMatchObject({
+        code: "operation_failed",
+        details: { operation: mode === "unsupported" ? "hidden_target_unsupported" : "hidden_target" },
+      });
+      const logFile = Bun.file(join(root, `${mode}.log`));
+      const events = await logFile.exists() ? (await logFile.text()).trim().split("\n") : [];
+      if (["unsupported", "unparseable"].includes(mode)) expect(events).not.toContain("create");
+      else {
+        expect(events).toContain("create");
+        expect(events).toContain("target-close");
+      }
+      expect(events).not.toContain("route");
+      expect(events).not.toContain("goto");
+      expect(events).not.toContain("newPage");
+    }
+    for (const operation of ["navigation", "origin_storage"]) {
+      const error = await runPlaywrightWorker("session-capture", {
+        endpoint: `ws://${operation}`,
+        captureSeed: { origins: ["https://closed.example"] },
+      }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+      expect(error).toMatchObject({ code: "operation_failed", details: { operation, outcome: "failed" } });
+      expect(JSON.stringify(error)).not.toContain("private");
+      expect(error.message).not.toContain("private");
+      const events = (await Bun.file(join(root, `${operation}.log`)).text()).trim().split("\n");
+      expect(events).toContain("target-close");
+      expect(events).toContain("browser-detach");
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker preserves Telegram direct-CDP allowlists through a hidden target", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-closed-telegram-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      const anchor = { url: () => "about:blank" };
+      let hiddenPage;
+      let routeHandler;
+      let storageDetached = false;
+      let browserDetached = false;
+      let signedIn = false;
+      let openTabsOnly = false;
+      const context = {
+        pages: () => hiddenPage ? [anchor, hiddenPage] : [anchor],
+        async route(_url, handler) { routeHandler = handler; },
+        async unroute() { routeHandler = undefined; },
+        async storageState() { throw new Error("capture used storageState"); },
+        async cookies() { return []; },
+        async newCDPSession(page) {
+          if (page !== hiddenPage) throw new Error("wrong storage CDP target");
+          return {
+            async send(method, params) {
+              if (method === "Target.getTargetInfo") {
+                if (params !== undefined) throw new Error("candidate identity used a targetId");
+                return { targetInfo: { targetId: "hidden-target", type: "other" } };
+              }
+              if (["Network.enable", "Network.setBypassServiceWorker", "DOMStorage.enable", "IndexedDB.enable"].includes(method)) return {};
+              if (method === "DOMStorage.getDOMStorageItems") return { entries: signedIn ? [["dc2_auth_key", '"key"']] : [["theme", "dark"]] };
+              if (method === "IndexedDB.requestDatabaseNames") return { databaseNames: ["cache-db", "tt-passcode"] };
+              if (method === "IndexedDB.requestDatabase") return {
+                databaseWithObjectStores: {
+                  name: params.databaseName,
+                  version: 1,
+                  objectStores: ["store", "cache"].map((name) => ({ name, keyPath: { type: "null" }, autoIncrement: false, indexes: [] })),
+                },
+              };
+              // Chromium 146 and 155 answer "Could not get index" to an empty index name.
+              if (method === "IndexedDB.requestData" && "indexName" in params) throw new Error("Protocol error (IndexedDB.requestData): Could not get index");
+              if (method === "IndexedDB.requestData") return {
+                objectStoreDataEntries: signedIn ? [] : [
+                  { primaryKey: { value: "sessionEncrypted" }, value: { objectId: "session-value" } },
+                  { primaryKey: { value: "globalEncrypted" }, value: { objectId: "global-value" } },
+                ],
+                hasMore: false,
+              };
+              if (method === "Runtime.callFunctionOn") return {
+                result: { value: { encoded: { ta: { b: params.objectId === "session-value" ? "AQI=" : "AwQ=", k: "ui8" } } } },
+              };
+              throw new Error("unexpected storage CDP method " + method);
+            },
+            async detach() { storageDetached = true; },
+          };
+        },
+      };
+      const browserCdp = {
+        async send(method, params) {
+          if (method === "Browser.getVersion") return { product: "Chrome/146.0.7680.153" };
+          if (method === "Target.getTargetInfo") return { targetInfo: { targetId: params.targetId, type: "other", url: "about:blank#__ghosteranti_hidden_capture__" } };
+          if (method === "Browser.getWindowForTarget") throw new Error("Protocol error (Browser.getWindowForTarget): Browser window not found");
+          if (method === "Target.closeTarget") { hiddenPage = undefined; return { success: true }; }
+          if (openTabsOnly) throw new Error("an open-tab capture created a temporary page");
+          if (method !== "Target.createTarget" || params.url !== "about:blank#__ghosteranti_hidden_capture__"
+            || params.browserContextId !== undefined || params.background !== true || params.hidden !== true
+            || process.env.PW_CHROMIUM_ATTACH_TO_OTHER !== "1") {
+            throw new Error("wrong hidden target command");
+          }
+          hiddenPage = {
+            currentUrl: params.url,
+            url() { return this.currentUrl; },
+            async goto(url) {
+              this.currentUrl = url;
+              if (!routeHandler) throw new Error("capture route missing");
+              await routeHandler({ fulfill: async () => {} });
+            },
+            async close() { hiddenPage = undefined; },
+          };
+          return { targetId: "hidden-target" };
+        },
+        async detach() { browserDetached = true; },
+      };
+      export const chromium = { async connectOverCDP(endpoint) {
+        signedIn = endpoint === "ws://signed-in";
+        openTabsOnly = endpoint === "ws://open-tabs-only";
+        return {
+        contexts: () => [context],
+        async newBrowserCDPSession() { return browserCdp; },
+        async close() {
+          if (hiddenPage || routeHandler || (!openTabsOnly && (!storageDetached || !browserDetached))
+            || process.env.PW_CHROMIUM_ATTACH_TO_OTHER !== undefined) {
+            throw new Error("hidden storage target cleanup was incomplete");
+          }
+        },
+      }; } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const captured = JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://browser",
+      captureSeed: { origins: ["https://web.telegram.org"], telegramClient: "a" },
+    }, { runtimeRoot: root, timeoutMs: 5_000 }));
+    expect(captured).toEqual({
+      cookies: [],
+      origins: [{
+        origin: "https://web.telegram.org",
+        localStorage: [{ name: "theme", value: "dark" }],
+        indexedDB: [{
+          name: "tt-passcode",
+          version: 1,
+          stores: [{
+            name: "store",
+            records: [
+              { key: "sessionEncrypted", valueEncoded: { ta: { b: "AQI=", k: "ui8" } } },
+              { key: "globalEncrypted", valueEncoded: { ta: { b: "AwQ=", k: "ui8" } } },
+            ],
+            indexes: [],
+            autoIncrement: false,
+          }],
+        }],
+      }],
+      tabs: [],
+      telegramClient: "a",
+    });
+    // A normal login is in localStorage, so a closed Telegram origin carries no IndexedDB, as a live page does.
+    const signedIn = JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://signed-in",
+      captureSeed: { origins: ["https://web.telegram.org"], telegramClient: "a" },
+    }, { runtimeRoot: root, timeoutMs: 5_000 }));
+    expect(signedIn.origins).toEqual([{
+      origin: "https://web.telegram.org",
+      localStorage: [{ name: "dc2_auth_key", value: '"key"' }],
+    }]);
+    // A storage-triggered checkpoint skips an origin without an open tab; the caller keeps its saved copy.
+    const openTabs = JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://open-tabs-only",
+      captureSeed: { origins: ["https://web.telegram.org"], openTabsOnly: true },
+    }, { runtimeRoot: root, timeoutMs: 5_000 }));
+    expect(openTabs.origins).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker falls back safely when a live page changes origin during capture", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-origin-race-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      const livePage = {
+        url: () => "https://race.example/start",
+        async evaluate() {
+          return { origin: "https://elsewhere.example", localStorage: [{ name: "wrong", value: "origin" }] };
+        },
+      };
+      let hiddenPage;
+      let routeHandler;
+      const context = {
+        pages: () => hiddenPage ? [livePage, hiddenPage] : [livePage],
+        async route(_url, handler) { routeHandler = handler; },
+        async unroute() { routeHandler = undefined; },
+        async newCDPSession(page) {
+          if (page === livePage) return {
+            async send(method) {
+              if (method === "Target.getTargetInfo") return { targetInfo: { browserContextId: "context-1" } };
+              throw new Error("unexpected anchor CDP method " + method);
+            },
+            async detach() {},
+          };
+          if (page !== hiddenPage) throw new Error("wrong storage CDP target");
+          return {
+            async send(method, params) {
+              if (method === "Target.getTargetInfo") {
+                if (params !== undefined) throw new Error("candidate identity used a targetId");
+                return { targetInfo: { targetId: "hidden-target", type: "other" } };
+              }
+              if (["Network.enable", "Network.setBypassServiceWorker", "DOMStorage.enable"].includes(method)) return {};
+              if (method === "DOMStorage.getDOMStorageItems") return { entries: [["safe", "fallback"]] };
+              throw new Error("unexpected storage CDP method " + method);
+            },
+            async detach() {},
+          };
+        },
+        async cookies() { return []; },
+        async storageState() { throw new Error("capture used storageState"); },
+      };
+      const browserCdp = {
+        async send(method, params) {
+          if (method === "Browser.getVersion") return { product: "Chrome/146.0.7680.153" };
+          if (method === "Target.getTargetInfo") return { targetInfo: { targetId: params.targetId, type: "other", url: "about:blank#__ghosteranti_hidden_capture__" } };
+          if (method === "Browser.getWindowForTarget") throw new Error("Protocol error (Browser.getWindowForTarget): Browser window not found");
+          if (method === "Target.closeTarget") { hiddenPage = undefined; return { success: true }; }
+          if (method !== "Target.createTarget" || params.browserContextId !== undefined
+            || params.background !== true || params.hidden !== true
+            || process.env.PW_CHROMIUM_ATTACH_TO_OTHER !== "1") {
+            throw new Error("wrong hidden target command");
+          }
+          hiddenPage = {
+            currentUrl: params.url,
+            url() { return this.currentUrl; },
+            async goto(url) {
+              this.currentUrl = url;
+              if (!routeHandler) throw new Error("capture route missing");
+              await routeHandler({ fulfill: async () => {} });
+            },
+            async close() { hiddenPage = undefined; },
+          };
+          return { targetId: "hidden-target" };
+        },
+        async detach() {},
+      };
+      export const chromium = { async connectOverCDP() { return {
+        contexts: () => [context],
+        async newBrowserCDPSession() { return browserCdp; },
+        async close() {
+          if (hiddenPage || routeHandler || process.env.PW_CHROMIUM_ATTACH_TO_OTHER !== undefined) {
+            throw new Error("hidden storage target cleanup was incomplete");
+          }
+        },
+      }; } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    expect(JSON.parse(await runPlaywrightWorker<string>("session-capture", {
+      endpoint: "ws://browser",
+    }, { runtimeRoot: root, timeoutMs: 5_000 }))).toEqual({
+      cookies: [],
+      origins: [{ origin: "https://race.example", localStorage: [{ name: "safe", value: "fallback" }] }],
+      tabs: ["https://race.example/start"],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+bunAsNodeTest("worker rejects capture when an attached Telegram page cannot be read", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-worker-telegram-capture-"));
+  try {
+    await mkdir(join(root, "node"), { recursive: true });
+    await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+    await fakePackagedNode(root);
+    await writeFile(join(root, "worker.mjs"), await Bun.file(join(import.meta.dir, "playwright-worker.mjs")).text());
+    await writeFile(join(root, "node_modules", "playwright-core", "package.json"), JSON.stringify({ name: "playwright-core", version: "1.58.2", type: "module" }));
+    await writeFile(join(root, "node_modules", "playwright-core", "index.mjs"), `
+      const page = { url: () => "https://web.telegram.org/a/", async evaluate() { throw new Error("unavailable"); } };
+      const context = { async storageState() { return { cookies: [], origins: [] }; }, pages: () => [page] };
+      export const chromium = { async connectOverCDP() { return { contexts: () => [context], async close() {} }; } };
+    `);
+    await chmod(join(root, "node", PACKAGED_NODE), 0o755);
+
+    const error = await runPlaywrightWorker("session-capture", {
+      endpoint: "ws://browser",
+    }, { runtimeRoot: root, timeoutMs: 5_000 }).then(() => null, (failure) => failure);
+    expect(error).toMatchObject({ code: "operation_failed" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("verifies the source Playwright runtime and Node version", async () => {
+  await expect(verifyPlaywrightRuntime()).resolves.toBeUndefined();
+});
+
+test("loads the installed Playwright ESM entrypoint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-playwright-runtime-"));
+  try {
+    const packageRoot = join(root, "node_modules", "playwright-core");
+    const wsRoot = join(root, "node_modules", "ws");
+    await mkdir(packageRoot, { recursive: true });
+    await mkdir(wsRoot, { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({
+      name: "playwright-core",
+      version: "1.58.2",
+    }));
+    await writeFile(join(wsRoot, "package.json"), JSON.stringify({
+      name: "ws",
+      version: "8.21.0",
+    }));
+    await writeFile(join(packageRoot, "index.mjs"), "export const chromium = {};");
+    await mkdir(join(root, "node"));
+    await writeFile(join(root, "node", PACKAGED_NODE), "node");
+    await writeFile(join(root, "worker.mjs"), "worker");
+
+    await verifyPlaywrightRuntime(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects an installed runtime without its ESM entrypoint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ghosteranti-playwright-runtime-"));
+  try {
+    const packageRoot = join(root, "node_modules", "playwright-core");
+    const wsRoot = join(root, "node_modules", "ws");
+    await mkdir(packageRoot, { recursive: true });
+    await mkdir(wsRoot, { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({
+      name: "playwright-core",
+      version: "1.58.2",
+    }));
+    await writeFile(join(wsRoot, "package.json"), JSON.stringify({
+      name: "ws",
+      version: "8.21.0",
+    }));
+
+    await expect(verifyPlaywrightRuntime(root)).rejects.toThrow("incomplete");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Firefox opens saved tabs in the window of the empty first page, not in new windows", async () => {
+  const visits: string[] = [];
+  const openers: string[] = [];
+  let windowsOpened = 0;
+  let front = "";
+  let resolveTab: ((page: unknown) => void) | undefined;
+  const makePage = (name: string, url: string) => {
+    const page = {
+      url: () => url,
+      async goto(target: string) { url = target; visits.push(`${name} ${target}`); },
+      // A page opens the next tab with window.open.
+      async evaluate() { openers.push(name); resolveTab?.(makePage(`tab${openers.length}`, "about:blank")); },
+      async bringToFront() { front = name; },
+      async close() {},
+    };
+    return page;
+  };
+  const first = makePage("first", "about:blank");
+  const context = {
+    pages: () => [first],
+    async newPage() { windowsOpened++; return makePage("window", "about:blank"); },
+    waitForEvent: () => new Promise((resolve) => { resolveTab = resolve; }),
+  };
+  await operatePersistentContext({}, context, "navigate", {
+    urls: ["https://one.example/", "https://two.example/", "https://one.example/"],
+    replacePages: true,
+  });
+  expect(windowsOpened).toBe(0);
+  // Each tab opens from the tab before it, so the tab strip keeps the saved order.
+  expect(openers).toEqual(["first", "tab1"]);
+  expect(visits).toEqual(["first https://one.example/", "tab1 https://two.example/", "tab2 https://one.example/"]);
+  expect(front).toBe("first");
+});

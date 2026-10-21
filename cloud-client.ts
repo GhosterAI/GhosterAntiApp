@@ -1,0 +1,547 @@
+import { normalizeSecureServiceUrl } from "./app-config.ts";
+import {
+  CLOUD_API_BASE_PATH,
+  type AbandonOpenResponse,
+  type AcceptInvitationRequest,
+  type AcceptLegalRequest,
+  type AcceptLegalResponse,
+  type BootstrapRequest,
+  type BootstrapResponse,
+  type CloseOpenConflict,
+  type CloseOpenRequest,
+  type CloseOpenResponse,
+  type CloudError,
+  type CloudErrorCode,
+  type CloudFolder,
+  type CloudMember,
+  type CloudStatusResponse,
+  type CloudWorkspace,
+  type FolderPermission,
+  type CreateInvitationResponse,
+  type CreateMcpConnectorResponse,
+  type CreateProfileRequest,
+  type CreateProfileResponse,
+  type GetProfileResponse,
+  type ImportProfilesRequest,
+  type ImportProfilesResponse,
+  type SetFolderGrantResponse,
+  type SetProfileGrantResponse,
+  type SetFolderExtensionDefaultsRequest,
+  type SetFolderExtensionDefaultsResponse,
+  type ListFoldersResponse,
+  type ListInvitationsResponse,
+  type ListMcpConnectorsResponse,
+  type ListMembersResponse,
+  type ListProfilesResponse,
+  type ListProfileProxiesResponse,
+  type ResendInvitationResponse,
+  type MoveProfileRequest,
+  type OpenHeartbeatResponse,
+  type OpenProfileRequest,
+  type OpenProfileResponse,
+  type ProfileMutationResponse,
+  type ProxyReplacementsRequest,
+  type ProxyReplacementsResponse,
+  type PurgeProfileResponse,
+  type RestoreProfileRequest,
+  type TrashProfileRequest,
+  type UpdateProfileRequest,
+  type UpdateProfileResponse,
+  type ScriptInput,
+  type ScriptRecord,
+  type ScriptSummary,
+  type PublishedScript,
+  type PublishScriptInput,
+  type PublishedScriptsQuery,
+  type ListPublishedScriptsResponse,
+} from "./contracts/cloud-v1.ts";
+
+export type CloudFetch = (url: string, init?: RequestInit) => Promise<Response>;
+export type CloudCredentialProvider = () => string | undefined | Promise<string | undefined>;
+
+const DEFAULT_CLOUD_REQUEST_TIMEOUT_MS = 30_000;
+
+export type CloudRequestFailure =
+  | { kind: "transport"; retryable: true }
+  | { kind: "timeout"; retryable: true };
+
+export class CloudRequestError extends Error {
+  constructor(
+    message: string,
+    readonly failure: CloudRequestFailure,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "CloudRequestError";
+  }
+}
+
+export class CloudApiError extends Error {
+  constructor(
+    message: string,
+    readonly code: CloudErrorCode,
+    readonly status: number,
+    readonly currentVersion?: number,
+  ) {
+    super(message);
+    this.name = "CloudApiError";
+  }
+}
+
+export interface CloudClientOptions {
+  baseUrl: string;
+  accessToken: CloudCredentialProvider;
+  deviceCredential?: CloudCredentialProvider;
+  fetchFn?: CloudFetch;
+  requestTimeoutMs?: number;
+}
+
+async function readResponseText(response: Response, progress: () => void): Promise<string> {
+  if (!response.body) return response.text();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return text + decoder.decode();
+    progress();
+    text += decoder.decode(value, { stream: true });
+  }
+}
+
+interface CallResponseOptions<T> {
+  anonymous?: boolean;
+  notModified?: () => T;
+  received?: (response: Response, body: T) => void;
+}
+
+export class CloudClient {
+  private readonly baseUrl: string;
+  private readonly fetchFn: CloudFetch;
+  private readonly requestTimeoutMs: number;
+  private profileRoster?: { etag: string; response: ListProfilesResponse };
+  private rosterInFlight?: Promise<ListProfilesResponse>;
+
+  constructor(private readonly options: CloudClientOptions) {
+    this.baseUrl = normalizeSecureServiceUrl(options.baseUrl, "GhosterAnti Cloud");
+    this.fetchFn = options.fetchFn ?? ((url, init) => fetch(url, init));
+    this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? DEFAULT_CLOUD_REQUEST_TIMEOUT_MS);
+  }
+
+  private async call<T>(
+    path: string,
+    init: RequestInit = {},
+    responseOptions: CallResponseOptions<T> = {},
+  ): Promise<T> {
+    const headers = new Headers(init.headers);
+    if (!responseOptions.anonymous) {
+      const accessToken = await this.options.accessToken();
+      if (!accessToken) {
+        throw new CloudApiError("GhosterAnti Cloud authentication is required", "authentication_required", 401);
+      }
+      const deviceCredential = await this.options.deviceCredential?.();
+      headers.set("authorization", `Bearer ${accessToken}`);
+      if (deviceCredential) headers.set("x-ghosteranti-device", deviceCredential);
+    }
+    if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json");
+
+    const controller = new AbortController();
+    const upstreamSignal = init.signal;
+    const abortFromUpstream = () => controller.abort(upstreamSignal?.reason);
+    if (upstreamSignal?.aborted) abortFromUpstream();
+    else upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+
+    // The limit covers silence, not total transfer time: a large roster on a
+    // slow link keeps arriving and must not fail only because it needs longer.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let rejectTimeout!: (error: CloudRequestError) => void;
+    const timeout = new Promise<never>((_, reject) => { rejectTimeout = reject; });
+    const restartTimeout = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const error = new CloudRequestError(
+          `GhosterAnti Cloud request ${path} timed out after ${this.requestTimeoutMs}ms`,
+          { kind: "timeout", retryable: true },
+        );
+        controller.abort(error);
+        rejectTimeout(error);
+      }, this.requestTimeoutMs);
+      if (timer && typeof timer === "object" && "unref" in timer) timer.unref();
+    };
+    restartTimeout();
+
+    try {
+      const request = Promise.resolve().then(async () => {
+        let response: Response;
+        try {
+          response = await this.fetchFn(`${this.baseUrl}${CLOUD_API_BASE_PATH}${path}`, {
+            ...init,
+            headers,
+            signal: controller.signal,
+          });
+        } catch (error) {
+          throw new CloudRequestError(
+            `GhosterAnti Cloud request ${path} could not be sent`,
+            { kind: "transport", retryable: true },
+            { cause: error },
+          );
+        }
+        restartTimeout();
+        if (response.status === 304) {
+          if (!responseOptions.notModified) {
+            throw new Error(`GhosterAnti Cloud ${path} returned an unexpected not-modified response`);
+          }
+          return responseOptions.notModified();
+        }
+        let text: string;
+        try {
+          text = await readResponseText(response, restartTimeout);
+        } catch (error) {
+          throw new CloudRequestError(
+            `GhosterAnti Cloud response ${path} could not be read`,
+            { kind: "transport", retryable: true },
+            { cause: error },
+          );
+        }
+        let body: any = {};
+        if (text.trim()) {
+          try {
+            body = JSON.parse(text);
+          } catch {
+            const contentType = response.headers.get("content-type") ?? "unknown content type";
+            const message = `GhosterAnti Cloud ${path} returned non-JSON (${response.status}, ${contentType})`;
+            if (!response.ok) throw new CloudApiError(message, "internal_error", response.status);
+            throw new Error(message);
+          }
+        }
+        if (!response.ok || body?.ok === false) this.throwApiError(response.status, body);
+        const result = body as T;
+        responseOptions.received?.(response, result);
+        return result;
+      });
+      return await Promise.race([request, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+    }
+  }
+
+  private throwApiError(status: number, body: Partial<CloudError>): never {
+    const error = body.error;
+    const code = error?.code ?? "internal_error";
+    const message = error?.message ?? `GhosterAnti Cloud request failed (${status})`;
+    throw new CloudApiError(message, code, status, error?.currentVersion);
+  }
+
+  status(): Promise<CloudStatusResponse> {
+    return this.call("/status");
+  }
+
+  bootstrap(request: BootstrapRequest): Promise<BootstrapResponse> {
+    return this.call("/account/bootstrap", { method: "POST", body: JSON.stringify(request) });
+  }
+
+  acceptLegal(request: AcceptLegalRequest): Promise<AcceptLegalResponse> {
+    return this.call("/account/legal", { method: "POST", body: JSON.stringify(request) });
+  }
+
+  listScripts(): Promise<{ ok: true; scripts: ScriptSummary[]; publicationDefaults?: { authorName: string } }> {
+    return this.call("/account/scripts");
+  }
+
+  getScript(id: string): Promise<{ ok: true; script: ScriptRecord }> {
+    return this.call(`/account/scripts/${encodeURIComponent(id)}`);
+  }
+
+  createScript(input: ScriptInput): Promise<{ ok: true; script: ScriptRecord }> {
+    return this.call("/account/scripts", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  updateScript(id: string, input: ScriptInput & { expectedRevision: number }): Promise<{ ok: true; script: ScriptRecord }> {
+    return this.call(`/account/scripts/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) });
+  }
+
+  deleteScript(id: string, expectedRevision: number): Promise<{ ok: true; deleted: true }> {
+    return this.call(`/account/scripts/${encodeURIComponent(id)}`, {
+      method: "DELETE", body: JSON.stringify({ expectedRevision }),
+    });
+  }
+
+  listPublishedScripts(query: PublishedScriptsQuery = {}): Promise<ListPublishedScriptsResponse> {
+    const params = new URLSearchParams();
+    if (query.q) params.set("q", query.q);
+    if (query.language) params.set("language", query.language);
+    if (query.offset !== undefined) params.set("offset", String(query.offset));
+    return this.call(`/library/scripts?${params}`, { cache: "no-store", credentials: "omit" }, { anonymous: true });
+  }
+
+  getPublishedScript(id: string): Promise<{ ok: true; script: PublishedScript }> {
+    return this.call(`/library/scripts/${encodeURIComponent(id)}`, { cache: "no-store", credentials: "omit" }, { anonymous: true });
+  }
+
+  publishScript(id: string, input: PublishScriptInput): Promise<{ ok: true; script: PublishedScript }> {
+    return this.call(`/account/scripts/${encodeURIComponent(id)}/publication`, { method: "PUT", body: JSON.stringify(input) });
+  }
+
+  unpublishScript(id: string): Promise<{ ok: true; unpublished: true }> {
+    return this.call(`/account/scripts/${encodeURIComponent(id)}/publication`, { method: "DELETE" });
+  }
+
+  listFolders(): Promise<ListFoldersResponse> {
+    return this.call("/workspace/folders");
+  }
+
+  createFolder(name: string, parentName?: string | null): Promise<{ ok: true; folder: CloudFolder }> {
+    return this.call("/workspace/folders", { method: "POST", body: JSON.stringify({ name, parentName }) });
+  }
+
+  moveFolder(name: string, parentName: string | null): Promise<{ ok: true; folder: CloudFolder }> {
+    return this.call(`/workspace/folders/${encodeURIComponent(name)}/move`, {
+      method: "POST", body: JSON.stringify({ parentName }),
+    });
+  }
+
+  setProfileGrant(profileId: string, accountId: string, permission: FolderPermission): Promise<SetProfileGrantResponse> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}/grants/${encodeURIComponent(accountId)}`, {
+      method: "PUT", body: JSON.stringify({ permission }),
+    });
+  }
+
+  removeProfileGrant(profileId: string, accountId: string): Promise<{ ok: true }> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}/grants/${encodeURIComponent(accountId)}`, { method: "DELETE" });
+  }
+
+  renameFolder(name: string, nextName: string): Promise<{ ok: true; folder: CloudFolder }> {
+    return this.call(`/workspace/folders/${encodeURIComponent(name)}`, {
+      method: "PATCH", body: JSON.stringify({ name: nextName }),
+    });
+  }
+
+  archiveFolder(name: string): Promise<{ ok: true; folder: CloudFolder }> {
+    return this.call(`/workspace/folders/${encodeURIComponent(name)}/archive`, {
+      method: "POST", body: "{}",
+    });
+  }
+
+  deleteFolder(name: string): Promise<{ ok: true }> {
+    return this.call(`/workspace/folders/${encodeURIComponent(name)}`, { method: "DELETE" });
+  }
+
+  setFolderGrant(name: string, accountId: string, permission: FolderPermission): Promise<SetFolderGrantResponse> {
+    return this.call(`/workspace/folders/${encodeURIComponent(name)}/grants/${encodeURIComponent(accountId)}`, {
+      method: "PUT", body: JSON.stringify({ permission }),
+    });
+  }
+
+  removeFolderGrant(name: string, accountId: string): Promise<{ ok: true }> {
+    return this.call(`/workspace/folders/${encodeURIComponent(name)}/grants/${encodeURIComponent(accountId)}`, { method: "DELETE" });
+  }
+
+  async setFolderExtensionDefaults(
+    name: string,
+    extensionDefaults: string[],
+  ): Promise<SetFolderExtensionDefaultsResponse> {
+    const request: SetFolderExtensionDefaultsRequest = { extensionDefaults };
+    const response = await this.call<SetFolderExtensionDefaultsResponse>(
+      `/workspace/folders/${encodeURIComponent(name)}/extensions`,
+      { method: "PUT", body: JSON.stringify(request) },
+    );
+    this.forgetRoster();
+    return response;
+  }
+
+  listMembers(): Promise<ListMembersResponse> {
+    return this.call("/workspace/members");
+  }
+
+  changeMemberRole(accountId: string, role: "admin" | "member"): Promise<{ ok: true; member: CloudMember }> {
+    return this.call(`/workspace/members/${encodeURIComponent(accountId)}`, {
+      method: "PATCH", body: JSON.stringify({ role }),
+    });
+  }
+
+  removeMember(accountId: string): Promise<{ ok: true }> {
+    return this.call(`/workspace/members/${encodeURIComponent(accountId)}`, { method: "DELETE" });
+  }
+
+  sendMemberPasswordReset(accountId: string): Promise<{ ok: true }> {
+    return this.call(`/workspace/members/${encodeURIComponent(accountId)}/password-reset`, { method: "POST", body: "{}" });
+  }
+
+  listInvitations(): Promise<ListInvitationsResponse> {
+    return this.call("/workspace/invitations");
+  }
+
+  createInvitation(email: string, role: "admin" | "member"): Promise<CreateInvitationResponse> {
+    return this.call("/workspace/invitations", {
+      method: "POST", body: JSON.stringify({ email, role }),
+    });
+  }
+
+  resendInvitation(id: string): Promise<ResendInvitationResponse> {
+    return this.call(`/workspace/invitations/${encodeURIComponent(id)}/resend`, { method: "POST", body: "{}" });
+  }
+
+  revokeInvitation(id: string): Promise<{ ok: true }> {
+    return this.call(`/workspace/invitations/${encodeURIComponent(id)}/revoke`, { method: "POST", body: "{}" });
+  }
+
+  acceptInvitation(code: string): Promise<{ ok: true; workspace: CloudWorkspace }> {
+    const request: AcceptInvitationRequest = { code };
+    return this.call("/invitations/accept", { method: "POST", body: JSON.stringify(request) });
+  }
+
+  createMcpConnector(label: string): Promise<CreateMcpConnectorResponse> {
+    return this.call("/mcp/connectors", {
+      method: "POST",
+      body: JSON.stringify({ label }),
+    });
+  }
+
+  listMcpConnectors(): Promise<ListMcpConnectorsResponse> {
+    return this.call("/mcp/connectors");
+  }
+
+  revokeMcpConnector(connectorId: string): Promise<{ ok: true }> {
+    return this.call(`/mcp/connectors/${encodeURIComponent(connectorId)}`, { method: "DELETE" });
+  }
+
+  remoteMcpUrl(deviceId: string): string {
+    return `${this.baseUrl}${CLOUD_API_BASE_PATH}/mcp/devices/${encodeURIComponent(deviceId)}`;
+  }
+
+  listProfiles(): Promise<ListProfilesResponse> {
+    // Callers share one download: on a slow link a large roster takes longer
+    // than the dashboard poll, and parallel copies split the bandwidth.
+    if (this.rosterInFlight) return this.rosterInFlight;
+    const headers = new Headers();
+    if (this.profileRoster) headers.set("if-none-match", this.profileRoster.etag);
+    const request = this.call<ListProfilesResponse>("/profiles", { headers }, {
+      notModified: () => {
+        if (!this.profileRoster) throw new Error("GhosterAnti Cloud profile roster cache is empty");
+        return this.profileRoster.response;
+      },
+      received: (response, body) => {
+        const etag = response.headers.get("etag");
+        this.profileRoster = etag ? { etag, response: body } : undefined;
+      },
+    }).finally(() => {
+      if (this.rosterInFlight === request) this.rosterInFlight = undefined;
+    });
+    this.rosterInFlight = request;
+    return request;
+  }
+
+  /** After a write, the next roster must be a new fetch, not the cached or in-flight one. */
+  private forgetRoster(): void {
+    this.profileRoster = undefined;
+    this.rosterInFlight = undefined;
+  }
+
+  listProfileProxies(signal?: AbortSignal): Promise<ListProfileProxiesResponse> {
+    return this.call("/profiles/proxies", { cache: "no-store", signal });
+  }
+
+  getProfile(profileId: string): Promise<GetProfileResponse> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}`);
+  }
+
+  updateProfile(profileId: string, request: UpdateProfileRequest): Promise<UpdateProfileResponse> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(request),
+    });
+  }
+
+  moveProfile(profileId: string, request: MoveProfileRequest): Promise<UpdateProfileResponse> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}/move`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  trashProfile(profileId: string, request: TrashProfileRequest): Promise<ProfileMutationResponse> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}/trash`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  restoreProfile(profileId: string, request: RestoreProfileRequest): Promise<ProfileMutationResponse> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}/restore`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  purgeProfile(profileId: string, expectedVersion: number): Promise<PurgeProfileResponse> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}/purge`, {
+      method: "DELETE",
+      body: JSON.stringify({ expectedVersion }),
+    });
+  }
+
+  createProfile(request: CreateProfileRequest): Promise<CreateProfileResponse> {
+    return this.call("/profiles", { method: "POST", body: JSON.stringify(request) });
+  }
+
+  async importProfiles(request: ImportProfilesRequest): Promise<ImportProfilesResponse> {
+    const response = await this.call<ImportProfilesResponse>("/profiles/import", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    this.forgetRoster();
+    return response;
+  }
+
+  async replaceProfileProxies(request: ProxyReplacementsRequest): Promise<ProxyReplacementsResponse> {
+    const response = await this.call<ProxyReplacementsResponse>("/profiles/proxy-replacements", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    if (!request.dryRun) this.forgetRoster();
+    return response;
+  }
+
+  openProfile(profileId: string, request: OpenProfileRequest): Promise<OpenProfileResponse> {
+    return this.call(`/profiles/${encodeURIComponent(profileId)}/open`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  heartbeat(registrationId: string): Promise<OpenHeartbeatResponse> {
+    return this.call(`/open-sessions/${encodeURIComponent(registrationId)}/heartbeat`, { method: "POST" });
+  }
+
+  async closeOpen(
+    registrationId: string,
+    request: CloseOpenRequest,
+  ): Promise<CloseOpenResponse | CloseOpenConflict> {
+    try {
+      return await this.call(`/open-sessions/${encodeURIComponent(registrationId)}/close`, {
+        method: "PUT",
+        body: JSON.stringify(request),
+      });
+    } catch (error) {
+      if (error instanceof CloudApiError && error.code === "version_conflict") {
+        if (!Number.isSafeInteger(error.currentVersion) || error.currentVersion! < 0) {
+          throw new Error("GhosterAnti Cloud version conflict is missing currentVersion");
+        }
+        return {
+          ok: false,
+          error: {
+            code: "version_conflict",
+            message: error.message,
+            currentVersion: error.currentVersion!,
+          },
+        };
+      }
+      throw error;
+    }
+  }
+
+  abandon(registrationId: string): Promise<AbandonOpenResponse> {
+    return this.call(`/open-sessions/${encodeURIComponent(registrationId)}/abandon`, { method: "POST" });
+  }
+}

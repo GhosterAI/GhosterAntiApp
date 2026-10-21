@@ -1,0 +1,4827 @@
+import { test, expect } from "bun:test";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
+import { mkdirSync, writeFileSync, existsSync, rmSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ProfileStore } from "./store.ts";
+import { Launcher } from "./launcher.ts";
+import { parseExport } from "./parse.ts";
+import { deriveFingerprintFlags } from "./fingerprint.ts";
+import { listUiProfiles, handleUiRequest } from "./ui.ts";
+import { supportsChromium155Host } from "./ghosteranti-chromium.ts";
+import { readXlsx, writeXlsx } from "./xlsx.ts";
+import { AppConfigStore } from "./app-config.ts";
+import { CloudAuthRuntime } from "./cloud-auth.ts";
+import { CloudConnectionRuntime } from "./cloud-connection.ts";
+import { CloudBrowserCoordinator } from "./cloud-browser.ts";
+import { PendingSyncRuntime } from "./pending-sync.ts";
+import { EmailVerificationRequiredError, SupabaseAuthRequestError, type SupabaseAuthClient } from "./supabase-auth.ts";
+import { CloudApiError, CloudRequestError } from "./cloud-client.ts";
+import { encodePortableProfile } from "./portable-profile.ts";
+import type { ProxyCheckResult } from "./proxy-check.ts";
+import type { Profile, ProxySpec } from "./types.ts";
+
+const SAMPLE = `id=k1d0cd11
+name=sophia
+group=va1
+username=account-user
+password=SECRETpw
+email=mailbox@example.com
+emailpassword=MAILSECRETpw
+fakey=TOTPSEED
+cookie=[{"name":"auth_token","value":"COOKIEVAL","domain":".x.com","path":"/","expires":4070908800}]
+proxytype=http
+proxy=1.2.3.4:8080:proxyuser:PROXYPASS
+ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/143.0.0.0 Safari/537.36
+resolution=1680*1050
+******************`;
+
+function store(): ProfileStore {
+  const s = new ProfileStore(":memory:");
+  for (const p of parseExport(SAMPLE).profiles) s.upsertProfile(p);
+  return s;
+}
+
+function firefoxProfile(s: ProfileStore, id: string): Profile {
+  const base = s.getProfile("k1d0cd11")!;
+  return {
+    ...base,
+    id,
+    engine: "firefox",
+    firefox: {
+      version: 1,
+      runtimeVersion: "test-firefox",
+      config: { timezone: "UTC" },
+    },
+  };
+}
+
+function timezoneFetch(timezones: Record<string, string>, calls?: string[][]) {
+  return async (url: string, _init: RequestInit) => {
+    calls?.push([url]);
+    const timezone = Object.values(timezones)[0];
+    return { json: async () => timezone ? { status: "success", timezone } : { status: "fail" } };
+  };
+}
+
+const EXTENSION_ZIP = Buffer.from(
+  "UEsDBBQAAAAAAFtxHl1SmQ+hOwAAADsAAAANAAAAbWFuaWZlc3QuanNvbnsibWFuaWZlc3RfdmVyc2lvbiI6MywibmFtZSI6IlJvdXRlIEZpeHR1cmUiLCJ2ZXJzaW9uIjoiMSJ9UEsBAhQDFAAAAAAAW3EeXVKZD6E7AAAAOwAAAA0AAAAAAAAAAAAAAIABAAAAAG1hbmlmZXN0Lmpzb25QSwUGAAAAAAEAAQA7AAAAZgAAAAAA",
+  "base64",
+);
+
+function extensionId(publicKey: Uint8Array): string {
+  const digest = createHash("sha256").update(publicKey).digest();
+  return [...digest.subarray(0, 16)]
+    .map((byte) => String.fromCharCode(97 + (byte >> 4), 97 + (byte & 15)))
+    .join("");
+}
+
+const extensionKeys = generateKeyPairSync("rsa", { modulusLength: 1024 });
+const extensionPublicKey = new Uint8Array(
+  extensionKeys.publicKey.export({ format: "der", type: "spki" }),
+);
+
+function extensionCrx(): Uint8Array {
+  const signature = new Uint8Array(sign("sha1", EXTENSION_ZIP, extensionKeys.privateKey));
+  const header = new Uint8Array(16);
+  header.set(new TextEncoder().encode("Cr24"));
+  const view = new DataView(header.buffer);
+  view.setUint32(4, 2, true);
+  view.setUint32(8, extensionPublicKey.length, true);
+  view.setUint32(12, signature.length, true);
+  const out = new Uint8Array(header.length + extensionPublicKey.length + signature.length + EXTENSION_ZIP.length);
+  out.set(header);
+  out.set(extensionPublicKey, header.length);
+  out.set(signature, header.length + extensionPublicKey.length);
+  out.set(EXTENSION_ZIP, header.length + extensionPublicKey.length + signature.length);
+  return out;
+}
+
+function extensionResponse(): Response {
+  const bytes = extensionCrx();
+  return new Response(bytes.buffer as ArrayBuffer);
+}
+
+test("listUiProfiles exposes metadata but redacts every secret", () => {
+  const s = store();
+  const list = listUiProfiles(s);
+  const p = list[0]!;
+  expect(p.proxy).toBe("1.2.3.4:8080"); // host:port only
+  expect(p.cookieCount).toBe(1);
+  expect(p.screen).toBe("1680x1050");
+  expect(p.running).toBe(false);
+
+  const json = JSON.stringify(list);
+  for (const secret of ["account-user", "SECRETpw", "MAILSECRETpw", "mailbox@example.com", "TOTPSEED", "COOKIEVAL", "PROXYPASS", "proxyuser"]) {
+    expect(json.includes(secret)).toBe(false);
+  }
+  s.close();
+});
+
+test("a quarantined legacy proxy stays visible and repairable without exposing credentials", async () => {
+  const s = store();
+  const raw = JSON.stringify({ type: "socks4", host: "legacy.example", port: "1080", user: "legacy-user", pass: "legacy-pass" });
+  (s as any)["db"].query("UPDATE profiles SET proxy_json = ? WHERE id = ?").run(raw, "k1d0cd11");
+
+  const roster = listUiProfiles(s);
+  expect(roster).toHaveLength(1);
+  expect(roster[0]!.proxy).toBeNull();
+  expect(roster[0]!.proxyError).toContain("unsupported proxy type");
+  expect(JSON.stringify(roster)).not.toContain("legacy-pass");
+
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11"),
+    {} as any,
+    s,
+  );
+  const edit = (await response!.json()).profile;
+  expect(edit.proxy).toBe("");
+  expect(edit.proxyError).toContain("unsupported proxy type");
+  s.close();
+});
+
+test("proxy check route works in Cloud mode without storing proxy data", async () => {
+  const s = store();
+  const before = structuredClone(s.getProfile("k1d0cd11"));
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-proxy-check-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const checked: ProxySpec[] = [];
+  const results: ProxyCheckResult[] = [
+    { status: "working", attempts: 3, successes: 3, ip: "203.0.113.10", country: "US", rotating: false },
+    { status: "unstable", attempts: 3, successes: 2, reason: "intermittent", ip: "203.0.113.11" },
+    { status: "failed", attempts: 3, successes: 0, reason: "authentication_failed" },
+    { status: "unavailable", attempts: 3, successes: 0, reason: "check_unavailable" },
+  ];
+
+  for (const expected of results) {
+    const response = await handleUiRequest(
+      new Request("http://x/ui/api/proxy/check", {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "http://x" },
+        body: JSON.stringify({
+          proxy: {
+            type: "socks5",
+            host: " proxy.example ",
+            port: "01080",
+            user: " proxy-user ",
+            pass: "private-password",
+          },
+        }),
+      }),
+      {} as any,
+      s,
+      null,
+      {
+        appConfig,
+        proxyCheck: async (proxy: ProxySpec) => {
+          checked.push(proxy);
+          return { ...expected, pass: "must-not-leak" } as ProxyCheckResult;
+        },
+      } as any,
+    );
+    expect(response!.status).toBe(200);
+    expect(response!.headers.get("cache-control")).toBe("no-store");
+    expect(await response!.json()).toEqual({ ok: true, ...expected });
+  }
+
+  expect(checked).toEqual(Array.from({ length: results.length }, () => ({
+    type: "socks5",
+    host: "proxy.example",
+    port: "1080",
+    user: "proxy-user",
+    pass: "private-password",
+  })));
+  expect(s.getProfile("k1d0cd11")).toEqual(before);
+  s.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("proxy check route rejects untrusted or invalid input without echoing credentials", async () => {
+  const s = store();
+  let checks = 0;
+  const options = {
+    proxyCheck: async () => {
+      checks++;
+      throw new Error("checker exposed private-password");
+    },
+  } as any;
+  const request = (body: unknown, headers: HeadersInit = { "content-type": "application/json" }) =>
+    handleUiRequest(new Request("http://x/ui/api/proxy/check", {
+      method: "POST",
+      headers,
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    }), {} as any, s, null, options);
+
+  const untrusted = await request({}, { "content-type": "text/plain" });
+  expect(untrusted!.status).toBe(415);
+  expect(untrusted!.headers.get("cache-control")).toBe("no-store");
+
+  const crossOrigin = await request({}, {
+    "content-type": "application/json",
+    origin: "https://outside.invalid",
+  });
+  expect(crossOrigin!.status).toBe(403);
+
+  for (const body of [
+    { proxy: { host: "", port: "" } },
+    { proxy: { host: "proxy.example", port: "not-a-port" } },
+    { proxy: { type: "https", host: "proxy.example", port: "8443" } },
+    { proxy: { type: "private-password", host: "proxy.example", port: "8080" } },
+    "not-json",
+  ]) {
+    const response = await request(body);
+    const text = await response!.text();
+    expect(response!.status).toBe(400);
+    expect(response!.headers.get("cache-control")).toBe("no-store");
+    expect(text).not.toContain("private-password");
+    expect(text).not.toContain("proxy.example");
+  }
+  expect(checks).toBe(0);
+
+  const failed = await request({
+    proxy: {
+      type: "http",
+      host: "proxy.example",
+      port: "8080",
+      user: "proxy-user",
+      pass: "private-password",
+    },
+  });
+  const failureText = await failed!.text();
+  expect(failed!.status).toBe(500);
+  expect(failed!.headers.get("cache-control")).toBe("no-store");
+  expect(failureText).toContain("Proxy check failed");
+  expect(failureText).not.toContain("private-password");
+  expect(failureText).not.toContain("checker exposed");
+  expect(checks).toBe(1);
+  s.close();
+});
+
+test("full profile edit keeps account and mailbox credentials in separate fields", async () => {
+  const s = store();
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11"),
+    {} as any,
+    s,
+  );
+  const edit = (await response!.json()).profile;
+  expect(edit).toMatchObject({
+    username: "account-user",
+    password: "SECRETpw",
+    email: "mailbox@example.com",
+    emailPassword: "MAILSECRETpw",
+    twofa: "TOTPSEED",
+  });
+  const updated = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: {
+        username: "account-user", password: "linkedin-pass",
+        email: "new-mail@example.com", emailPassword: "new-mail-pass", twofa: "NEWSEED",
+      } }),
+    }),
+    {} as any,
+    s,
+  );
+  expect(updated!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")).toMatchObject({
+    username: "account-user", password: "linkedin-pass",
+    email: "new-mail@example.com", emailPassword: "new-mail-pass", twofa: "NEWSEED",
+  });
+  s.close();
+});
+
+test("listUiProfiles reflects running status from the launches table", () => {
+  const s = store();
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 1, debugPort: 9412, ws: "ws://x", startedAt: 123 });
+  const p = listUiProfiles(s)[0]!;
+  expect(p.running).toBe(true);
+  expect(p.debugPort).toBe(9412);
+  s.close();
+});
+
+test("open/close routes call the launcher", async () => {
+  const s = store();
+  const calls: string[] = [];
+  const launcher: any = {
+    start: async (id: string) => { calls.push(`start:${id}`); return { ws: "ws://x", port: 9333 }; },
+    stop: async (id: string) => { calls.push(`stop:${id}`); return true; },
+    captureLocalSession: async (id: string) => { calls.push(`capture:${id}`); return false; },
+  };
+  const open = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/open", { method: "POST" }), launcher, s);
+  expect((await open!.json()).ok).toBe(true);
+  const close = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/close", { method: "POST" }), launcher, s);
+  expect((await close!.json()).ok).toBe(true);
+  expect(calls).toEqual(["start:k1d0cd11", "capture:k1d0cd11", "stop:k1d0cd11"]);
+  s.close();
+});
+
+test("Firefox open responses do not expose the internal port", async () => {
+  const s = store();
+  s.upsertProfile(firefoxProfile(s, "firefox-open"));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/firefox-open/open", { method: "POST" }),
+    { start: async () => ({ port: 9333 }) } as any,
+    s,
+  );
+  expect(await response!.json()).toEqual({
+    ok: true,
+    engine: "firefox",
+    capabilities: { cdp: false, pdf: false, chromeExtensions: false },
+  });
+  s.close();
+});
+
+test("cookie route adds one persistent cookie to an active Cloud browser without changing imports", async () => {
+  const s = store();
+  const importedCookies = structuredClone(s.getProfile("k1d0cd11")!.cookies);
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 1, debugPort: 9412, ws: "ws://live-browser", startedAt: 123 });
+  const appConfig = new AppConfigStore(join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-cookie-")), "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const calls: Array<{ ws: string; cookie: any }> = [];
+  const startedAt = Math.floor(Date.now() / 1_000);
+
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/cookies", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://x" },
+      body: JSON.stringify({
+        name: "session",
+        value: "private-cookie-value",
+        domain: "https://Example.com/account",
+        path: "/account",
+      }),
+    }),
+    { certifiedActive: async () => true } as any,
+    s,
+    null,
+    {
+      appConfig,
+      cloudBrowser: {} as any,
+      addCookie: async (ws: string, cookie: any) => { calls.push({ ws, cookie }); },
+    } as any,
+  );
+
+  expect(response!.status).toBe(200);
+  expect(await response!.json()).toEqual({ ok: true });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toMatchObject({
+    ws: "ws://live-browser",
+    cookie: {
+      name: "session",
+      value: "private-cookie-value",
+      domain: "example.com",
+      path: "/account",
+      secure: true,
+      sameSite: "Lax",
+    },
+  });
+  expect(calls[0]!.cookie.expires).toBeGreaterThanOrEqual(startedAt + 31_536_000);
+  expect(calls[0]!.cookie.expires).toBeLessThanOrEqual(Math.floor(Date.now() / 1_000) + 31_536_000);
+  expect(s.getProfile("k1d0cd11")!.cookies).toEqual(importedCookies);
+  s.close();
+});
+
+test("cookie route rejects untrusted, malformed, and closed-browser requests", async () => {
+  const s = store();
+  let certifications = 0;
+  let writes = 0;
+  const launcher = { certifiedActive: async () => { certifications++; return false; } } as any;
+  const options = { addCookie: async () => { writes++; } } as any;
+
+  const untrusted = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/cookies", {
+    method: "POST",
+    headers: { "content-type": "text/plain", origin: "https://outside.invalid" },
+    body: "{}",
+  }), launcher, s, null, options);
+  expect(untrusted!.status).toBe(415);
+
+  const crossOrigin = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/cookies", {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "https://outside.invalid" },
+    body: JSON.stringify({ name: "session", value: "value", domain: "example.com", path: "/" }),
+  }), launcher, s, null, options);
+  expect(crossOrigin!.status).toBe(403);
+
+  for (const body of [
+    { name: "", value: "value", domain: "example.com", path: "/" },
+    { name: "bad name", value: "value", domain: "example.com", path: "/" },
+    { name: "bad=name", value: "value", domain: "example.com", path: "/" },
+    { name: "name", value: "bad;value", domain: "example.com", path: "/" },
+    { name: "name", value: "value", domain: "", path: "/" },
+    { name: "name", value: "value", domain: "example.com", path: "account" },
+  ]) {
+    const malformed = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/cookies", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }), launcher, s, null, options);
+    expect(malformed!.status).toBe(400);
+  }
+
+  const closed = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/cookies", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "session", value: "value", domain: "example.com", path: "/" }),
+  }), launcher, s, null, options);
+  expect(closed!.status).toBe(409);
+  expect(await closed!.json()).toEqual({ ok: false, error: "profile browser is not open" });
+  expect(certifications).toBe(1);
+  expect(writes).toBe(0);
+  s.close();
+});
+
+test("cookie route never returns the cookie value or a raw worker error", async () => {
+  const s = store();
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 1, debugPort: 9412, ws: "ws://live-browser", startedAt: 123 });
+  const secret = "private-cookie-value";
+  const response = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/cookies", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "session", value: secret, domain: "example.com", path: "/" }),
+  }), { certifiedActive: async () => true } as any, s, null, {
+    addCookie: async () => { throw new Error(`worker rejected ${secret}`); },
+  } as any);
+  const body = await response!.text();
+
+  expect(response!.status).toBe(500);
+  expect(body).toContain("cookie could not be added");
+  expect(body).not.toContain(secret);
+  expect(body).not.toContain("worker rejected");
+  s.close();
+});
+
+test("raise route brings Local and Cloud browsers to the front", async () => {
+  const s = store();
+  const calls: string[] = [];
+  const launcher = {
+    async bringToFront(id: string) { calls.push(id); },
+  } as any;
+
+  const local = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/raise", { method: "POST" }),
+    launcher,
+    s,
+  );
+  expect(local!.status).toBe(200);
+  expect(await local!.json()).toEqual({ ok: true });
+
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-raise-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const cloud = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/cloud1/raise", { method: "POST" }),
+    launcher,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any },
+  );
+  expect(cloud!.status).toBe(200);
+  expect(await cloud!.json()).toEqual({ ok: true });
+  expect(calls).toEqual(["k1d0cd11", "cloud1"]);
+  s.close();
+});
+
+test("remote open returns an advisory warning as a success", async () => {
+  const s = store();
+  const remote: any = {
+    open: async () => ({
+      ok: true,
+      port: 9333,
+      warning: "Possible concurrent use; session sync is disabled for this browser.",
+    }),
+  };
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/open", { method: "POST" }),
+    {} as any,
+    s,
+    remote,
+  );
+  expect(res!.status).toBe(200);
+  expect(await res!.json()).toEqual({
+    ok: true,
+    port: 9333,
+    warning: "Possible concurrent use; session sync is disabled for this browser.",
+  });
+  s.close();
+});
+
+test("open on an unknown profile 404s without touching the launcher", async () => {
+  const s = store();
+  const launcher: any = { start: async () => { throw new Error("must not be called"); } };
+  const res = await handleUiRequest(new Request("http://x/ui/api/profiles/nope/open", { method: "POST" }), launcher, s);
+  expect(res!.status).toBe(404);
+  s.close();
+});
+
+test("GET /ui/api/health is independent of launcher and hub state", async () => {
+  const s = store();
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/health"),
+    new Proxy({}, { get: () => { throw new Error("launcher must not be touched"); } }) as any,
+    s,
+    new Proxy({}, { get: () => { throw new Error("hub must not be touched"); } }) as any,
+  );
+  expect(res!.status).toBe(200);
+  expect(await res!.json()).toMatchObject({ ok: true, version: expect.any(String), root: import.meta.dir });
+  s.close();
+});
+
+test("GET /ui/api/health uses desktop parent metadata when supplied", async () => {
+  const s = store();
+  const health = { version: "0.1.0-beta.1", root: "C:\\GhosterAnti", instance: "ab".repeat(32) };
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/health"),
+    {} as any,
+    s,
+    null,
+    { health },
+  );
+  expect(await res!.json()).toEqual({ ok: true, ...health });
+  s.close();
+});
+
+test("GET /ui/api/profiles clears a stale launch row before reporting status", async () => {
+  const s = store();
+  // A launch row whose browser is gone (crash / external teardown).
+  s.recordLaunch({
+    profileId: "k1d0cd11",
+    pid: 99999,
+    debugPort: 9999,
+    ws: "ws://x",
+    startedAt: 1,
+    binaryPath: "/fake",
+    userDataDir: "/tmp/ui-recon/k1d0cd11",
+    processGroupId: 99999,
+    rootStartTime: "1",
+  });
+  const launcher = new Launcher({
+    store: s,
+    binaryPath: "/fake",
+    unsafeDisableIdentityGates: true,
+    dataRoot: "/tmp/ui-recon",
+    spawn: () => ({ pid: 1, kill() {} }),
+    fetch: async () => ({ ok: false, json: async () => ({}) }), // CDP port is dead
+    ensureCookies: async () => ({ injected: false }),
+    killPid: async () => {},
+    isPidAlive: () => false,
+    findOwnedBrowserPids: async () => [],
+    cdpReadyTimeoutMs: 100,
+  });
+
+  const res = await handleUiRequest(new Request("http://x/ui/api/profiles"), launcher, s);
+  const body = await res!.json();
+  expect(body.profiles[0].running).toBe(false); // not shown as running
+  expect(body.healthSources).toEqual([]);
+  expect(s.getLaunch("k1d0cd11")).toBeNull(); // stale row reconciled away
+  s.close();
+});
+
+test("GET /ui/api/profiles carries remote health and node freshness through local launch overlays", async () => {
+  const s = store();
+  const launcher: any = { reconcileOrphans: async () => {} };
+  const remote: any = {
+    listRoster: async () => ({
+      profiles: [{
+        id: "k1d0cd11",
+        name: "sophia",
+        group: "va1",
+        healthStatus: "suspended",
+        healthObservedAt: 1_000,
+      }],
+      healthSources: [{ sourceId: "node-a", lastSnapshotAt: 1_000, stale: false }],
+    }),
+  };
+
+  const res = await handleUiRequest(new Request("http://x/ui/api/profiles"), launcher, s, remote);
+  expect(await res!.json()).toEqual({
+    profiles: [{
+      id: "k1d0cd11",
+      name: "sophia",
+      group: "va1",
+      healthStatus: "suspended",
+      healthObservedAt: 1_000,
+      engine: "chromium",
+      running: false,
+    }],
+    healthSources: [{ sourceId: "node-a", lastSnapshotAt: 1_000, stale: false }],
+  });
+  s.close();
+});
+
+test("GET /ui/api/profiles returns a JSON error when remote roster loading fails", async () => {
+  const s = store();
+  const launcher: any = { reconcileOrphans: async () => {} };
+  const remote: any = { listRoster: async () => { throw new Error("hub roster unavailable"); } };
+
+  const res = await handleUiRequest(new Request("http://x/ui/api/profiles"), launcher, s, remote);
+  expect(res!.status).toBe(502);
+  expect(res!.headers.get("content-type")).toContain("application/json");
+  const body = await res!.json();
+  expect(body.error).toBe("profile roster failed: hub roster unavailable");
+  s.close();
+});
+
+test("GET /ui/api/profiles returns a JSON error when local reconciliation fails", async () => {
+  const s = store();
+  const launcher: any = { reconcileOrphans: async () => { throw new Error("process scan unavailable"); } };
+
+  const res = await handleUiRequest(new Request("http://x/ui/api/profiles"), launcher, s);
+  expect(res!.status).toBe(500);
+  expect(res!.headers.get("content-type")).toContain("application/json");
+  expect((await res!.json()).error).toBe("profile roster failed: process scan unavailable");
+  s.close();
+});
+
+test("Local group creation keeps an empty group in the profile roster", async () => {
+  const s = store();
+  const created = await handleUiRequest(
+    new Request("http://x/ui/api/groups/create", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Empty group" }),
+    }),
+    {} as any,
+    s,
+  );
+  expect(created!.status).toBe(200);
+  expect(await created!.json()).toEqual({ ok: true, name: "Empty group", folder: { name: "Empty group", parentName: null, label: "Empty group" } });
+
+  const reserved = await handleUiRequest(
+    new Request("http://x/ui/api/groups/create", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "all" }),
+    }),
+    {} as any,
+    s,
+  );
+  expect(reserved!.status).toBe(400);
+
+  const roster = await handleUiRequest(
+    new Request("http://x/ui/api/profiles"),
+    { reconcileOrphans: async () => {} } as any,
+    s,
+  );
+  expect((await roster!.json()).groups).toContain("Empty group");
+  s.close();
+});
+
+test("Local folder routes preserve explicit parents through create, rename and move", async () => {
+  const s = store();
+  const request = (path: string, body: unknown) => handleUiRequest(new Request(`http://x/ui/api/groups/${path}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }), {} as any, s);
+  try {
+    await request("create", { name: "Facebook" });
+    const created = await request("create", { name: "Fitness", parentName: "Facebook" });
+    expect((await created!.json()).folder).toEqual({ name: "Facebook/Fitness", parentName: "Facebook", label: "Fitness" });
+    const renamed = await request("rename", { from: "Facebook/Fitness", to: "Health" });
+    expect((await renamed!.json()).folder.name).toBe("Facebook/Health");
+    expect((await request("move", { name: "Facebook", parentName: "Facebook/Health" }))!.status).toBe(400);
+    const moved = await request("move", { name: "Facebook/Health", parentName: null });
+    expect((await moved!.json()).folder).toEqual({ name: "Health", parentName: null, label: "Health" });
+  } finally { s.close(); }
+});
+
+test("move route reassigns selected profiles' group", async () => {
+  const s = store();
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/move", { method: "POST", body: JSON.stringify({ ids: ["k1d0cd11"], group: "newgrp" }) }),
+    {} as any,
+    s,
+  );
+  const body = await res!.json();
+  expect(body.ok).toBe(true);
+  expect(body.moved).toBe(1);
+  expect(listUiProfiles(s)[0]!.group).toBe("newgrp");
+  s.close();
+});
+
+test("group extension route replaces members and lists defaults", async () => {
+  const s = store();
+  const saved = await handleUiRequest(
+    new Request("http://x/ui/api/groups/extensions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ group: "va1", extensions: ["e2", "e1", "e2"] }),
+    }),
+    {} as any,
+    s,
+  );
+  expect(saved!.status).toBe(200);
+  expect(await saved!.json()).toMatchObject({ ok: true, updatedCount: 1 });
+  expect(s.getProfile("k1d0cd11")!.extensions).toEqual(["e2", "e1"]);
+
+  const listed = await handleUiRequest(
+    new Request("http://x/ui/api/groups/extensions"),
+    {} as any,
+    s,
+  );
+  expect(await listed!.json()).toEqual({
+    ok: true,
+    groups: [{ name: "va1", extensions: ["e2", "e1"], permission: "edit" }],
+  });
+  s.close();
+});
+
+test("new profiles and moves inherit Local group extension defaults", async () => {
+  const s = store();
+  s.registerGroup("With defaults");
+  s.setGroupExtensionDefaults("With defaults", ["e1"]);
+
+  const created = await handleUiRequest(
+    new Request("http://x/ui/api/profiles", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "new", group: "With defaults", engine: "chromium" }),
+    }),
+    {} as any,
+    s,
+  );
+  const createdId = (await created!.json()).id;
+  expect(s.getProfile(createdId)!.extensions).toEqual(["e1"]);
+
+  const moved = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/move", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["k1d0cd11"], group: "With defaults" }),
+    }),
+    {} as any,
+    s,
+  );
+  expect(moved!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")!.extensions).toEqual(["e1"]);
+  s.close();
+});
+
+test("single and file group edits inherit unless extensions are explicit", async () => {
+  const s = store();
+  s.registerGroup("Defaulted");
+  s.setGroupExtensionDefaults("Defaulted", ["group-extension"]);
+
+  const inherited = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: { group: "Defaulted" } }),
+    }),
+    {} as any,
+    s,
+  );
+  expect(inherited!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")!.extensions).toEqual(["group-extension"]);
+
+  const explicit = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: { group: "va1", extensions: ["chosen"] } }),
+    }),
+    {} as any,
+    s,
+  );
+  expect(explicit!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")!.extensions).toEqual(["chosen"]);
+
+  const form = new FormData();
+  form.append("files", new File(["id,group\nk1d0cd11,Defaulted\n"], "updates.csv"));
+  const fromFile = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  expect(fromFile!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")!.extensions).toEqual(["group-extension"]);
+  s.close();
+});
+
+test("move route with no ids is a 400", async () => {
+  const s = store();
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/move", { method: "POST", body: JSON.stringify({ ids: [], group: "x" }) }),
+    {} as any,
+    s,
+  );
+  expect(res!.status).toBe(400);
+  s.close();
+});
+
+test("upload route imports profiles from posted files", async () => {
+  const s = new ProfileStore(":memory:");
+  // No proxy line → geoip is skipped (no network in the test).
+  const NOPROXY = `id=k1up0001\nname=uploaded\ngroup=ug\ncookie=[]\nresolution=1280*720\n******************`;
+  const form = new FormData();
+  form.append("files", new File([NOPROXY], "export.txt", { type: "text/plain" }));
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  const body = await res!.json();
+  expect(body.ok).toBe(true);
+  expect(body.profiles).toBe(1);
+  expect(s.getProfile("k1up0001")!.group).toBe("ug");
+  s.close();
+});
+
+test("upload route atomically imports two AdsPower profiles from one pasted file", async () => {
+  const s = new ProfileStore(":memory:");
+  const ADSPOWER = `id=k1up0002\nname=first\ngroup=ug\ncookie=[]\nresolution=1280*720\n******************\nid=k1up0003\nname=second\ngroup=ug\ncookie=[]\nresolution=1280*720\n******************`;
+  const form = new FormData();
+  form.append("files", new File([ADSPOWER], "pasted-adspower.txt", { type: "text/plain" }));
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  expect(res!.status).toBe(200);
+  expect(await res!.json()).toMatchObject({ ok: true, files: 1, profiles: 2 });
+  expect(s.count()).toBe(2);
+  expect(s.getProfile("k1up0002")).not.toBeNull();
+  expect(s.getProfile("k1up0003")).not.toBeNull();
+  s.close();
+});
+
+test("upload route rejects a malformed AdsPower record without partial writes", async () => {
+  const s = store();
+  const beforeCount = s.count();
+  const ADSPOWER = `id=k1up0002\nname=first\ngroup=ug\ncookie=[]\nresolution=1280*720\n******************\nid=k1up0003\nname=second\ngroup=ug\ncookie=[]\nresolution=0x0\n******************`;
+  const form = new FormData();
+  form.append("files", new File([ADSPOWER], "pasted-adspower.txt", { type: "text/plain" }));
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  expect(res!.status).toBe(400);
+  expect((await res!.json()).error).toContain("invalid resolution");
+  expect(s.count()).toBe(beforeCount);
+  expect(s.getProfile("k1up0002")).toBeNull();
+  expect(s.getProfile("k1up0003")).toBeNull();
+  s.close();
+});
+
+test("upload route applies group override in local mode", async () => {
+  const s = new ProfileStore(":memory:");
+  const NOPROXY = `id=k1up0001\nname=uploaded\ngroup=fromfile\ncookie=[]\nresolution=1280*720\n******************`;
+  const form = new FormData();
+  form.append("group", "selected");
+  form.append("files", new File([NOPROXY], "export.txt", { type: "text/plain" }));
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  expect((await res!.json()).ok).toBe(true);
+  expect(s.getProfile("k1up0001")!.group).toBe("selected");
+  s.close();
+});
+
+test("upload route imports JSON and XLSX provider files in Local mode", async () => {
+  const s = new ProfileStore(":memory:");
+  const form = new FormData();
+  form.append("files", new File([JSON.stringify({ profiles: [{
+    _id: "localjson1",
+    name: "GoLogin JSON",
+    navigator: { resolution: "1600x900", platform: "Win32" },
+  }] })], "gologin.json", { type: "application/json" }));
+  const workbook = await writeXlsx(
+    ["Profile ID", "Profile Name", "Operating System"],
+    [["localxlsx1", "HideMyAcc sheet", "mac"]],
+  );
+  form.append("files", new File([workbook as unknown as BlobPart], "hidemyacc.xlsx"));
+
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+
+  expect(response!.status).toBe(200);
+  expect(await response!.json()).toMatchObject({ ok: true, files: 2, profiles: 2 });
+  expect(s.getProfile("localjson1")).toMatchObject({ name: "GoLogin JSON", platformOs: "windows" });
+  expect(s.getProfile("localxlsx1")).toMatchObject({ name: "HideMyAcc sheet", platformOs: "macos" });
+  s.close();
+});
+
+test("upload route sends one parsed batch to Cloud without writing the Local store", async () => {
+  const s = new ProfileStore(":memory:");
+  const appConfig = new AppConfigStore(join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-import-")), "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const batches: Array<{ destination: string; profiles: any[] }> = [];
+  const cloudBrowser = {
+    async importProfiles(destination: string, profiles: any[]) {
+      batches.push({ destination, profiles: structuredClone(profiles) });
+      return { ok: true, imported: profiles.length, ids: profiles.map((profile) => profile.id) };
+    },
+  } as any;
+  const form = new FormData();
+  form.append("group", "Sales");
+  form.append("platform", "telegram.org");
+  form.append("files", new File([
+    `id=cloudimp1\nname=First\ngroup=from-file\ncookie=[]\nresolution=1280*720\n******************\n` +
+    `id=cloudimp2\nname=Second\ngroup=from-file\ncookie=[]\nresolution=1280*720\n******************`,
+  ], "export.txt", { type: "text/plain" }));
+  form.append("files", new File([JSON.stringify({ profiles: [{
+    profileId: "cloudjson1",
+    profileName: "GoLogin JSON",
+    folderName: "from-json",
+  }] })], "gologin.json", { type: "application/json" }));
+  const workbook = await writeXlsx(
+    ["Profile ID", "Profile Name", "Folder Name"],
+    [["cloudxlsx1", "Dolphin sheet", "from-sheet"]],
+  );
+  form.append("files", new File([workbook as unknown as BlobPart], "dolphin.xlsx"));
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+
+  expect(res!.status).toBe(200);
+  expect(await res!.json()).toMatchObject({ ok: true, files: 3, profiles: 4 });
+  expect(batches).toHaveLength(1);
+  expect(batches[0]!.destination).toBe("Sales");
+  expect(batches[0]!.profiles.map((profile) => ({ id: profile.id, group: profile.group, platform: profile.platform }))).toEqual([
+    { id: "cloudimp1", group: "Sales", platform: "telegram.org" },
+    { id: "cloudimp2", group: "Sales", platform: "telegram.org" },
+    { id: "cloudjson1", group: "Sales", platform: "telegram.org" },
+    { id: "cloudxlsx1", group: "Sales", platform: "telegram.org" },
+  ]);
+  expect(s.getProfile("cloudimp1")).toBeNull();
+  expect(s.getProfile("cloudimp2")).toBeNull();
+  expect(s.getProfile("cloudjson1")).toBeNull();
+  expect(s.getProfile("cloudxlsx1")).toBeNull();
+  s.close();
+});
+
+test("Cloud upload requires an explicit destination before parsing files", async () => {
+  const s = new ProfileStore(":memory:");
+  const appConfig = new AppConfigStore(join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-import-group-")), "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const form = new FormData();
+  form.append("files", new File(["not parsed"], "export.txt", { type: "text/plain" }));
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: { importProfiles: async () => { throw new Error("must not import"); } } as any },
+  );
+  expect(res!.status).toBe(400);
+  expect((await res!.json()).error).toContain("destination");
+  s.close();
+});
+
+test("upload route forwards raw files and overrides in remote mode", async () => {
+  const s = new ProfileStore(":memory:");
+  const form = new FormData();
+  form.append("group", "hubgrp");
+  form.append("platform", "telegram.org");
+  const rawFile = "raw,unchanged\ncontent";
+  form.append("files", new File([rawFile], "export.json", { type: "application/json" }));
+  let gotOverride: any = null;
+  let gotUploads: any[] = [];
+  const remote = {
+    importToHub: async (uploads: any[], override: any) => {
+      gotUploads = uploads.map((upload) => ({ name: upload.name, bytes: new Uint8Array(upload.bytes) }));
+      gotOverride = override;
+      return { files: 1, profiles: 1 };
+    },
+  } as any;
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+    remote,
+  );
+  expect((await res!.json()).ok).toBe(true);
+  expect(gotOverride).toEqual({ group: "hubgrp", platform: "telegram.org" });
+  expect(gotUploads).toEqual([{ name: "export.json", bytes: new TextEncoder().encode(rawFile) }]);
+  s.close();
+});
+
+test("upload route rejects a zero-profile hub result", async () => {
+  const s = new ProfileStore(":memory:");
+  const form = new FormData();
+  form.append("files", new File(["unrecognized"], "export.txt", { type: "text/plain" }));
+  const remote = {
+    importToHub: async () => ({ files: 1, profiles: 0 }),
+  } as any;
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+    remote,
+  );
+  expect(res!.status).toBe(400);
+  expect(await res!.json()).toMatchObject({ ok: false, error: expect.stringContaining("no profiles") });
+  s.close();
+});
+
+test("upload route with no files is a 400", async () => {
+  const s = new ProfileStore(":memory:");
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: new FormData() }),
+    {} as any,
+    s,
+  );
+  expect(res!.status).toBe(400);
+  s.close();
+});
+
+test("upload route reports unsupported archives as bad input", async () => {
+  const s = new ProfileStore(":memory:");
+  const form = new FormData();
+  form.append("files", new File(["PKencrypted-profile"], "multilogin.zip", { type: "application/zip" }));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  expect(response!.status).toBe(400);
+  expect((await response!.json()).error).toContain("encrypted or proprietary");
+  expect(s.count()).toBe(0);
+  s.close();
+});
+
+test("upload route reports an open-profile import conflict as 409", async () => {
+  const s = store();
+  s.recordLaunch({
+    profileId: "k1d0cd11",
+    pid: 123,
+    debugPort: 9333,
+    ws: "ws://127.0.0.1:9333/devtools/browser/live",
+    startedAt: Date.now(),
+  });
+  const form = new FormData();
+  form.append("files", new File(["id=k1d0cd11\nname=changed\n******************"], "profile.txt"));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/import/upload", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  expect(response!.status).toBe(409);
+  expect((await response!.json()).error).toContain("currently open");
+  s.close();
+});
+
+function cloudFileHarness() {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-update-file-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const profiles = new Map(Array.from({ length: 4 }, (_, index) => {
+    const id = `cloud000${index + 1}`;
+    return [id, {
+      profile: { id, version: 3, activeOpens: [] as unknown[] },
+      payload: encodePortableProfile({ ...s.getProfile("k1d0cd11")!, id }),
+    }] as const;
+  }));
+  const updates: Array<{ id: string; request: any }> = [];
+  const client = {
+    async getProfile(id: string) {
+      const value = profiles.get(id);
+      if (!value) throw new CloudApiError("Cloud profile was not found", "profile_not_found", 404);
+      return value;
+    },
+    async updateProfile(id: string, request: any) { updates.push({ id, request }); },
+  };
+  return {
+    s, profiles, updates, client,
+    async upload(files: File[]) {
+      const form = new FormData();
+      for (const file of files) form.append("files", file);
+      return (await handleUiRequest(
+        new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+        {} as any, s, null,
+        { appConfig, cloudBrowser: {} as any, cloudConnection: { client } as any },
+      ))!;
+    },
+    close() { s.close(); rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+test("Cloud file updates merge IDs across CSV, TXT and XLSX without replacing sessions or Local profiles", async () => {
+  const h = cloudFileHarness();
+  try {
+    const workbook = await writeXlsx(
+      ["id", "username", "cookie", "ua", "custom_no"],
+      [["cloud0002", "second-user", "[]", "ignored-ua", "12"]],
+    );
+    const response = await h.upload([
+      new File(["id,username,password,twofa\ncloud0001,first-user,first-pass,\nk1d0cd11,local-must-not-change\n,missing-id\n"], "updates.csv"),
+      new File(["id=cloud0001\npassword=final-pass\n******************"], "updates.txt"),
+      new File([workbook as unknown as BlobPart], "updates.xlsx"),
+    ]);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, updated: 2, skipped: 1, notFound: ["k1d0cd11"], errors: [] });
+    expect(h.updates.map((update) => update.id)).toEqual(["cloud0001", "cloud0002"]);
+    expect(h.updates[0]!.request.payload.profile).toMatchObject({ username: "first-user", password: "final-pass", twofa: "", emailPassword: "MAILSECRETpw" });
+    expect(h.updates[1]!.request.payload.profile).toMatchObject({ username: "second-user", password: "SECRETpw" });
+    for (const { id, request } of h.updates) {
+      const before = h.profiles.get(id)!.payload;
+      expect(request.expectedVersion).toBe(3);
+      expect(request.payload.session).toEqual(before.session);
+      for (const field of ["proxy", "ua", "fingerprintSeed", "screenWidth", "screenHeight", "timezone"] as const) {
+        expect(request.payload.profile[field]).toEqual(before.profile[field]);
+      }
+    }
+    expect(h.s.getProfile("k1d0cd11")!.username).toBe("account-user");
+    expect(h.s.getProfile("cloud0001")).toBeNull();
+  } finally { h.close(); }
+});
+
+test("Cloud file updates report partial failures and continue after open, denied and conflicting profiles", async () => {
+  const h = cloudFileHarness();
+  try {
+    h.profiles.get("cloud0001")!.profile.activeOpens.push({});
+    const getProfile = h.client.getProfile;
+    h.client.getProfile = async (id) => {
+      if (id === "cloud0002") throw new CloudApiError("No edit permission", "folder_access_denied", 403);
+      return getProfile(id);
+    };
+    const attempts: string[] = [];
+    h.client.updateProfile = async (id, request) => {
+      attempts.push(id);
+      if (id === "cloud0003") throw new CloudApiError("Version conflict", "version_conflict", 409);
+      h.updates.push({ id, request });
+    };
+    const response = await h.upload([new File([
+      "id,password\ncloud0001,new-password\ncloud0002,new-password\ncloud0003,new-password\ncloud0004,new-password\n",
+    ], "updates.csv")]);
+    const result = await response.json();
+    expect(result).toMatchObject({ ok: false, updated: 1, skipped: 0, notFound: [] });
+    expect(result.errors.map((error: { id: string }) => error.id)).toEqual(["cloud0001", "cloud0002", "cloud0003"]);
+    expect(attempts).toEqual(["cloud0003", "cloud0004"]);
+    expect(h.updates.map((update) => update.id)).toEqual(["cloud0004"]);
+    expect(JSON.stringify(result)).not.toContain("new-password");
+  } finally { h.close(); }
+});
+
+test("Cloud file updates reject invalid IDs before writing any profile", async () => {
+  const h = cloudFileHarness();
+  try {
+    const response = await h.upload([new File(["id,password\ncloud0001,new-password\n../bad,new-password\n"], "updates.csv")]);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ ok: false, updated: 0, errors: [{ id: "../bad" }] });
+    expect(h.updates).toEqual([]);
+  } finally { h.close(); }
+});
+
+test("bulk update validates every row before atomically writing any profile", async () => {
+  const s = store();
+  const first = s.getProfile("k1d0cd11")!;
+  s.upsertProfile({ ...first, id: "k1d0cd22", name: "second" });
+  const csv = [
+    "id,name,proxy,proxytype",
+    "k1d0cd11,renamed,proxy.example:8080:u:p,http",
+    "k1d0cd22,also-renamed,malformed,http",
+  ].join("\n");
+  const form = new FormData();
+  form.append("files", new File([csv], "updates.csv", { type: "text/csv" }));
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  const body = await res!.json();
+  expect(res!.status).toBe(400);
+  expect(body.updated).toBe(0);
+  expect(body.errors).toEqual([{ id: "k1d0cd22", error: expect.stringContaining("proxy must be") }]);
+  expect(s.getProfile("k1d0cd11")!.name).toBe("sophia");
+  expect(s.getProfile("k1d0cd22")!.name).toBe("second");
+  s.close();
+});
+
+test("a short CSV update row preserves omitted trailing identity fields", async () => {
+  const s = store();
+  const before = s.getProfile("k1d0cd11")!;
+  before.timezone = "America/Los_Angeles";
+  s.upsertProfile(before);
+  const form = new FormData();
+  form.append("files", new File([
+    "id,name,proxy,proxytype,resolution\n" +
+    "k1d0cd11,renamed",
+  ], "updates.csv", { type: "text/csv" }));
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+
+  expect(res!.status).toBe(200);
+  const after = s.getProfile("k1d0cd11")!;
+  expect(after.name).toBe("renamed");
+  expect(after.proxy).toEqual(before.proxy);
+  expect(after.timezone).toBe("America/Los_Angeles");
+  expect([after.screenWidth, after.screenHeight]).toEqual([before.screenWidth, before.screenHeight]);
+  s.close();
+});
+
+test("bulk proxy edits resolve changed timezones", async () => {
+  const s = store();
+  const first = s.getProfile("k1d0cd11")!;
+  first.timezone = "America/Los_Angeles";
+  s.upsertProfile(first);
+  s.upsertProfile({ ...first, id: "k1d0cd22", name: "second" });
+  const form = new FormData();
+  form.append("files", new File([
+    "id,proxy,proxytype\n" +
+    "k1d0cd11,first-proxy.example:8080:u:p,http\n" +
+    "k1d0cd22,second-proxy.example:1080:u:p,socks5",
+  ], "updates.csv", { type: "text/csv" }));
+  const calls: string[][] = [];
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: timezoneFetch({ "first-proxy.example": "Europe/London" }, calls) },
+  );
+
+  expect(res!.status).toBe(200);
+  expect(calls).toHaveLength(2);
+  expect(s.getProfile("k1d0cd11")!.timezone).toBe("Europe/London");
+  expect(s.getProfile("k1d0cd22")!.timezone).toBe("Europe/London");
+  s.close();
+});
+
+test("single edits reject malformed resolutions without changing stored identity", async () => {
+  for (const resolution of ["", "0x0", "319x1080", "99999x1080", "1920xnope"]) {
+    const s = store();
+    const before = s.getProfile("k1d0cd11")!;
+    const res = await handleUiRequest(
+      new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+        method: "POST",
+        body: JSON.stringify({ set: { resolution } }),
+      }),
+      {} as any,
+      s,
+    );
+    expect(res!.status).toBe(500);
+    expect((await res!.json()).error).toContain("invalid resolution");
+    const after = s.getProfile("k1d0cd11")!;
+    expect([after.screenWidth, after.screenHeight]).toEqual([before.screenWidth, before.screenHeight]);
+    s.close();
+  }
+});
+
+test("Firefox profiles reject screen and Chrome extension changes", async () => {
+  for (const set of [{ resolution: "1920x1080" }, { extensions: ["chrome-extension"] }]) {
+    const s = store();
+    const getProfile = s.getProfile.bind(s);
+    (s as any).getProfile = (id: string) => {
+      const profile = getProfile(id);
+      return profile ? { ...profile, engine: "firefox" } : null;
+    };
+    const res = await handleUiRequest(
+      new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+        method: "POST",
+        body: JSON.stringify({ set }),
+      }),
+      {} as any,
+      s,
+    );
+    expect(res!.status).toBe(500);
+    expect((await res!.json()).error).toMatch(/Firefox (screen settings|profiles)/);
+    s.close();
+  }
+});
+
+test("a malformed nonblank proxy edit is rejected without removing the existing proxy", async () => {
+  const s = store();
+  const before = s.getProfile("k1d0cd11")!;
+  before.timezone = "America/Los_Angeles";
+  s.upsertProfile(before);
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: { proxy: "proxy.example:not-a-port" } }),
+    }),
+    {} as any,
+    s,
+  );
+
+  expect(res!.status).toBe(500);
+  expect((await res!.json()).error).toContain("invalid proxy port");
+  const after = s.getProfile("k1d0cd11")!;
+  expect(after.proxy).toEqual(before.proxy);
+  expect(after.timezone).toBe("America/Los_Angeles");
+  s.close();
+});
+
+test("a changed proxy gets its exit timezone", async () => {
+  const s = store();
+  const before = s.getProfile("k1d0cd11")!;
+  before.timezone = "America/Los_Angeles";
+  s.upsertProfile(before);
+  const calls: string[][] = [];
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: { proxyType: "socks5", proxy: "new-proxy.example:1080:user:pass" } }),
+    }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: timezoneFetch({ "new-proxy.example": "Europe/Paris" }, calls) },
+  );
+
+  expect(res!.status).toBe(200);
+  expect(calls).toEqual([["http://ip-api.com/json/?fields=status,timezone,countryCode,query"]]);
+  expect(s.getProfile("k1d0cd11")).toMatchObject({
+    proxy: { type: "socks5", host: "new-proxy.example", port: "1080", user: "user", pass: "pass" },
+    timezone: "Europe/Paris",
+  });
+  s.close();
+});
+
+test("a proxy edit keeps changes saved during its timezone lookup", async () => {
+  for (const launch of [false, true]) {
+    const s = store();
+    const before = s.getProfile("k1d0cd11")!;
+    before.timezone = "America/Los_Angeles";
+    s.upsertProfile(before);
+    const res = await handleUiRequest(
+      new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+        method: "POST",
+        body: JSON.stringify({ set: { proxyType: "http", proxy: "new-proxy.example:8080" } }),
+      }),
+      {} as any,
+      s,
+      null,
+      { timezoneFetch: async () => {
+        const updated = s.getProfile("k1d0cd11")!;
+        updated.name = "renamed during lookup";
+        s.upsertProfile(updated);
+        if (launch) s.recordLaunch({ profileId: "k1d0cd11", pid: 123, debugPort: 9333, ws: "ws://x", startedAt: 1 });
+        return { json: async () => ({ status: "success", timezone: "Europe/Paris" }) };
+      } },
+    );
+    expect(res!.status).toBe(200);
+    expect(s.getProfile("k1d0cd11")).toMatchObject({
+      name: "renamed during lookup",
+      proxy: { host: "new-proxy.example" },
+      // A browser opened during the lookup keeps the timezone it launched with.
+      timezone: launch ? "America/Los_Angeles" : "Europe/Paris",
+    });
+    s.close();
+  }
+});
+
+test("bulk proxy edits keep changes saved during the timezone lookups", async () => {
+  const s = store();
+  const form = new FormData();
+  form.append("files", new File(["id,proxy,proxytype\nk1d0cd11,new-proxy.example:8080,http"], "updates.csv", { type: "text/csv" }));
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: async () => {
+      const updated = s.getProfile("k1d0cd11")!;
+      updated.name = "renamed during lookup";
+      s.upsertProfile(updated);
+      return { json: async () => ({ status: "success", timezone: "Europe/Paris" }) };
+    } },
+  );
+  expect(res!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")).toMatchObject({
+    name: "renamed during lookup",
+    proxy: { host: "new-proxy.example" },
+    timezone: "Europe/Paris",
+  });
+  s.close();
+});
+
+test("bulk proxy edits reject an open profile before any lookup", async () => {
+  const s = store();
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 123, debugPort: 9333, ws: "ws://x", startedAt: 1 });
+  const form = new FormData();
+  form.append("files", new File(["id,proxy,proxytype\nk1d0cd11,new-proxy.example:8080,http"], "updates.csv", { type: "text/csv" }));
+  const calls: string[][] = [];
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: timezoneFetch({ "new-proxy.example": "Europe/Paris" }, calls) },
+  );
+  expect(res!.status).toBe(409);
+  expect(calls).toEqual([]);
+  s.close();
+});
+
+test("an explicit timezone action updates a Local proxy timezone", async () => {
+  const s = store();
+  const calls: string[][] = [];
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/timezone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: timezoneFetch({ "1.2.3.4": "Europe/London" }, calls) },
+  );
+  expect(res!.status).toBe(200);
+  expect(await res!.json()).toMatchObject({ ok: true, timezone: "Europe/London" });
+  expect(calls).toEqual([["http://ip-api.com/json/?fields=status,timezone,countryCode,query"]]);
+  expect(s.getProfile("k1d0cd11")!.locale).toBe("en-GB");
+  expect(s.getProfile("k1d0cd11")!.timezone).toBe("Europe/London");
+  s.close();
+});
+
+test("an explicit timezone action updates Firefox configuration", async () => {
+  const s = store();
+  s.upsertProfile(firefoxProfile(s, "firefox-timezone"));
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/firefox-timezone/timezone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: timezoneFetch({ "1.2.3.4": "Europe/London" }) },
+  );
+  expect(res!.status).toBe(200);
+  expect(s.getProfile("firefox-timezone")!).toMatchObject({
+    timezone: "Europe/London",
+    locale: "en-GB",
+    firefox: { config: { timezone: "Europe/London", "navigator.language": "en-GB", "locale:all": "en-GB, en" } },
+  });
+  s.close();
+});
+
+test("explicit connection timezone lookup supports system VPNs in both engines", async () => {
+  for (const engine of ["chromium", "firefox"] as const) {
+    const s = store();
+    const profile = engine === "firefox" ? firefoxProfile(s, "vpn-profile") : { ...s.getProfile("k1d0cd11")!, id: "vpn-profile" };
+    profile.proxy = null;
+    profile.timezone = "UTC";
+    s.upsertProfile(profile);
+    const response = await handleUiRequest(new Request("http://x/ui/api/profiles/vpn-profile/timezone", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    }), {} as any, s, null, { timezoneFetch: async (_url, init) => {
+      expect(init).not.toHaveProperty("proxy");
+      return { json: async () => ({ status: "success", timezone: "America/Toronto" }) };
+    } });
+    expect(response!.status).toBe(200);
+    expect(await response!.json()).toMatchObject({ ok: true, timezone: "America/Toronto" });
+    const saved = s.getProfile(profile.id)!;
+    expect(saved.timezone).toBe("America/Toronto");
+    expect(saved.fingerprintSeed).toBe(profile.fingerprintSeed);
+    expect(saved.cookies).toEqual(profile.cookies);
+    if (engine === "firefox") expect(saved.firefox!.config.timezone).toBe(saved.timezone);
+    s.close();
+  }
+});
+
+test("timezone lookup does not treat a quarantined proxy as a direct connection", async () => {
+  const s = store();
+  const profile = s.getProfile("k1d0cd11")!;
+  profile.proxy = null;
+  profile.proxyError = "Invalid proxy port";
+  s.upsertProfile(profile);
+  let calls = 0;
+  const response = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/timezone", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  }), {} as any, s, null, { timezoneFetch: async () => {
+    calls++;
+    return { json: async () => ({ status: "success", timezone: "Europe/Paris" }) };
+  } });
+  expect(response!.status).toBe(400);
+  expect(calls).toBe(0);
+  expect(s.getProfile(profile.id)).toEqual(profile);
+  s.close();
+});
+
+test("failed timezone lookups report failure without changing the saved identity", async () => {
+  const s = store();
+  const before = s.getProfile("k1d0cd11")!;
+  before.timezone = "Europe/Paris";
+  s.upsertProfile(before);
+  const response = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/timezone", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  }), {} as any, s, null, { timezoneFetch: async () => { throw new Error("offline"); } });
+  expect(response!.status).toBe(502);
+  expect(await response!.json()).toMatchObject({ ok: false, error: expect.any(String) });
+  expect(s.getProfile(before.id)).toEqual(before);
+  s.close();
+});
+
+test("timezone lookup cannot overwrite a changed connection or unrelated edits", async () => {
+  for (const changeProxy of [false, true]) {
+    const s = store();
+    const response = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/timezone", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    }), {} as any, s, null, { timezoneFetch: async () => {
+      const updated = s.getProfile("k1d0cd11")!;
+      updated.name = "edited while lookup was pending";
+      if (changeProxy) updated.proxy = null;
+      s.upsertProfile(updated);
+      return { json: async () => ({ status: "success", timezone: "Europe/Paris" }) };
+    } });
+    expect(response!.status).toBe(changeProxy ? 409 : 200);
+    expect(s.getProfile("k1d0cd11")!.name).toBe("edited while lookup was pending");
+    expect(s.getProfile("k1d0cd11")!.timezone).toBe(changeProxy ? "" : "Europe/Paris");
+    s.close();
+  }
+});
+
+test("legacy remote proxy edits preserve stored timezone without a lookup", async () => {
+  const s = store();
+  const local = s.getProfile("k1d0cd11")!;
+  local.timezone = "America/Los_Angeles";
+  s.upsertProfile(local);
+  const remoteProfile = structuredClone(local);
+  let saved: typeof remoteProfile | null = null;
+  const remote = {
+    async getProfile() { return structuredClone(remoteProfile); },
+    async saveProfile(profile: typeof remoteProfile) { saved = structuredClone(profile); },
+  } as any;
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: { proxyType: "http", proxy: "remote-proxy.example:8080:user:pass" } }),
+    }),
+    {} as any,
+    s,
+    remote,
+    { timezoneFetch: timezoneFetch({ "remote-proxy.example": "Asia/Singapore" }) },
+  );
+
+  expect(res!.status).toBe(200);
+  expect(saved).toMatchObject({
+    proxy: { type: "http", host: "remote-proxy.example", port: "8080", user: "user", pass: "pass" },
+    timezone: "America/Los_Angeles",
+  });
+  expect(s.getProfile("k1d0cd11")).toMatchObject({
+    proxy: local.proxy,
+    timezone: "America/Los_Angeles",
+  });
+  s.close();
+});
+
+test("an explicit blank proxy edit preserves the stored timezone", async () => {
+  const s = store();
+  const before = s.getProfile("k1d0cd11")!;
+  before.timezone = "America/Los_Angeles";
+  s.upsertProfile(before);
+  const calls: string[][] = [];
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: { proxy: "" } }),
+    }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: timezoneFetch({}, calls) },
+  );
+  expect(res!.status).toBe(200);
+  expect(calls).toEqual([]);
+  expect(s.getProfile("k1d0cd11")!.proxy).toBeNull();
+  expect(s.getProfile("k1d0cd11")!.timezone).toBe("America/Los_Angeles");
+  s.close();
+});
+
+test("an IPv6 proxy round-trips through the edit view without losing its identity", async () => {
+  const s = store();
+  const before = s.getProfile("k1d0cd11")!;
+  before.proxy = { type: "socks5", host: "2001:db8::1", port: "1080", user: "user", pass: "p:ss" };
+  before.timezone = "America/New_York";
+  s.upsertProfile(before);
+  const calls: string[][] = [];
+
+  const detail = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11"),
+    {} as any,
+    s,
+  );
+  const edit = (await detail!.json()).profile;
+  expect(edit.proxy).toBe("[2001:db8::1]:1080:user:p:ss");
+
+  const saved = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: { proxy: edit.proxy, proxyType: edit.proxyType } }),
+    }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: timezoneFetch({}, calls) },
+  );
+  expect(saved!.status).toBe(200);
+  expect(calls).toEqual([]);
+  expect(s.getProfile("k1d0cd11")!.proxy).toEqual(before.proxy);
+  expect(s.getProfile("k1d0cd11")!.timezone).toBe("America/New_York");
+  s.close();
+});
+
+test("Chrome Web Store endpoint installs once and reuses the registered extension", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-web-store-"));
+  const id = extensionId(extensionPublicKey);
+  const assignmentsBefore = s.listProfiles().map((profile) => profile.extensions ?? []);
+  let fetches = 0;
+  const request = () => new Request("http://x/ui/api/extensions/web-store", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source: `https://chromewebstore.google.com/detail/fixture/${id}` }),
+  });
+
+  const first = await handleUiRequest(request(), {} as any, s, null, {
+    paths: { extensions: root } as any,
+    extensionFetch: async () => { fetches++; return extensionResponse(); },
+  });
+  expect(first!.status).toBe(200);
+  expect(await first!.json()).toMatchObject({ ok: true, installed: { id, name: "Route Fixture" }, alreadyInstalled: false });
+  expect(s.getExtension(id)?.loadDir).toBe(join(root, id));
+  expect(existsSync(join(root, id, "manifest.json"))).toBe(true);
+
+  const second = await handleUiRequest(request(), {} as any, s, null, {
+    paths: { extensions: root } as any,
+    extensionFetch: async () => { fetches++; throw new Error("must not fetch again"); },
+  });
+  expect(second!.status).toBe(200);
+  expect(await second!.json()).toMatchObject({ ok: true, installed: { id, name: "Route Fixture" }, alreadyInstalled: true });
+  expect(fetches).toBe(1);
+  expect(s.listProfiles().map((profile) => profile.extensions ?? [])).toEqual(assignmentsBefore);
+  s.close();
+});
+
+test("Chrome Web Store endpoint leaves no registry or files after identity failure", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-web-store-"));
+  const requestedId = "a".repeat(32);
+  expect(requestedId).not.toBe(extensionId(extensionPublicKey));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/extensions/web-store", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: requestedId }),
+    }),
+    {} as any,
+    s,
+    null,
+    {
+      paths: { extensions: root } as any,
+      extensionFetch: async () => extensionResponse(),
+    },
+  );
+
+  expect(response!.status).toBe(500);
+  expect(s.getExtension(requestedId)).toBeNull();
+  expect(existsSync(join(root, requestedId))).toBe(false);
+  s.close();
+});
+
+test("Chrome Web Store endpoint rejects cross-origin simple requests", async () => {
+  const s = store();
+  let fetches = 0;
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/extensions/web-store", {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain",
+        Origin: "https://example.com",
+      },
+      body: JSON.stringify({ source: extensionId(extensionPublicKey) }),
+    }),
+    {} as any,
+    s,
+    null,
+    {
+      extensionFetch: async () => {
+        fetches++;
+        return extensionResponse();
+      },
+    },
+  );
+
+  expect(response!.status).toBe(415);
+  expect(fetches).toBe(0);
+  expect(s.listExtensions()).toEqual([]);
+  s.close();
+});
+
+test("Chrome Web Store endpoint keeps the existing remote-mode restriction", async () => {
+  const s = store();
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/extensions/web-store", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "aapbdbdomjkkjkaonfhkkikfgjllcleb" }),
+    }),
+    {} as any,
+    s,
+    {} as any,
+  );
+  expect(response!.status).toBe(400);
+  s.close();
+});
+
+test("extension assignment is atomic and blocked when any selected profile is open", async () => {
+  const s = store();
+  const first = s.getProfile("k1d0cd11")!;
+  s.upsertProfile({ ...first, id: "k1d0cd22", name: "second", extensions: [] });
+  s.addExtension({ id: "ext-one", name: "Extension One", loadDir: "/tmp/ext-one" });
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 123, debugPort: 9333, ws: "ws://x", startedAt: 1 });
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/extensions", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["k1d0cd11", "k1d0cd22"], extensionId: "ext-one", op: "add" }),
+    }),
+    {} as any,
+    s,
+  );
+
+  expect(res!.status).toBe(409);
+  expect(s.getProfile("k1d0cd11")!.extensions).toEqual([]);
+  expect(s.getProfile("k1d0cd22")!.extensions).toEqual([]);
+  s.close();
+});
+
+test("extension deletion cannot mutate the persona of an open profile", async () => {
+  const s = store();
+  s.addExtension({ id: "ext-one", name: "Extension One", loadDir: "/tmp/ext-one" });
+  expect(s.assignExtension(["k1d0cd11"], "ext-one", true)).toBe(1);
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 123, debugPort: 9333, ws: "ws://x", startedAt: 1 });
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/extensions/delete", {
+      method: "POST",
+      body: JSON.stringify({ id: "ext-one" }),
+    }),
+    {} as any,
+    s,
+  );
+
+  expect(res!.status).toBe(409);
+  expect(s.getExtension("ext-one")).not.toBeNull();
+  expect(s.getProfile("k1d0cd11")!.extensions).toEqual(["ext-one"]);
+  s.close();
+});
+
+test("open Local and Cloud profiles allow account edits but reject fingerprint changes", async () => {
+  for (const cloud of [false, true]) {
+    const s = store();
+    s.recordLaunch({ profileId: "k1d0cd11", pid: 123, debugPort: 9333, ws: "ws://x", startedAt: 1 });
+    const options = cloud ? { cloudBrowser: {
+      canEditLive: () => true,
+      commitLiveEdit: async (profile: Profile) => { s.upsertProfile(profile); return true; },
+    } as any } : {};
+    for (const set of [{ resolution: "1366x768" }, { platformOs: "macos" }, { timezone: "Europe/Paris" }, { locale: "fr-FR" }]) {
+      const res = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ set }),
+      }), {} as any, s, null, options);
+      expect(res!.status).toBe(409);
+    }
+    const res = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ set: { name: "Renamed", resolution: "1680x1050", platformOs: "windows", timezone: "" } }),
+    }), {} as any, s, null, options);
+    expect(res!.status).toBe(200);
+    expect(s.getProfile("k1d0cd11")).toMatchObject({ name: "Renamed", screenWidth: 1680, screenHeight: 1050 });
+    expect(s.getLaunch("k1d0cd11")).not.toBeNull();
+    s.close();
+  }
+});
+
+test("closed fingerprint edits persist and preserve the rest of the identity", async () => {
+  for (const engine of ["chromium", "firefox"] as const) {
+    const s = store();
+    const id = engine === "firefox" ? "firefox-edit" : "k1d0cd11";
+    if (engine === "firefox") s.upsertProfile(firefoxProfile(s, id));
+    const before = s.getProfile(id)!;
+    const calls: string[][] = [];
+    for (const timezone of ["Europe/Paris", ""]) {
+      const set = { timezone, proxy: "next-proxy.example:8080", ...(engine === "chromium" ? { platformOs: "macos", resolution: "1920x1080" } : {}) };
+      const res = await handleUiRequest(new Request(`http://x/ui/api/profiles/${id}/update`, {
+        method: "POST", body: JSON.stringify({ set }),
+      }), {} as any, s, null, { timezoneFetch: timezoneFetch({}, calls) });
+      expect(res!.status).toBe(200);
+      const saved = s.getProfile(id)!;
+      expect(saved.timezone).toBe(timezone);
+      expect(saved.locale).toBe(before.locale);
+      expect(saved.cookies).toEqual(before.cookies);
+      expect(saved.fingerprintSeed).toBe(before.fingerprintSeed);
+      expect(saved.ua).toBe(before.ua);
+      if (engine === "firefox") {
+        const { timezone: _timezone, ...config } = before.firefox!.config;
+        expect(saved.firefox!.config).toEqual({ ...config, ...(timezone ? { timezone } : {}) });
+      } else {
+        expect(saved).toMatchObject({ platformOs: "macos", screenWidth: 1920, screenHeight: 1080 });
+        const flags = deriveFingerprintFlags(saved);
+        expect(flags).toContain("--fingerprint-platform=macos");
+        expect(flags).toContain("--fingerprint-screen-width=1920");
+        expect(flags.filter((flag) => flag.startsWith("--fingerprint-timezone="))).toEqual(timezone ? [`--fingerprint-timezone=${timezone}`] : []);
+      }
+      const detail = await handleUiRequest(new Request(`http://x/ui/api/profiles/${id}`), {} as any, s);
+      expect((await detail!.json()).profile.timezone).toBe(timezone);
+    }
+    expect(calls).toEqual([]);
+    s.close();
+  }
+});
+
+test("Firefox rejects OS edits and invalid timezone edits leave the profile unchanged", async () => {
+  const s = store();
+  s.upsertProfile(firefoxProfile(s, "firefox-edit"));
+  const before = s.getProfile("firefox-edit");
+  for (const set of [{ platformOs: "macos" }, { timezone: "Europe/Not_A_Zone" }]) {
+    const res = await handleUiRequest(new Request("http://x/ui/api/profiles/firefox-edit/update", {
+      method: "POST", body: JSON.stringify({ set }),
+    }), {} as any, s);
+    expect((await res!.json()).ok).toBe(false);
+    expect(s.getProfile("firefox-edit")).toEqual(before);
+  }
+  s.close();
+});
+
+test("timezone lookup refuses an open profile before making a request", async () => {
+  const s = store();
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 123, debugPort: 9333, ws: "ws://x", startedAt: 1 });
+  const calls: string[][] = [];
+  const res = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/timezone", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  }), {} as any, s, null, { timezoneFetch: timezoneFetch({}, calls) });
+  expect(res!.status).toBe(409);
+  expect(calls).toEqual([]);
+  s.close();
+});
+
+test("mobile persona conversion preserves the account and replaces only incoherent device fields", async () => {
+  const s = store();
+  const before = s.getProfile("k1d0cd11")!;
+  before.ua = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/146.0.0.0 Mobile Safari/537.36";
+  before.screenWidth = 412;
+  before.screenHeight = 915;
+  before.timezone = "America/New_York";
+  before.tags = ["priority"];
+  before.extensions = ["ext-one"];
+  s.upsertProfile(before);
+
+  const detail = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11"), {} as any, s);
+  const edit = (await detail!.json()).profile;
+  expect(edit.mobilePersona).toBe(true);
+  expect(edit.desktopConversion.platform).toBe("windows");
+  expect(edit.desktopConversion.screenChanged).toBe(true);
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/convert-mobile", { method: "POST" }),
+    {} as any,
+    s,
+  );
+  expect(res!.status).toBe(200);
+  const body = await res!.json();
+  expect(body).toMatchObject({ ok: true, changed: true, platform: "windows", screenChanged: true });
+
+  const after = s.getProfile("k1d0cd11")!;
+  expect(after.ua).toContain("Windows NT 10.0");
+  expect(after.ua.toLowerCase()).not.toContain("mobile");
+  expect(after.screenWidth).toBeGreaterThanOrEqual(1024);
+  for (const key of ["id", "accId", "username", "password", "email", "emailPassword", "twofa", "proxy", "timezone", "fingerprintSeed", "cookies", "seeded", "tags", "extensions"] as const) {
+    expect(after[key]).toEqual(before[key]);
+  }
+  s.close();
+});
+
+test("mobile persona conversion is idempotent and refuses local mutation while open", async () => {
+  const s = store();
+  const p = s.getProfile("k1d0cd11")!;
+  p.ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) Mobile/15E148";
+  s.upsertProfile(p);
+  s.recordLaunch({ profileId: p.id, pid: 123, debugPort: 9333, ws: "ws://live", startedAt: 1 });
+
+  const blocked = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/convert-mobile", { method: "POST" }),
+    {} as any,
+    s,
+  );
+  expect(blocked!.status).toBe(409);
+  expect(s.getProfile(p.id)!.ua).toContain("iPhone");
+
+  s.clearLaunch(p.id);
+  const converted = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/convert-mobile", { method: "POST" }),
+    {} as any,
+    s,
+  );
+  expect((await converted!.json()).platform).toBe("macos");
+  const repeated = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/convert-mobile", { method: "POST" }),
+    {} as any,
+    s,
+  );
+  expect(await repeated!.json()).toEqual({ ok: true, changed: false });
+  s.close();
+});
+
+test("remote mobile persona conversion saves a fresh hub profile without touching the local cache", async () => {
+  const s = store();
+  const hubProfile = s.getProfile("k1d0cd11")!;
+  hubProfile.ua = "Mozilla/5.0 (Linux; Android 13; Mobile) Chrome/145.0.0.0 Safari/537.36";
+  let saved: typeof hubProfile | null = null;
+  const remote = {
+    getProfile: async () => structuredClone(hubProfile),
+    saveProfile: async (profile: typeof hubProfile) => { saved = structuredClone(profile); },
+  } as any;
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/convert-mobile", { method: "POST" }),
+    {} as any,
+    s,
+    remote,
+  );
+  expect(res!.status).toBe(200);
+  expect(saved!.ua).toContain("Windows NT 10.0");
+  expect(saved!.fingerprintSeed).toBe(hubProfile.fingerprintSeed);
+  expect(saved!.cookies).toEqual(hubProfile.cookies);
+  expect(s.getProfile("k1d0cd11")!.ua).not.toContain("Android");
+  s.close();
+});
+
+test("bulk updates reject all rows when any target profile is open", async () => {
+  const s = store();
+  const first = s.getProfile("k1d0cd11")!;
+  s.upsertProfile({ ...first, id: "k1bulk02", name: "second-before" });
+  s.recordLaunch({ profileId: "k1bulk02", pid: 123, debugPort: 9334, ws: "ws://live", startedAt: 1 });
+  const form = new FormData();
+  form.append("file", new File([
+    [
+      "id,name",
+      "k1d0cd11,first-after",
+      "k1bulk02,second-after",
+    ].join("\n"),
+  ], "updates.csv", { type: "text/csv" }));
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+    {} as any,
+    s,
+  );
+  expect(res!.status).toBe(409);
+  expect(s.getProfile("k1d0cd11")!.name).toBe("sophia");
+  expect(s.getProfile("k1bulk02")!.name).toBe("second-before");
+  s.close();
+});
+
+test("export route fails explicitly in remote mode", async () => {
+  const s = new ProfileStore(":memory:");
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/export", { method: "POST", body: JSON.stringify({ ids: ["k1d0cd11"] }) }),
+    {} as any,
+    s,
+    {} as any,
+  );
+  expect(res!.status).toBe(400);
+  const body = await res!.json();
+  expect(body.ok).toBe(false);
+  expect(body.error).toContain("remote mode");
+  s.close();
+});
+
+test("create (local mode) sets the timezone from the proxy", async () => {
+  for (const engine of ["chromium", "firefox"] as const) {
+    const s = new ProfileStore(":memory:");
+    const calls: string[][] = [];
+    const res = await handleUiRequest(
+      new Request("http://x/ui/api/profiles", {
+        method: "POST",
+        body: JSON.stringify({ engine, name: "fresh", proxy: { type: "http", host: "new-proxy.example", port: "8080" } }),
+      }),
+      {} as any,
+      s,
+      null,
+      { timezoneFetch: timezoneFetch({ "new-proxy.example": "Europe/Paris" }, calls) },
+    );
+    const body = await res!.json();
+    expect(body.ok).toBe(true);
+    expect(calls).toEqual([["http://ip-api.com/json/?fields=status,timezone,countryCode,query"]]);
+    const saved = s.getProfile(body.id)!;
+    expect(saved).toMatchObject({ timezone: "Europe/Paris", locale: "fr-FR" });
+    if (engine === "firefox") expect(saved.firefox!.config.timezone).toBe("Europe/Paris");
+    s.close();
+  }
+});
+
+test("create (local mode) keeps the host timezone when the proxy lookup fails", async () => {
+  const s = new ProfileStore(":memory:");
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles", {
+      method: "POST",
+      body: JSON.stringify({ name: "fresh", proxy: { type: "http", host: "new-proxy.example", port: "8080" } }),
+    }),
+    {} as any,
+    s,
+    null,
+    { timezoneFetch: async () => { throw new Error("offline"); } },
+  );
+  const body = await res!.json();
+  expect(body.ok).toBe(true);
+  expect(s.getProfile(body.id)!.timezone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  s.close();
+});
+
+test("blank Local creation and edit do not request timezones for either browser", async () => {
+  for (const engine of ["chromium", "firefox"] as const) {
+    const s = new ProfileStore(":memory:");
+    const calls: string[][] = [];
+    const created = await handleUiRequest(
+      new Request("http://x/ui/api/profiles", {
+        method: "POST",
+        body: JSON.stringify({ engine }),
+      }),
+      {} as any,
+      s,
+      null,
+      { timezoneFetch: timezoneFetch({ "1.2.3.4": "Europe/London" }, calls) },
+    );
+    const body = await created!.json();
+    expect(body.ok).toBe(true);
+    expect(calls).toEqual([]);
+
+    const edited = await handleUiRequest(
+      new Request(`http://x/ui/api/profiles/${body.id}/update`, {
+        method: "POST",
+        body: JSON.stringify({ set: { name: `${engine}-edited` } }),
+      }),
+      {} as any,
+      s,
+      null,
+      { timezoneFetch: timezoneFetch({ "1.2.3.4": "Europe/London" }, calls) },
+    );
+    expect((await edited!.json()).ok).toBe(true);
+    expect(calls).toEqual([]);
+    expect(s.getProfile(body.id)).toMatchObject({ engine, name: `${engine}-edited` });
+    s.close();
+  }
+});
+
+test("create (local mode) adds a new profile", async () => {
+  const s = new ProfileStore(":memory:");
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles", { method: "POST", body: JSON.stringify({ name: "fresh", group: "g" }) }),
+    {} as any,
+    s,
+  );
+  const body = await res!.json();
+  expect(body.ok).toBe(true);
+  expect(s.getProfile(body.id)!.name).toBe("fresh");
+  s.close();
+});
+
+test("creating a Firefox profile starts the background download of its font pack", async () => {
+  const s = new ProfileStore(":memory:");
+  const prefetched: Profile[][] = [];
+  const launcher = { prefetchFirefoxFontPacks: (profiles: Profile[]) => { prefetched.push(profiles); } } as any;
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles", { method: "POST", body: JSON.stringify({ name: "mac", engine: "firefox", platformOs: "macos" }) }),
+    launcher,
+    s,
+  );
+  const body = await res!.json();
+  expect(body.ok).toBe(true);
+  expect(prefetched.map((profiles) => profiles.map((profile) => [profile.id, profile.engine, profile.platformOs])))
+    .toEqual([[[body.id, "firefox", "macos"]]]);
+  s.close();
+});
+
+test("create in remote mode delegates to the hub (not the local store)", async () => {
+  const s = new ProfileStore(":memory:");
+  const remote = { createProfile: async (input: any) => ({ id: "remote-" + (input.name || "x") }) } as any;
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles", { method: "POST", body: JSON.stringify({ name: "rp" }) }),
+    {} as any,
+    s,
+    remote,
+  );
+  const body = await res!.json();
+  expect(body.ok).toBe(true);
+  expect(body.id).toBe("remote-rp");
+  expect(s.getProfile("remote-rp")).toBeNull(); // went to the hub, not created locally
+  s.close();
+});
+
+test("export in remote mode pulls every selected profile from the hub, not the local launch cache", async () => {
+  const s = store(); // local launch cache holds only k1d0cd11
+  // Two accounts that live on the hub roster but were never opened on this
+  // machine — exactly what the launch cache can't serve. Selecting these and
+  // exporting used to silently produce a file missing both rows.
+  const base = parseExport(SAMPLE).profiles[0]!;
+  const hubProfiles: Record<string, any> = {
+    hub0001: { ...base, id: "hub0001", name: "alpha" },
+    hub0002: { ...base, id: "hub0002", name: "bravo" },
+  };
+  const fetched: string[] = [];
+  const remote = {
+    async getProfiles(ids: string[]) {
+      fetched.push(...ids);
+      return ids.map((id) => hubProfiles[id]).filter(Boolean);
+    },
+  } as any;
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["hub0001", "hub0002"], format: "csv" }),
+    }),
+    {} as any,
+    s,
+    remote,
+  );
+  expect(res!.status).toBe(200);
+  expect(res!.headers.get("content-disposition")).toContain("ghosteranti-export.csv");
+  const text = await res!.text();
+  expect(fetched).toEqual(["hub0001", "hub0002"]); // resolved against the hub, not the local store
+  const rows = text.trim().split("\n");
+  expect(rows.length).toBe(3); // header + both selected accounts (not just the locally-cached one)
+  expect(text).toContain("hub0001");
+  expect(text).toContain("hub0002");
+  expect(text).not.toContain("k1d0cd11"); // the local-cache fallback is gone
+  s.close();
+});
+
+test("Cloud export uses the authoritative portable profile", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-export-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const local = s.getProfile("k1d0cd11")!;
+  local.fpObserved = { canvas: "local-canvas-attestation" };
+  s.upsertProfile(local);
+  const cloudProfile = {
+    ...local,
+    name: "Authoritative Cloud name",
+    timezone: "UTC",
+    cookies: [
+      { name: "auth_token", value: "CLOUD_COOKIE", domain: ".x.com", path: "/" },
+      // `document.cookie = "value"` makes a cookie with an empty name; export keeps it.
+      { name: "", value: "NAMELESS_COOKIE", domain: "x.com", path: "/" },
+    ],
+  };
+  const cloudBundle = JSON.stringify({
+    cookies: cloudProfile.cookies,
+    origins: [{ origin: "https://x.com", localStorage: [{ name: "device", value: "cloud-device" }] }],
+    tabs: ["https://x.com/messages"],
+  });
+  s.saveSessionBundle(local.id, JSON.stringify({ cookies: [], origins: [], tabs: ["https://local-stale.example/"] }));
+  const fetched: string[] = [];
+  const cloudConnection = {
+    client: {
+      async getProfile(id: string) {
+        fetched.push(id);
+        return {
+          profile: { id, version: 3, activeOpens: [{ accountId: "other-device" }] },
+          payload: encodePortableProfile(cloudProfile, cloudBundle),
+        };
+      },
+    },
+  } as any;
+
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["k1d0cd11"], format: "txt" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+
+  expect(response!.status).toBe(200);
+  expect(response!.headers.get("cache-control")).toBe("no-store");
+  expect(fetched).toEqual(["k1d0cd11"]);
+  const text = await response!.text();
+  expect(text).toContain("name=Authoritative Cloud name");
+  expect(text).toContain("CLOUD_COOKIE");
+  expect(text).toContain("fp_canvas=local-canvas-attestation");
+  expect(text).not.toContain("local-stale.example");
+  expect(text).toContain("session_source=cloud");
+  const exportedSession = parseExport(text).imports[0]!.sessionBundle!;
+  expect(JSON.parse(exportedSession).origins).toEqual(JSON.parse(cloudBundle).origins);
+  expect(JSON.parse(exportedSession).tabs).toEqual(["https://x.com/messages"]);
+  expect(JSON.parse(exportedSession).cookies).toContainEqual(expect.objectContaining({ name: "", value: "NAMELESS_COOKIE" }));
+  const form = new FormData();
+  form.append("group", "Imported");
+  form.append("files", new File([text], "export.txt"));
+  let imported = false;
+  const upload = await handleUiRequest(new Request("http://x/ui/api/import/upload", { method: "POST", body: form }), {} as any, s, null, {
+    appConfig,
+    cloudBrowser: { importProfiles: async (_destination: string, profiles: any[]) => {
+      expect(profiles[0].sessionBundle).toBe(exportedSession);
+      imported = true;
+      return { ok: true, imported: 1, ids: [local.id] };
+    } } as any,
+  });
+  expect(upload!.status).toBe(200);
+  expect(imported).toBe(true);
+  s.close();
+});
+
+test("Cloud export preserves selection order in every format", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-export-formats-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const base = s.getProfile("k1d0cd11")!;
+  const profiles: Record<string, Profile> = {
+    cloud0001: { ...base, id: "cloud0001", name: "First Cloud" },
+    cloud0002: { ...base, id: "cloud0002", name: "Second Cloud" },
+  };
+  const fetched: string[] = [];
+  const cloudConnection = {
+    client: {
+      async getProfile(id: string) {
+        fetched.push(id);
+        return { profile: { id, version: 1, activeOpens: [] }, payload: encodePortableProfile(profiles[id]!) };
+      },
+    },
+  } as any;
+  const requested = ["cloud0002", "cloud0001"];
+
+  for (const format of ["csv", "txt", "xlsx"] as const) {
+    const response = await handleUiRequest(
+      new Request("http://x/ui/api/profiles/export", {
+        method: "POST",
+        body: JSON.stringify({ ids: requested, format }),
+      }),
+      {} as any,
+      s,
+      null,
+      { appConfig, cloudBrowser: {} as any, cloudConnection },
+    );
+    expect(response!.status).toBe(200);
+    expect(response!.headers.get("cache-control")).toBe("no-store");
+    const ids = format === "xlsx"
+      ? (await readXlsx(new Uint8Array(await response!.arrayBuffer()))).map((row) => row.id)
+      : format === "txt"
+        ? parseExport(await response!.text()).profiles.map((profile) => profile.id)
+        : (await response!.text()).trim().split("\n").slice(1).map((row) => row.split(",")[0]);
+    expect(ids).toEqual(requested);
+  }
+  expect(fetched).toEqual([...requested, ...requested, ...requested]);
+  s.close();
+});
+
+test("Cloud export fails the whole download when one profile cannot be fetched", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-export-failure-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const cloudConnection = {
+    client: {
+      async getProfile(id: string) {
+        if (id === "missing001") throw new CloudApiError("Cloud profile was not found", "profile_not_found", 404);
+        const profile = { ...s.getProfile("k1d0cd11")!, id };
+        return { profile: { id, version: 1, activeOpens: [] }, payload: encodePortableProfile(profile) };
+      },
+    },
+  } as any;
+
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["k1d0cd11", "missing001"], format: "txt" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+  expect(response!.status).toBe(404);
+  expect(await response!.json()).toEqual({ ok: false, error: "Cloud profile was not found" });
+  s.close();
+});
+
+test("streamed export reports progress in 16-wide Cloud batches and streams the identical file", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-export-stream-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const base = s.getProfile("k1d0cd11")!;
+  const ids = Array.from({ length: 34 }, (_, i) => `cloud${String(i).padStart(4, "0")}`);
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const cloudConnection = {
+    client: {
+      async getProfile(id: string) {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight--;
+        const profile = { ...base, id, name: `Cloud ${id}` };
+        return { profile: { id, version: 1, activeOpens: [] }, payload: encodePortableProfile(profile) };
+      },
+    },
+  } as any;
+
+  const streamed = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids, format: "txt", stream: true }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+  expect(streamed!.status).toBe(200);
+  expect(streamed!.headers.get("content-type")).toContain("application/x-ndjson");
+  expect(streamed!.headers.get("cache-control")).toBe("no-store");
+  const records = (await streamed!.text()).trim().split("\n").map((line) => JSON.parse(line));
+  const progress = records.filter((record) => record.type === "progress");
+  expect(progress[0]).toEqual({ type: "progress", completed: 0, total: 34 });
+  expect(progress.at(-1)).toEqual({ type: "progress", completed: 34, total: 34 });
+  expect(maxInFlight).toBe(16); // 16-wide fan-out, not the previous 8
+  expect(records.filter((record) => record.type === "file")).toHaveLength(1);
+  const file = records.at(-1)!;
+  expect(file.type).toBe("file");
+  expect(file.mime).toContain("text/plain");
+
+  // The streamed file must be byte-identical to the legacy single-response export.
+  const legacy = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids, format: "txt" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+  expect(Buffer.from(file.data, "base64").toString("utf8")).toBe(await legacy!.text());
+  s.close();
+});
+
+test("streamed export turns a failed Cloud fetch into an error record without a file", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-export-stream-error-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const cloudConnection = {
+    client: {
+      async getProfile(id: string) {
+        if (id === "missing001") throw new CloudApiError("Cloud profile was not found", "profile_not_found", 404);
+        const profile = { ...s.getProfile("k1d0cd11")!, id };
+        return { profile: { id, version: 1, activeOpens: [] }, payload: encodePortableProfile(profile) };
+      },
+    },
+  } as any;
+
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["k1d0cd11", "missing001"], format: "txt", stream: true }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+  expect(response!.status).toBe(200);
+  const records = (await response!.text()).trim().split("\n").map((line) => JSON.parse(line));
+  expect(records[0]).toEqual({ type: "progress", completed: 0, total: 2 });
+  expect(records.find((record) => record.type === "error")).toMatchObject({ type: "error", error: "Cloud profile was not found" });
+  expect(records.some((record) => record.type === "file")).toBe(false);
+  s.close();
+});
+
+test("a disconnected streamed export stops scheduling further Cloud batches", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-export-stream-cancel-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const base = s.getProfile("k1d0cd11")!;
+  const ids = Array.from({ length: 40 }, (_, i) => `cloud${String(i).padStart(4, "0")}`);
+  const fetched: string[] = [];
+  const cloudConnection = {
+    client: {
+      async getProfile(id: string) {
+        fetched.push(id);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const profile = { ...base, id };
+        return { profile: { id, version: 1, activeOpens: [] }, payload: encodePortableProfile(profile) };
+      },
+    },
+  } as any;
+
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids, format: "txt", stream: true }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+  const reader = response!.body!.getReader();
+  const first = await reader.read();
+  expect(new TextDecoder().decode(first.value!)).toContain('"completed":0');
+  await reader.cancel(); // the browser tab closed / the request was aborted
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  expect(fetched).toHaveLength(16); // the in-flight batch finished; the rest were never scheduled
+  s.close();
+});
+
+test("remote-mode streamed export reports progress between hub batches", async () => {
+  const s = store();
+  const base = parseExport(SAMPLE).profiles[0]!;
+  const ids = Array.from({ length: 20 }, (_, i) => `hub${String(i).padStart(4, "0")}`);
+  const remote = {
+    async getProfiles(selected: string[], _full: boolean, onProgress?: (completed: number, total: number) => void) {
+      const out: Profile[] = [];
+      for (let i = 0; i < selected.length; i += 8) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        out.push(...selected.slice(i, i + 8).map((id) => ({ ...base, id })));
+        onProgress?.(out.length, selected.length);
+      }
+      return out;
+    },
+  } as any;
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids, format: "csv", stream: true }),
+    }),
+    {} as any,
+    s,
+    remote,
+  );
+  const records = (await response!.text()).trim().split("\n").map((line) => JSON.parse(line));
+  expect(records.filter((record) => record.type === "progress").map((record) => record.completed)).toEqual([0, 8, 16, 20]);
+  const file = records.at(-1)!;
+  expect(file.type).toBe("file");
+  expect(file.mime).toContain("text/csv");
+  expect(Buffer.from(file.data, "base64").toString("utf8")).toContain("hub0000");
+  s.close();
+});
+
+test("local-mode streamed export reports progress after each profile", async () => {
+  const s = store();
+  s.upsertProfile({ ...s.getProfile("k1d0cd11")!, id: "local0002", name: "second" });
+  const captured: string[] = [];
+  const launcher = { async captureLocalSession(id: string) { captured.push(id); return false; } } as any;
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["k1d0cd11", "local0002"], format: "txt", stream: true }),
+    }),
+    launcher,
+    s,
+  );
+  const records = (await response!.text()).trim().split("\n").map((line) => JSON.parse(line));
+  expect(records.filter((record) => record.type === "progress").map((record) => record.completed)).toEqual([0, 1, 2]);
+  const file = records.at(-1)!;
+  expect(file.type).toBe("file");
+  const text = Buffer.from(file.data, "base64").toString("utf8");
+  expect(parseExport(text).profiles.map((profile) => profile.id)).toEqual(["k1d0cd11", "local0002"]);
+  expect(captured).toEqual(["k1d0cd11", "local0002"]);
+  s.close();
+});
+
+test("export as xlsx returns a workbook carrying the full identity", async () => {
+  const s = store();
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["k1d0cd11"], format: "xlsx" }),
+    }),
+    new Launcher({ store: s }),
+    s,
+    null as any,
+  );
+  expect(res!.status).toBe(200);
+  expect(res!.headers.get("content-disposition")).toContain("ghosteranti-export.xlsx");
+  expect(res!.headers.get("content-type")).toContain("spreadsheetml.sheet");
+
+  const rows = await readXlsx(new Uint8Array(await res!.arrayBuffer()));
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.id).toBe("k1d0cd11");
+  expect(rows[0]!.proxy).toBe("1.2.3.4:8080:proxyuser:PROXYPASS");
+  expect(rows[0]!.resolution).toBe("1680*1050");
+  // The identity the export exists to move: cookies and the user-agent.
+  expect(JSON.parse(rows[0]!.cookie!)[0].name).toBe("auth_token");
+  expect(rows[0]!.ua).toContain("Chrome/143.0.0.0");
+  s.close();
+});
+
+test("export as xlsx pulls from the hub in remote mode, with secrets", async () => {
+  const s = store();
+  const asked: Array<[string[], boolean | undefined]> = [];
+  const base = parseExport(SAMPLE).profiles[0]!;
+  const remote = {
+    async getProfiles(ids: string[], full?: boolean) {
+      asked.push([ids, full]);
+      return ids.map((id) => ({ ...base, id }));
+    },
+  } as any;
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/export", {
+      method: "POST",
+      body: JSON.stringify({ ids: ["hub0001"], format: "xlsx" }),
+    }),
+    {} as any,
+    s,
+    remote,
+  );
+  expect(res!.status).toBe(200);
+  // A full-fidelity sheet without cookies would be a silent downgrade, so the
+  // hub fetch must ask for secrets exactly as the .txt export does.
+  expect(asked).toEqual([[["hub0001"], true]]);
+  expect((await readXlsx(new Uint8Array(await res!.arrayBuffer())))[0]!.id).toBe("hub0001");
+  s.close();
+});
+
+test("update-file accepts an edited .xlsx and applies only editable columns", async () => {
+  const s = store();
+  const book = await writeXlsx(
+    ["id", "name", "group", "cookie"],
+    [["k1d0cd11", "renamed", "NewGroup", "[]"]],
+  );
+  const form = new FormData();
+  form.append("files", new File([book as unknown as BlobPart], "edited.xlsx"));
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/update-file", { method: "POST", body: form }),
+    {} as any,
+    s,
+    null as any,
+  );
+  const body = (await res!.json()) as any;
+  expect(body.ok).toBe(true);
+  expect(body.updated).toBe(1);
+
+  const p = s.getProfile("k1d0cd11")!;
+  expect(p.name).toBe("renamed");
+  expect(p.group).toBe("NewGroup");
+  // Identity columns stay inert on re-upload, exactly as for .txt and .csv.
+  expect(p.cookies).toHaveLength(1);
+  s.close();
+});
+
+test("delete (standalone) blocks an open profile without stopping it or removing its data", async () => {
+  const s = store();
+  const dataRoot = join("/tmp", `ui-del-${process.pid}-${s.count()}`);
+  const launcher: any = {
+    profileDeletionBlocked: () => true,
+    stop: async () => { throw new Error("must not stop an open profile during delete"); },
+    removeUserDataDir: () => { throw new Error("must not remove an open profile"); },
+  };
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 1, debugPort: 9412, ws: "ws://x", startedAt: 1 });
+  const dir = join(dataRoot, "k1d0cd11");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "Cookies"), "logged-in");
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/delete", { method: "POST", body: JSON.stringify({ ids: ["k1d0cd11"] }) }),
+    launcher,
+    s,
+  );
+  const body = await res!.json();
+  expect(res!.status).toBe(409);
+  expect(body).toMatchObject({ ok: false, deleted: 0, locked: ["k1d0cd11"] });
+  expect(existsSync(dir)).toBe(true);
+  expect(s.getProfile("k1d0cd11")).not.toBeNull();
+
+  rmSync(dataRoot, { recursive: true, force: true });
+  s.close();
+});
+
+test("delete (standalone) keeps a mixed open and closed selection atomic", async () => {
+  const s = store();
+  const closedId = "closed001";
+  s.upsertProfile({ ...s.getProfile("k1d0cd11")!, id: closedId, name: "closed" });
+  const dataRoot = join("/tmp", `ui-del-mixed-${process.pid}-${s.count()}`);
+  const openDir = join(dataRoot, "k1d0cd11");
+  const closedDir = join(dataRoot, closedId);
+  mkdirSync(openDir, { recursive: true });
+  mkdirSync(closedDir, { recursive: true });
+  writeFileSync(join(openDir, "Cookies"), "open");
+  writeFileSync(join(closedDir, "Cookies"), "closed");
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 1, debugPort: 9412, ws: "ws://x", startedAt: 1 });
+  const launcher: any = {
+    profileDeletionBlocked: (id: string) => id === "k1d0cd11",
+    stop: async () => { throw new Error("must not stop profiles during delete"); },
+    removeUserDataDir: () => { throw new Error("must not mutate a blocked batch"); },
+  };
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/delete", {
+      method: "POST", body: JSON.stringify({ ids: [closedId, "k1d0cd11"] }),
+    }),
+    launcher,
+    s,
+  );
+  expect(res!.status).toBe(409);
+  expect(await res!.json()).toMatchObject({ deleted: 0, locked: ["k1d0cd11"] });
+  expect(s.getProfile(closedId)).not.toBeNull();
+  expect(s.getProfile("k1d0cd11")).not.toBeNull();
+  expect(existsSync(closedDir)).toBe(true);
+  expect(existsSync(openDir)).toBe(true);
+  rmSync(dataRoot, { recursive: true, force: true });
+  s.close();
+});
+
+test("delete (standalone) trashes a closed profile without calling stop or removing data", async () => {
+  const s = store();
+  const calls: string[] = [];
+  const launcher: any = {
+    profileDeletionBlocked: () => false,
+    stop: async () => { throw new Error("delete must not stop a profile"); },
+    removeUserDataDir: (id: string) => { calls.push(id); return true; },
+  };
+
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/delete", { method: "POST", body: JSON.stringify({ ids: ["k1d0cd11"] }) }),
+    launcher,
+    s,
+  );
+
+  expect(await res!.json()).toMatchObject({ ok: true, deleted: 1, locked: [] });
+  expect(calls).toEqual([]);
+  expect(s.getProfile("k1d0cd11")).toBeNull();
+  expect(s.listTrashed().map((p) => p.id)).toEqual(["k1d0cd11"]);
+  s.close();
+});
+
+test("delete (standalone) keeps recoverable data without cleanup and is idempotent", async () => {
+  const s = store();
+  const launcher: any = {
+    profileDeletionBlocked: () => false,
+    removeUserDataDir: () => { throw new Error("Trash must not clean up saved data"); },
+  };
+  const request = () => new Request("http://x/ui/api/profiles/delete", {
+    method: "POST", body: JSON.stringify({ ids: ["k1d0cd11"] }),
+  });
+
+  const first = await handleUiRequest(request(), launcher, s);
+  expect(first!.status).toBe(200);
+  expect(await first!.json()).toMatchObject({ ok: true, deleted: 1 });
+  const retried = await handleUiRequest(request(), launcher, s);
+  expect(retried!.status).toBe(200);
+  expect(await retried!.json()).toMatchObject({ ok: true, deleted: 0 });
+  expect(s.listTrashed()).toHaveLength(1);
+  expect(s.restoreProfile("k1d0cd11")).toBe(true);
+  expect(s.getProfile("k1d0cd11")).not.toBeNull();
+  s.close();
+});
+
+test("delete with an unknown id never touches the launcher (no rmSync on a crafted path)", async () => {
+  const s = store();
+  const launcher: any = {
+    stop: async () => { throw new Error("must not be called"); },
+    userDataDir: () => { throw new Error("must not be called"); },
+  };
+  const res = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/delete", { method: "POST", body: JSON.stringify({ ids: ["../../etc"] }) }),
+    launcher,
+    s,
+  );
+  expect((await res!.json()).deleted).toBe(0);
+  s.close();
+});
+
+test("handleUiRequest returns null for non-ui paths (falls through to the AdsPower API)", async () => {
+  const s = store();
+  const res = await handleUiRequest(new Request("http://x/api/v1/status"), {} as any, s);
+  expect(res).toBeNull();
+  s.close();
+});
+
+test("app mode API exposes unconfigured first launch and persists Local selection", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-config-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+
+  const initial = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode"),
+    {} as any,
+    s,
+    null,
+    { appConfig },
+  );
+  const { chromiumRuntime: _forcedRuntime, defaultChromiumRuntime, defaultEngine, ...config } = await initial!.json();
+  expect(config).toEqual({ version: 1, mode: "unconfigured", localAnalytics: false });
+  // The dashboard starts new Chrome profiles on Chromium 155 only where this computer can run it.
+  expect(defaultChromiumRuntime).toBe(supportsChromium155Host(process.platform, process.arch) ? "ghosteranti" : undefined);
+  // New profiles start on GhosterAnti Chromium on Windows and GhosterAnti Firefox on macOS and Linux.
+  expect(defaultEngine).toBe(process.platform === "win32" ? "chromium" : "firefox");
+
+  const selected = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "local" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig },
+  );
+  expect(await selected!.json()).toEqual({
+    ok: true,
+    config: { version: 1, mode: "local", localAnalytics: false },
+    restartRequired: true,
+  });
+  expect(appConfig.read().mode).toBe("local");
+  s.close();
+});
+
+test("app mode API keeps restart-required state across dashboard reloads", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-config-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  const options = { appConfig, runtimeMode: "local" as const, defaultCloudUrl: "https://cloud.ghosteranti.test" };
+
+  const selected = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "cloud" }),
+    }),
+    {} as any,
+    s,
+    null,
+    options,
+  );
+  expect(await selected!.json()).toMatchObject({ restartRequired: true });
+
+  const reloaded = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode"),
+    {} as any,
+    s,
+    null,
+    options,
+  );
+  expect(await reloaded!.json()).toMatchObject({ mode: "cloud", restartRequired: true });
+  s.close();
+});
+
+test("app mode API switches persisted Local mode to Cloud without touching Cloud runtimes", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-config-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("local");
+  let cloudRuntimeReads = 0;
+  const unavailableRuntime = new Proxy({}, {
+    get() {
+      cloudRuntimeReads++;
+      throw new Error("mode selection must not initialize Cloud");
+    },
+  });
+
+  const selected = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "cloud" }),
+    }),
+    {} as any,
+    s,
+    null,
+    {
+      appConfig,
+      defaultCloudUrl: "https://cloud.ghosteranti.test",
+      cloudAuth: unavailableRuntime as any,
+      cloudConnection: unavailableRuntime as any,
+    },
+  );
+
+  expect(await selected!.json()).toEqual({
+    ok: true,
+    config: {
+      version: 1,
+      mode: "cloud",
+      cloudUrl: "https://cloud.ghosteranti.test",
+      localAnalytics: false,
+    },
+    restartRequired: true,
+  });
+  expect(appConfig.read().mode).toBe("cloud");
+  expect(cloudRuntimeReads).toBe(0);
+  s.close();
+});
+
+test("app mode API uses the packaged Cloud endpoint", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-config-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "cloud", cloudUrl: "https://attacker.example" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, defaultCloudUrl: "https://cloud.ghosteranti.test" },
+  );
+  expect(await response!.json()).toEqual({
+    ok: true,
+    config: {
+      version: 1,
+      mode: "cloud",
+      cloudUrl: "https://cloud.ghosteranti.test",
+      localAnalytics: false,
+    },
+    restartRequired: true,
+  });
+  const profiles = await handleUiRequest(
+    new Request("http://x/ui/api/profiles"),
+    {} as any,
+    s,
+    null,
+    { appConfig },
+  );
+  expect(profiles!.status).toBe(503);
+  expect((await profiles!.json()).error).toContain("authentication is required");
+  s.close();
+});
+
+test("Cloud connector API creates, checks, and revokes only the selected connector", async () => {
+  const s = store();
+  const revoked: string[] = [];
+  const connectors = [
+    { id: "settings-connector", deviceId: "device-1", label: "GhosterAnti Settings", revokedAt: null },
+    { id: "cli-connector", deviceId: "device-1", label: "Linux Claude", revokedAt: null },
+  ];
+  const client = {
+    async createMcpConnector(label: string) {
+      expect(label).toBe("GhosterAnti Settings");
+      return {
+        ok: true,
+        connector: connectors[0],
+        token: "test-connector-secret",
+      };
+    },
+    async listMcpConnectors() { return { ok: true, connectors }; },
+    async revokeMcpConnector(id: string) { revoked.push(id); return { ok: true }; },
+    remoteMcpUrl(deviceId: string) { return `https://cloud.ghosteranti.test/v1/mcp/devices/${deviceId}`; },
+  };
+  const options = {
+    cloudConnection: {
+      accountId: () => "account-1",
+      deviceId: () => "device-1",
+      client,
+    } as unknown as CloudConnectionRuntime,
+  };
+  const request = (body: unknown) => new Request("http://x/ui/api/cloud-connector", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const created = await handleUiRequest(request({ action: "create" }), {} as any, s, null, options);
+  expect(created!.headers.get("cache-control")).toBe("no-store");
+  expect(await created!.json()).toEqual({
+    ok: true,
+    state: "active",
+    connectorId: "settings-connector",
+    deviceId: "device-1",
+    url: "https://cloud.ghosteranti.test/v1/mcp/devices/device-1",
+    token: "test-connector-secret",
+  });
+
+  const active = await handleUiRequest(request({
+    action: "status", connectorId: "settings-connector",
+  }), {} as any, s, null, options);
+  expect(await active!.json()).toEqual({
+    ok: true,
+    state: "active",
+    url: "https://cloud.ghosteranti.test/v1/mcp/devices/device-1",
+  });
+
+  const missing = await handleUiRequest(request({
+    action: "status", connectorId: "unknown-connector",
+  }), {} as any, s, null, options);
+  expect((await missing!.json()).state).toBe("missing");
+
+  const disabled = await handleUiRequest(request({
+    action: "revoke", connectorId: "settings-connector",
+  }), {} as any, s, null, options);
+  expect(await disabled!.json()).toEqual({ ok: true, state: "disabled" });
+  expect(revoked).toEqual(["settings-connector"]);
+  expect(revoked).not.toContain("cli-connector");
+  s.close();
+});
+
+test("Cloud connector API requires an authenticated trusted JSON request", async () => {
+  const s = store();
+  const unavailable = await handleUiRequest(new Request("http://x/ui/api/cloud-connector", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: '{"action":"create"}',
+  }), {} as any, s);
+  expect(unavailable!.status).toBe(503);
+  expect(unavailable!.headers.get("cache-control")).toBe("no-store");
+
+  const unauthenticated = await handleUiRequest(new Request("http://x/ui/api/cloud-connector", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: '{"action":"create"}',
+  }), {} as any, s, null, {
+    cloudConnection: {
+      accountId: () => null,
+      deviceId: () => null,
+      client: {},
+    } as unknown as CloudConnectionRuntime,
+  });
+  expect(unauthenticated!.status).toBe(401);
+  expect(unauthenticated!.headers.get("cache-control")).toBe("no-store");
+
+  const cloudConnection = {
+    accountId: () => "account-1",
+    deviceId: () => "device-1",
+    client: {},
+  } as unknown as CloudConnectionRuntime;
+  const rejected = await handleUiRequest(new Request("http://x/ui/api/cloud-connector", {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "https://outside.invalid" },
+    body: '{"action":"create"}',
+  }), {} as any, s, null, { cloudConnection });
+  expect(rejected!.status).toBe(403);
+  expect(rejected!.headers.get("cache-control")).toBe("no-store");
+  s.close();
+});
+
+test("Cloud group extension route lists and updates editable defaults", async () => {
+  const s = store();
+  const calls: unknown[] = [];
+  const client = {
+    async listFolders() {
+      return { ok: true, folders: [
+        { name: "Sales", archivedAt: null, permission: "edit", extensionDefaults: ["e1"] },
+        { name: "Archive", archivedAt: 1, permission: "edit", extensionDefaults: ["old"] },
+      ] };
+    },
+    async setFolderExtensionDefaults(name: string, extensions: string[]) {
+      calls.push({ name, extensions });
+      return {
+        ok: true,
+        folder: { name, archivedAt: null, permission: "edit", extensionDefaults: extensions },
+        updatedCount: 2,
+      };
+    },
+  };
+  const options = {
+    cloudBrowser: {} as any,
+    cloudConnection: { client } as unknown as CloudConnectionRuntime,
+  };
+
+  const listed = await handleUiRequest(
+    new Request("http://x/ui/api/groups/extensions"),
+    {} as any,
+    s,
+    null,
+    options,
+  );
+  expect(await listed!.json()).toEqual({
+    ok: true,
+    groups: [{ name: "Sales", extensions: ["e1"], permission: "edit" }],
+  });
+
+  const saved = await handleUiRequest(
+    new Request("http://x/ui/api/groups/extensions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ group: "Sales", extensions: ["e2"] }),
+    }),
+    {} as any,
+    s,
+    null,
+    options,
+  );
+  expect(saved!.status).toBe(200);
+  expect((await saved!.json()).updatedCount).toBe(2);
+  expect(calls).toEqual([{ name: "Sales", extensions: ["e2"] }]);
+  s.close();
+});
+
+test("Cloud workspace API returns editable folders to members without loading invitations", async () => {
+  const s = store();
+  let invitationCalls = 0;
+  const client = {
+    async status() { return { workspace: { role: "member" } }; },
+    async listFolders() { return { ok: true, folders: [{ name: "Sales", archivedAt: null, permission: "edit" }] }; },
+    async listMembers() { return { ok: true, members: [] }; },
+    async listInvitations() { invitationCalls++; throw new Error("members cannot list invitations"); },
+  };
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-workspace"),
+    {} as any,
+    s,
+    null,
+    { cloudConnection: { client } as unknown as CloudConnectionRuntime },
+  );
+  expect(response!.status).toBe(200);
+  expect(await response!.json()).toEqual({
+    ok: true, folders: [{ name: "Sales", archivedAt: null, permission: "edit" }], members: [], invitations: [],
+  });
+  expect(invitationCalls).toBe(0);
+  s.close();
+});
+
+test("Cloud workspace API returns pending invitations to admins", async () => {
+  const s = store();
+  const invitation = { id: "invite-admin", email: "next-admin@example.com", role: "admin", acceptedAt: null, revokedAt: null };
+  const client = {
+    async status() { return { workspace: { role: "admin" } }; },
+    async listFolders() { return { ok: true, folders: [] }; },
+    async listMembers() { return { ok: true, members: [] }; },
+    async listInvitations() { return { ok: true, invitations: [invitation] }; },
+  };
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-workspace"),
+    {} as any,
+    s,
+    null,
+    { cloudConnection: { client } as unknown as CloudConnectionRuntime },
+  );
+  expect(response!.status).toBe(200);
+  expect((await response!.json()).invitations).toEqual([invitation]);
+  s.close();
+});
+
+test("Cloud workspace API combines team state and forwards grants", async () => {
+  const s = store();
+  const calls: unknown[] = [];
+  const client = {
+    async status() { return { workspace: { role: "owner" } }; },
+    async listFolders() { return { ok: true, folders: [{ name: "Sales", archivedAt: null, permission: "edit" }] }; },
+    async listMembers() { return { ok: true, members: [] }; },
+    async listInvitations() { return { ok: true, invitations: [] }; },
+    async setFolderGrant(folderName: string, accountId: string, permission: string) {
+      calls.push({ folderName, accountId, permission });
+      return { ok: true, grant: { folderName, accountId, permission } };
+    },
+  };
+  const options = { cloudConnection: { client } as unknown as CloudConnectionRuntime };
+  const listed = await handleUiRequest(new Request("http://x/ui/api/cloud-workspace"), {} as any, s, null, options);
+  expect(await listed!.json()).toEqual({
+    ok: true, folders: [{ name: "Sales", archivedAt: null, permission: "edit" }], members: [], invitations: [],
+  });
+  const granted = await handleUiRequest(new Request("http://x/ui/api/cloud-workspace", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "grant", folderName: "Sales", accountId: "account1", permission: "view" }),
+  }), {} as any, s, null, options);
+  expect(granted!.status).toBe(200);
+  expect(calls).toEqual([{ folderName: "Sales", accountId: "account1", permission: "view" }]);
+  s.close();
+});
+test("Cloud workspace forwards hierarchy and direct profile grants without local writes", async () => {
+  const s = store();
+  const calls: unknown[] = [];
+  const forward = (method: string) => async (...args: unknown[]) => { calls.push([method, ...args]); return { ok: true }; };
+  const client = { createFolder: forward("create"), moveFolder: forward("move"), setProfileGrant: forward("grant"), removeProfileGrant: forward("remove") };
+  const before = s.listFolders();
+  try {
+    for (const body of [
+      { action: "create-folder", name: "Fitness", parentName: "Facebook" },
+      { action: "move-folder", name: "Facebook/Fitness", parentName: null },
+      { action: "profile-grant", profileId: "p1", accountId: "member", permission: "edit" },
+      { action: "remove-profile-grant", profileId: "p1", accountId: "member" },
+    ]) {
+      const response = await handleUiRequest(new Request("http://x/ui/api/cloud-workspace", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      }), {} as any, s, null, { cloudConnection: { client } as unknown as CloudConnectionRuntime });
+      expect(response!.status).toBe(200);
+    }
+    expect(calls).toEqual([["create", "Fitness", "Facebook"], ["move", "Facebook/Fitness", null], ["grant", "p1", "member", "edit"], ["remove", "p1", "member"]]);
+    expect(s.listFolders()).toEqual(before);
+  } finally { s.close(); }
+});
+
+test("Cloud workspace API forwards member password resets", async () => {
+  const s = store();
+  const resets: string[] = [];
+  const client = {
+    async sendMemberPasswordReset(accountId: string) { resets.push(accountId); return { ok: true }; },
+  };
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-workspace", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "reset-password", accountId: "account1" }),
+  }), {} as any, s, null, { cloudConnection: { client } as unknown as CloudConnectionRuntime });
+  expect(response!.status).toBe(200);
+  expect(resets).toEqual(["account1"]);
+  s.close();
+});
+
+test("Cloud forgot password stays neutral when Auth throttles repeat emails", async () => {
+  const s = store();
+  const requested: string[] = [];
+  let failure: Error | null = null;
+  const cloudAuth = {
+    async acquireTransition() { return { generation: 0, release() {} }; },
+    isTransitionCurrent() { return true; },
+    async requestPasswordReset(email: string) { requested.push(email); if (failure) throw failure; },
+  } as unknown as CloudAuthRuntime;
+  const request = () => handleUiRequest(new Request("http://x/ui/api/cloud-auth/forgot-password", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "member@example.com" }),
+  }), {} as any, s, null, { cloudAuth });
+
+  expect((await request())!.status).toBe(200);
+  failure = new SupabaseAuthRequestError("too many", { kind: "http", status: 429, retryable: true });
+  expect(await (await request())!.json()).toEqual({ ok: true });
+  failure = new SupabaseAuthRequestError("down", { kind: "http", status: 500, retryable: true });
+  expect((await request())!.status).not.toBe(200);
+  expect(requested).toEqual(["member@example.com", "member@example.com", "member@example.com"]);
+  s.close();
+});
+
+test("Cloud workspace API forwards folder deletion and preserves Cloud conflicts", async () => {
+  const s = store();
+  const deleted: string[] = [];
+  const client = {
+    async deleteFolder(name: string) {
+      deleted.push(name);
+      if (name === "Used folder") {
+        throw new CloudApiError("Only an empty folder can be deleted.", "workspace_conflict", 409);
+      }
+      return { ok: true };
+    },
+  };
+  const options = { cloudConnection: { client } as unknown as CloudConnectionRuntime };
+  const request = (name: string) => new Request("http://x/ui/api/cloud-workspace", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "delete-folder", name }),
+  });
+
+  const removed = await handleUiRequest(request("Empty folder"), {} as any, s, null, options);
+  expect(removed!.status).toBe(200);
+  expect(await removed!.json()).toEqual({ ok: true });
+  const rejected = await handleUiRequest(request("Used folder"), {} as any, s, null, options);
+  expect(rejected!.status).toBe(409);
+  expect((await rejected!.json()).error).toBe("Only an empty folder can be deleted.");
+  expect(deleted).toEqual(["Empty folder", "Used folder"]);
+  s.close();
+});
+
+for (const action of ["signin", "restore"] as const) {
+  for (const sameAccount of [true, false]) {
+    test(`Cloud ${action} retains unverified browsers without bypassing account isolation (sameAccount=${sameAccount})`, async () => {
+      const s = store();
+      const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-retained-auth-"));
+      const pendingSync = new PendingSyncRuntime(join(root, "pending.sqlite"));
+      const { queue, createdKey: queueKey } = pendingSync.initialize();
+      const profileId = "k1d0cd11";
+      const owner = sameAccount ? "account1" : "previous-account";
+      const session = async () => ({
+        accessToken: "test-access", refreshToken: "test-refresh", expiresIn: 60, expiresAt: 61_000,
+        user: { id: "account1", email: "user@example.com", email_confirmed_at: "verified" },
+      });
+      const cloudAuth = new CloudAuthRuntime({ signIn: session, refresh: session } as unknown as SupabaseAuthClient, () => 1_000);
+      const legal = { terms: "1", privacy: "1", acceptableUse: "1" };
+      const requests: string[] = [];
+      const cloudConnection = new CloudConnectionRuntime({
+        baseUrl: "https://cloud.ghosteranti.test", accessToken: () => cloudAuth.accessToken(),
+        installation: { installationId: "test-installation", label: "test", platform: "windows", appVersion: "test" },
+        fetchFn: async (url) => {
+          requests.push(new URL(url).pathname);
+          return Response.json({
+            ok: true, account: { id: "account1" }, device: { id: "device1" },
+            deviceCredential: "test-device", legal: { current: legal, accepted: legal },
+          });
+        },
+      });
+      const browserCalls: string[] = [];
+      let scans = 0;
+      const launcher = new Launcher({
+        store: s, binaryPath: join(root, "fake-browser"), dataRoot: root,
+        expectedBinarySha256: "0".repeat(64),
+        fetch: async () => ({ ok: false, json: async () => ({}) }),
+        isPidAlive: () => false,
+        findOwnedBrowserPids: async () => { scans++; return null; },
+        spawn: () => { browserCalls.push("spawn"); throw new Error("must not spawn"); },
+        killPid: async () => { browserCalls.push("kill"); },
+        browserClose: async () => { browserCalls.push("close"); return false; },
+        log: () => {},
+      });
+      s.recordLaunch({
+        profileId, pid: 123, debugPort: 9333, ws: "ws://127.0.0.1:9333/test", startedAt: 1_000,
+        binaryPath: join(root, "fake-browser"), userDataDir: join(root, profileId),
+        binarySha256: "0".repeat(64), personaDigest: "0".repeat(64), headless: false,
+      });
+      queue.recordOpen({ accountId: owner, profileId, registrationId: "retained-registration", expectedVersion: 4 });
+      queue.updateOpen(profileId, owner, "running", { debugPort: 9333, startedAt: 1_000 });
+      const cloudBrowser = new CloudBrowserCoordinator({
+        cloud: cloudConnection.client, launcher, store: s, queue: () => pendingSync.queue(),
+        accountId: () => cloudConnection.accountId(), deviceId: () => cloudConnection.deviceId(),
+        heartbeatMs: 0, storageCheckpoints: false, log: () => {},
+        readSession: async () => { browserCalls.push("capture"); throw new Error("must not capture"); },
+        applySession: async () => { browserCalls.push("restore"); throw new Error("must not restore"); },
+      });
+      const launch = s.getLaunch(profileId);
+      const profile = s.getProfile(profileId);
+      const retainedOpen = queue.getOpen(profileId, owner);
+      try {
+        await launcher.reconcileOrphans();
+        const response = await handleUiRequest(new Request(`http://x/ui/api/cloud-auth/${action}`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(action === "signin"
+            ? { email: "user@example.com", password: "test-password", queueKey }
+            : { refreshToken: "test-refresh", deviceCredential: "test-device", queueKey, resumeLifecycle: true }),
+        }), launcher, s, null, { cloudAuth, cloudConnection, pendingSync, cloudBrowser });
+        const body = await response!.json();
+        if (sameAccount) {
+          expect(body).toMatchObject({ ok: true, authenticated: true });
+          expect(response!.status).toBe(200);
+          expect(cloudAuth.state().authenticated).toBe(true);
+          expect(cloudConnection.accountId()).toBe("account1");
+          expect(pendingSync.queue()).toBe(queue);
+          expect((await cloudBrowser.open(profileId)).ok).toBe(false);
+        } else {
+          expect(response!.ok).toBe(false);
+          if (action === "signin") {
+            expect(cloudAuth.state().authenticated).toBe(false);
+            expect(cloudConnection.accountId()).toBeUndefined();
+            expect(pendingSync.queue()).toBeUndefined();
+          }
+        }
+        const retainedQueue = pendingSync.queue() ?? pendingSync.initialize(queueKey).queue;
+        expect(retainedQueue.getOpen(profileId, owner)).toEqual(retainedOpen);
+        expect(retainedQueue.list(owner)).toEqual([]);
+        expect(s.getLaunch(profileId)).toEqual(launch);
+        expect(s.getProfile(profileId)).toEqual(profile);
+        expect(browserCalls).toEqual([]);
+        expect(scans).toBeGreaterThan(0);
+        expect(requests).toEqual([action === "signin" ? "/v1/account/bootstrap" : "/v1/status"]);
+      } finally {
+        pendingSync.close();
+        s.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+test("Cloud auth API accepts verified sign-in without exposing extra user metadata", async () => {
+  const s = store();
+  const cloudAuth = new CloudAuthRuntime({
+    async signIn() {
+      return {
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: {
+          id: "account1",
+          email: "user@example.com",
+          email_confirmed_at: "verified",
+          privateMetadata: "must-not-leak",
+        },
+      };
+    },
+  } as unknown as SupabaseAuthClient, () => 1_000);
+  let secures = 0;
+  let resumes = 0;
+  const currentLegal = { terms: "1", privacy: "1", acceptableUse: "1" };
+  const cloudConnection = {
+    accountId() { return "account1"; },
+    async bootstrap() {
+      return {
+        device: { id: "device1" },
+        deviceCredential: "device-credential",
+        legal: { current: currentLegal, accepted: null },
+      };
+    },
+    client: {
+      async status() {
+        return { legal: { current: currentLegal, accepted: null } };
+      },
+      async acceptLegal() {
+        return { ok: true, accepted: { ...currentLegal, acceptedAt: 1 } };
+      },
+    },
+  } as unknown as CloudConnectionRuntime;
+  const cloudBrowser = {
+    async secureAfterAuthentication() { secures++; },
+    async resumeAfterAuthentication() { resumes++; },
+  } as any;
+  const pendingSync = new PendingSyncRuntime(
+    join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-pending-")), "pending.sqlite"),
+  );
+  const queueKey = Buffer.alloc(32, 7).toString("base64");
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-auth/signin", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "user@example.com", password: "password", queueKey }),
+    }),
+    {} as any,
+    s,
+    null,
+    { cloudAuth, cloudConnection, pendingSync, cloudBrowser },
+  );
+  expect(await response!.json()).toEqual({
+    ok: true,
+    authenticated: true,
+    refreshToken: "refresh-token",
+    deviceId: "device1",
+    deviceCredential: "device-credential",
+    expiresAt: 61_000,
+    legal: { current: { terms: "1", privacy: "1", acceptableUse: "1" }, accepted: null },
+    user: { id: "account1", email: "user@example.com" },
+  });
+  expect(cloudAuth.accessToken()).toBe("access-token");
+  expect(secures).toBe(1);
+  expect(resumes).toBe(0);
+
+  const authState = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-auth"),
+    {} as any,
+    s,
+    null,
+    { cloudAuth, cloudConnection },
+  );
+  expect(await authState!.json()).toMatchObject({
+    ok: true,
+    authenticated: true,
+    legal: { current: currentLegal, accepted: null },
+  });
+
+  const accepted = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-auth/accept-legal", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    }),
+    {} as any,
+    s,
+    null,
+    { cloudAuth, cloudConnection, pendingSync, cloudBrowser },
+  );
+  expect(await accepted!.json()).toEqual({
+    ok: true,
+    legal: { current: currentLegal, accepted: { ...currentLegal, acceptedAt: 1 } },
+  });
+  expect(resumes).toBe(1);
+  pendingSync.close();
+  s.close();
+});
+
+test("Cloud auth routes cannot replace an active account session", async () => {
+  const s = store();
+  let remoteSignIns = 0;
+  const cloudAuth = new CloudAuthRuntime({
+    async signIn() {
+      remoteSignIns++;
+      return {
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: "account1", email_confirmed_at: "verified" },
+      };
+    },
+  } as unknown as SupabaseAuthClient, () => 1_000);
+  await cloudAuth.signIn("first@example.com", "password");
+  const options = {
+    cloudAuth,
+    cloudConnection: {} as CloudConnectionRuntime,
+    pendingSync: {} as PendingSyncRuntime,
+  };
+
+  const signIn = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/signin", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "second@example.com", password: "password" }),
+  }), {} as any, s, null, options);
+  const restore = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/restore", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      refreshToken: "other-refresh-token",
+      deviceCredential: "other-device-credential",
+      queueKey: Buffer.alloc(32, 9).toString("base64"),
+    }),
+  }), {} as any, s, null, options);
+
+  expect(signIn!.status).toBe(409);
+  expect(restore!.status).toBe(409);
+  expect(remoteSignIns).toBe(1);
+  expect(cloudAuth.state()).toMatchObject({ authenticated: true, user: { id: "account1" } });
+  s.close();
+});
+
+test("Cloud sign-out cancels a stale bootstrap without delaying the next account", async () => {
+  const s = store();
+  const pendingSync = new PendingSyncRuntime(
+    join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-auth-transition-")), "pending.sqlite"),
+  );
+  const queueKey = Buffer.alloc(32, 7).toString("base64");
+  const legal = { terms: "1", privacy: "1", acceptableUse: "1" };
+  let account = 1;
+  const cloudAuth = new CloudAuthRuntime({
+    async signIn() {
+      const id = account++;
+      return {
+        accessToken: `access-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: `account${id}`, email_confirmed_at: "verified" },
+      };
+    },
+    async signOut() {},
+  } as unknown as SupabaseAuthClient, () => 1_000);
+  let markFirstBootstrapStarted!: () => void;
+  const firstBootstrapStarted = new Promise<void>((resolve) => { markFirstBootstrapStarted = resolve; });
+  let finishFirstBootstrap!: () => void;
+  const firstBootstrap = new Promise<void>((resolve) => { finishFirstBootstrap = resolve; });
+  let bootstrapCalls = 0;
+  let accountId: string | undefined;
+  const cloudConnection = {
+    async bootstrap(accept: () => boolean = () => true) {
+      const call = ++bootstrapCalls;
+      if (call === 1) {
+        markFirstBootstrapStarted();
+        await firstBootstrap;
+      }
+      if (!accept()) throw new Error("Cloud authentication was cancelled");
+      accountId = `account${call}`;
+      return {
+        account: { id: accountId },
+        device: { id: `device${call}` },
+        deviceCredential: `device-credential-${call}`,
+        legal: { current: legal, accepted: legal },
+        workspace: { id: `workspace${call}` },
+      };
+    },
+    accountId() { return accountId; },
+    clearDevice() { accountId = undefined; },
+  } as unknown as CloudConnectionRuntime;
+  const cloudBrowser = {
+    async resumeAfterAuthentication() {},
+    async releaseAll() { return true; },
+  } as any;
+  const request = (email: string) => new Request("http://x/ui/api/cloud-auth/signin", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, password: "password", queueKey }),
+  });
+  const options = { cloudAuth, cloudConnection, pendingSync, cloudBrowser };
+
+  const staleSignIn = handleUiRequest(request("first@example.com"), {} as any, s, null, options);
+  await firstBootstrapStarted;
+  const signingOut = handleUiRequest(new Request("http://x/ui/api/cloud-auth/signout", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }), {} as any, s, null, options);
+  const signOut = await Promise.race([
+    signingOut,
+    Bun.sleep(200).then(() => null),
+  ]);
+  expect(signOut).not.toBeNull();
+  expect(signOut!.status).toBe(200);
+
+  const nextSignIn = await handleUiRequest(request("second@example.com"), {} as any, s, null, options);
+  expect(nextSignIn!.status).toBe(200);
+  finishFirstBootstrap();
+  expect((await staleSignIn)!.status).toBe(409);
+  expect(cloudAuth.state()).toMatchObject({ authenticated: true, user: { id: "account2" } });
+  expect(cloudConnection.accountId()).toBe("account2");
+  expect(pendingSync.queue()).toBeDefined();
+  pendingSync.close();
+  s.close();
+});
+
+test("Cloud auth API creates a pending-sync key only for a new queue", async () => {
+  const s = store();
+  const cloudAuth = new CloudAuthRuntime({
+    async signIn() {
+      return {
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: "account1", email: "user@example.com", email_confirmed_at: "verified" },
+      };
+    },
+  } as unknown as SupabaseAuthClient, () => 1_000);
+  const cloudConnection = {
+    async bootstrap() {
+      return {
+        device: { id: "device1" },
+        deviceCredential: "device-credential",
+        legal: { current: { terms: "1", privacy: "1", acceptableUse: "1" }, accepted: null },
+      };
+    },
+    clearDevice() {},
+  } as unknown as CloudConnectionRuntime;
+  const pendingSync = new PendingSyncRuntime(
+    join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-pending-")), "pending.sqlite"),
+  );
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-auth/signin", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "user@example.com", password: "password" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { cloudAuth, cloudConnection, pendingSync },
+  );
+  const body = await response!.json();
+  expect(body.queueKey).toMatch(/^[A-Za-z0-9+/]{43}=$/);
+  expect(pendingSync.queue()).toBeDefined();
+  pendingSync.close();
+  s.close();
+});
+
+test("Cloud auth API reports a server-persisted queue key without returning it", async () => {
+  const s = store();
+  const cloudAuth = new CloudAuthRuntime({
+    async signIn() {
+      return {
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: "account1", email: "user@example.com", email_confirmed_at: "verified" },
+      };
+    },
+  } as unknown as SupabaseAuthClient, () => 1_000);
+  const cloudConnection = {
+    async bootstrap() {
+      return {
+        device: { id: "device1" },
+        deviceCredential: "device-credential",
+        legal: { current: { terms: "1", privacy: "1", acceptableUse: "1" }, accepted: null },
+      };
+    },
+    clearDevice() {},
+  } as unknown as CloudConnectionRuntime;
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-persisted-key-"));
+  const pendingSync = new PendingSyncRuntime(
+    join(root, "pending.sqlite"),
+    join(root, "pending.key"),
+  );
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-auth/signin", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "user@example.com", password: "password" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { cloudAuth, cloudConnection, pendingSync },
+  );
+  const body = await response!.json();
+  expect(body.queueKey).toBeUndefined();
+  expect(body.queueKeyPersisted).toBe(true);
+  expect(existsSync(join(root, "pending.key"))).toBe(true);
+  pendingSync.close();
+  s.close();
+});
+
+test("Cloud auth API does not replace an existing queue when its key is missing", async () => {
+  const s = store();
+  const path = join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-pending-")), "pending.sqlite");
+  const pendingSync = new PendingSyncRuntime(path);
+  pendingSync.initialize().queue.recordOpen({
+    accountId: "account1",
+    profileId: "profile1",
+    registrationId: "registration1",
+    expectedVersion: 1,
+  });
+  pendingSync.close();
+  const cloudAuth = new CloudAuthRuntime({
+    async signIn() {
+      return {
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: "account1", email: "user@example.com", email_confirmed_at: "verified" },
+      };
+    },
+  } as unknown as SupabaseAuthClient, () => 1_000);
+  let bootstrapCalls = 0;
+  let cleared = 0;
+  const cloudConnection = {
+    async bootstrap() { bootstrapCalls++; throw new Error("must not bootstrap"); },
+    clearDevice() { cleared++; },
+  } as unknown as CloudConnectionRuntime;
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-auth/signin", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "user@example.com", password: "password" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { cloudAuth, cloudConnection, pendingSync },
+  );
+  expect(response!.status).toBe(400);
+  expect((await response!.json()).error).toContain("requires its stored encryption key");
+  expect(bootstrapCalls).toBe(0);
+  expect(cleared).toBe(0);
+  expect(cloudAuth.accessToken()).toBeUndefined();
+  expect(existsSync(path)).toBe(true);
+  s.close();
+});
+
+test("Cloud auth API restores rotated credentials with the stored queue key", async () => {
+  const s = store();
+  const path = join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-pending-")), "pending.sqlite");
+  const created = new PendingSyncRuntime(path);
+  const queueKey = created.initialize().createdKey!;
+  created.close();
+  const pendingSync = new PendingSyncRuntime(path);
+  const cloudAuth = new CloudAuthRuntime({
+    async refresh() {
+      return {
+        accessToken: "restored-access-token",
+        refreshToken: "rotated-refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: "account1", email: "user@example.com", email_confirmed_at: "verified" },
+      };
+    },
+  } as unknown as SupabaseAuthClient, () => 1_000);
+  let restoredCredential = "";
+  let restoredDevice = "";
+  const cloudConnection = {
+    accountId() { return undefined; },
+    restoreCredential(value: string) { restoredCredential = value; },
+    client: {
+      async status() {
+        return {
+          account: { id: "account1" },
+          device: { id: "device1" },
+          legal: { current: { terms: "1", privacy: "1", acceptableUse: "1" }, accepted: null },
+        };
+      },
+    },
+    restoreAccount() {},
+    restoreDevice(deviceId: string) { restoredDevice = deviceId; },
+    clearDevice() {},
+  } as unknown as CloudConnectionRuntime;
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-auth/restore", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        refreshToken: "stored-refresh-token",
+        deviceCredential: "device-credential",
+        queueKey,
+      }),
+    }),
+    {} as any,
+    s,
+    null,
+    { cloudAuth, cloudConnection, pendingSync },
+  );
+  const body = await response!.json();
+  expect(body).toMatchObject({
+    ok: true,
+    authenticated: true,
+    refreshToken: "rotated-refresh-token",
+    deviceId: "device1",
+  });
+  expect(body.queueKey).toBeUndefined();
+  expect(restoredCredential).toBe("device-credential");
+  expect(restoredDevice).toBe("device1");
+  expect(pendingSync.queue()).toBeDefined();
+  pendingSync.close();
+  s.close();
+});
+
+test("Cloud restore retains rotated auth, device, and queue state after a retryable status failure", async () => {
+  const s = store();
+  const path = join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-retryable-restore-")), "pending.sqlite");
+  const pendingSync = new PendingSyncRuntime(path);
+  const queueKey = pendingSync.initialize().createdKey!;
+  const persisted: string[] = [];
+  const cloudAuth = new CloudAuthRuntime({
+    async refresh() {
+      return {
+        accessToken: "rotated-access-token",
+        refreshToken: "rotated-refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: "account1", email: "user@example.com", email_confirmed_at: "verified" },
+      };
+    },
+  } as unknown as SupabaseAuthClient, () => 1_000, (token) => { persisted.push(token); });
+  let cleared = 0;
+  let restoredCredential = "";
+  let statusCalls = 0;
+  const currentLegal = { terms: "1", privacy: "1", acceptableUse: "1" };
+  const cloudConnection = {
+    accountId() { return "account1"; },
+    restoreAccount() {},
+    restoreDevice() {},
+    restoreCredential(value: string) { restoredCredential = value; },
+    client: {
+      async status() {
+        statusCalls++;
+        if (statusCalls === 1) {
+          throw new CloudRequestError("offline", { kind: "transport", retryable: true });
+        }
+        return {
+          account: { id: "account1" },
+          device: { id: "device1" },
+          legal: { current: currentLegal, accepted: currentLegal },
+          workspace: { id: "workspace1" },
+        };
+      },
+    },
+    clearDevice() { cleared++; },
+  } as unknown as CloudConnectionRuntime;
+
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/restore", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      refreshToken: "stored-refresh-token",
+      deviceCredential: "stored-device-credential",
+      queueKey,
+    }),
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync });
+  const body = await response!.json();
+
+  expect(response!.status).toBe(503);
+  expect(body).toEqual({
+    ok: false,
+    error: "Saved Cloud session could not be restored. Try again when the connection is available.",
+    stage: "cloud_status",
+    retryable: true,
+    category: "network",
+    code: "network_unavailable",
+  });
+  expect(persisted).toEqual(["rotated-refresh-token"]);
+  expect(cloudAuth.state().authenticated).toBe(true);
+  expect(restoredCredential).toBe("stored-device-credential");
+  expect(cleared).toBe(0);
+  expect(pendingSync.queue()).toBeDefined();
+  expect(JSON.stringify(body)).not.toContain("stored-refresh-token");
+  expect(JSON.stringify(body)).not.toContain("stored-device-credential");
+  expect(body.queueKey).toBeUndefined();
+
+  const recovered = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/restore", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      refreshToken: "rotated-refresh-token",
+      deviceCredential: "stored-device-credential",
+      queueKey,
+    }),
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync });
+
+  expect(recovered!.status).toBe(200);
+  expect(await recovered!.json()).toMatchObject({
+    ok: true,
+    authenticated: true,
+    refreshToken: "rotated-refresh-token",
+    deviceId: "device1",
+  });
+  expect(statusCalls).toBe(2);
+  expect(persisted).toEqual(["rotated-refresh-token"]);
+  pendingSync.close();
+  s.close();
+});
+
+test("Cloud restore clears only invalid session state after an unstructured 401 status failure", async () => {
+  const s = store();
+  const path = join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-unauthorized-restore-")), "pending.sqlite");
+  const pendingSync = new PendingSyncRuntime(path);
+  const queueKey = pendingSync.initialize().createdKey!;
+  let durableSessionClears = 0;
+  let remoteSignOuts = 0;
+  const cloudAuth = new CloudAuthRuntime({
+    async refresh() {
+      return {
+        accessToken: "rotated-access-token",
+        refreshToken: "rotated-refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: "account1", email: "user@example.com", email_confirmed_at: "verified" },
+      };
+    },
+    async signOut() { remoteSignOuts++; },
+  } as unknown as SupabaseAuthClient, () => 1_000, undefined, () => { durableSessionClears++; });
+  let deviceClears = 0;
+  const cloudConnection = {
+    accountId() { return "account1"; },
+    restoreCredential() {},
+    client: {
+      async status() {
+        throw new CloudApiError("GhosterAnti Cloud /status returned non-JSON (401, text/html)", "internal_error", 401);
+      },
+    },
+    clearDevice() { deviceClears++; },
+  } as unknown as CloudConnectionRuntime;
+
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/restore", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      refreshToken: "stored-refresh-token",
+      deviceCredential: "stored-device-credential",
+      queueKey,
+    }),
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync });
+  const body = await response!.json();
+
+  expect(response!.status).toBe(401);
+  expect(body).toEqual({
+    ok: false,
+    error: "Saved Cloud session is no longer valid. Sign in again.",
+    stage: "cloud_status",
+    retryable: false,
+    category: "authentication",
+    code: "authentication_invalid",
+  });
+  expect(durableSessionClears).toBe(1);
+  expect(remoteSignOuts).toBe(0);
+  expect(deviceClears).toBe(1);
+  expect(cloudAuth.state()).toEqual({ authenticated: false });
+  expect(pendingSync.queue()).toBeUndefined();
+  expect(pendingSync.initialize(queueKey).createdKey).toBeUndefined();
+  expect(JSON.stringify(body)).not.toContain("stored-refresh-token");
+  expect(JSON.stringify(body)).not.toContain("stored-device-credential");
+  pendingSync.close();
+  s.close();
+});
+
+test("Cloud restore clears only invalid session state after a permanent refresh failure", async () => {
+  const s = store();
+  const path = join(mkdtempSync(join(tmpdir(), "ghosteranti-ui-permanent-restore-")), "pending.sqlite");
+  const pendingSync = new PendingSyncRuntime(path);
+  const queueKey = pendingSync.initialize().createdKey!;
+  let durableSessionClears = 0;
+  const cloudAuth = new CloudAuthRuntime({
+    async refresh() {
+      throw new SupabaseAuthRequestError(
+        "invalid refresh token",
+        { kind: "http", status: 401, retryable: false },
+      );
+    },
+  } as unknown as SupabaseAuthClient, () => 1_000, undefined, () => { durableSessionClears++; });
+  let deviceClears = 0;
+  const cloudConnection = {
+    accountId() { return undefined; },
+    clearDevice() { deviceClears++; },
+  } as unknown as CloudConnectionRuntime;
+
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/restore", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      refreshToken: "invalid-stored-refresh",
+      deviceCredential: "stored-device-credential",
+      queueKey,
+    }),
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync });
+  const body = await response!.json();
+
+  expect(body).toEqual({
+    ok: false,
+    error: "Saved Cloud session is no longer valid. Sign in again.",
+    stage: "auth_refresh",
+    retryable: false,
+    category: "authentication",
+    code: "authentication_invalid",
+  });
+  expect(response!.status).toBe(401);
+  expect(durableSessionClears).toBe(1);
+  expect(deviceClears).toBe(1);
+  expect(cloudAuth.state()).toEqual({ authenticated: false });
+  expect(pendingSync.queue()).toBeUndefined();
+  expect(pendingSync.initialize(queueKey).createdKey).toBeUndefined();
+  expect(JSON.stringify(body)).not.toContain("invalid-stored-refresh");
+  expect(JSON.stringify(body)).not.toContain("stored-device-credential");
+  pendingSync.close();
+  s.close();
+});
+
+test("Cloud restore treats unverified email as permanent and clears credentials locally", async () => {
+  const s = store();
+  let localClears = 0;
+  let remoteSignOuts = 0;
+  const cloudAuth = {
+    async acquireTransition() { return { generation: 0, release() {} }; },
+    isTransitionCurrent() { return true; },
+    canRestore() { return true; },
+    async restore() { throw new EmailVerificationRequiredError(); },
+    async clearStoredSession() { localClears++; },
+    async signOut() { remoteSignOuts++; },
+  } as unknown as CloudAuthRuntime;
+  let deviceClears = 0;
+  const cloudConnection = {
+    accountId() { return undefined; },
+    clearDevice() { deviceClears++; },
+  } as unknown as CloudConnectionRuntime;
+  let queueCloses = 0;
+  const pendingSync = {
+    queue() { return {}; },
+    close() { queueCloses++; },
+  } as unknown as PendingSyncRuntime;
+
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/restore", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      refreshToken: "unverified-refresh",
+      deviceCredential: "stored-device-credential",
+      queueKey: "stored-queue-key",
+    }),
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync });
+  const body = await response!.json();
+
+  expect(response!.status).toBe(401);
+  expect(body).toEqual({
+    ok: false,
+    error: "Saved Cloud session is no longer valid. Sign in again.",
+    stage: "auth_refresh",
+    retryable: false,
+    category: "authentication",
+    code: "email_not_verified",
+  });
+  expect([localClears, remoteSignOuts, deviceClears, queueCloses]).toEqual([1, 0, 1, 1]);
+  expect(JSON.stringify(body)).not.toContain("unverified-refresh");
+  expect(JSON.stringify(body)).not.toContain("stored-device-credential");
+  expect(JSON.stringify(body)).not.toContain("stored-queue-key");
+  s.close();
+});
+
+test("Cloud restore treats device and membership revocation as permanent", async () => {
+  for (const code of ["device_revoked", "membership_revoked"] as const) {
+    const s = store();
+    let credentialClears = 0;
+    let deviceClears = 0;
+    let queueCloses = 0;
+    const cloudAuth = new CloudAuthRuntime({
+      async refresh() {
+        return {
+          accessToken: "access-token",
+          refreshToken: "rotated-refresh-token",
+          expiresIn: 60,
+          expiresAt: 61_000,
+          user: { id: "account1", email_confirmed_at: "verified" },
+        };
+      },
+      async signOut() {},
+    } as unknown as SupabaseAuthClient, () => 1_000, undefined, () => { credentialClears++; });
+    const cloudConnection = {
+      accountId() { return "account1"; },
+      restoreCredential() {},
+      client: { async status() { throw new CloudApiError("revoked", code, 403); } },
+      clearDevice() { deviceClears++; },
+    } as unknown as CloudConnectionRuntime;
+    const pendingSync = {
+      queue() { return {}; },
+      close() { queueCloses++; },
+    } as unknown as PendingSyncRuntime;
+
+    const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/restore", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refreshToken: "refresh", deviceCredential: "device", queueKey: "queue" }),
+    }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync });
+
+    expect(response!.status).toBe(401);
+    expect(await response!.json()).toMatchObject({
+      stage: "cloud_status",
+      retryable: false,
+      category: "authentication",
+      code,
+    });
+    expect([credentialClears, deviceClears, queueCloses]).toEqual([1, 1, 1]);
+    s.close();
+  }
+});
+
+test("Cloud diagnostics route returns only sanitized current-process events", async () => {
+  const s = store();
+  const cloudBrowser = {
+    diagnostics() {
+      return [{
+        timestamp: 123,
+        type: "session_restore_context_timeout",
+        profileId: "profile-secret",
+        error: "raw browser secret",
+      }];
+    },
+  } as any;
+
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-events"),
+    {} as any,
+    s,
+    null,
+    { cloudBrowser },
+  );
+
+  expect(response!.headers.get("cache-control")).toBe("no-store");
+  expect(await response!.json()).toEqual({
+    events: [{ timestamp: 123, type: "session_restore_context_timeout" }],
+  });
+
+  const empty = await handleUiRequest(
+    new Request("http://x/ui/api/cloud-events"),
+    {} as any,
+    s,
+  );
+  expect(await empty!.json()).toEqual({ events: [] });
+  s.close();
+});
+
+test("Cloud forget releases browsers and clears only stored session state", async () => {
+  const s = store();
+  const calls: string[] = [];
+  const cloudAuth = {
+    beginExit() { return () => {}; },
+    async clearStoredSession() { calls.push("clearStoredSession"); },
+    async signOut() { throw new Error("remote sign-out must not run"); },
+  } as unknown as CloudAuthRuntime;
+  const cloudConnection = {
+    clearDevice() { calls.push("clearDevice"); },
+  } as unknown as CloudConnectionRuntime;
+  const pendingSync = { close() { calls.push("closeQueue"); } } as unknown as PendingSyncRuntime;
+  const cloudBrowser = { async releaseAll() { calls.push("releaseAll"); return true; } } as any;
+
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/forget", {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync, cloudBrowser });
+
+  expect(response!.status).toBe(200);
+  expect(calls).toEqual(["releaseAll", "closeQueue", "clearDevice", "clearStoredSession"]);
+  s.close();
+});
+
+test("Cloud sign-out keeps auth and account state when browsers cannot release", async () => {
+  const s = store();
+  const calls: string[] = [];
+  const cloudAuth = {
+    beginExit() { return () => {}; },
+    state() { return { authenticated: true }; },
+    async signOut() { calls.push("signOut"); },
+  } as unknown as CloudAuthRuntime;
+  const cloudConnection = {
+    accountId() { return "account1"; },
+    clearDevice() { calls.push("clearDevice"); },
+  } as unknown as CloudConnectionRuntime;
+  const pendingSync = { close() { calls.push("closeQueue"); } } as unknown as PendingSyncRuntime;
+  const cloudBrowser = { async releaseAll() { calls.push("releaseAll"); return false; } } as any;
+  const mcpTunnel = {
+    async disconnect() { calls.push("disconnectTunnel"); },
+    refresh() { calls.push("refreshTunnel"); },
+  };
+
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/signout", {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync, cloudBrowser, mcpTunnel });
+
+  expect(response!.status).toBe(409);
+  expect(calls).toEqual(["disconnectTunnel", "releaseAll", "refreshTunnel"]);
+  expect(cloudConnection.accountId()).toBe("account1");
+  s.close();
+});
+
+test("Cloud sign-out releases browsers before queue, device, and credentials", async () => {
+  const s = store();
+  const calls: string[] = [];
+  const cloudAuth = {
+    beginExit() { return () => {}; },
+    async signOut() { calls.push("signOut"); },
+  } as unknown as CloudAuthRuntime;
+  const cloudConnection = {
+    clearDevice() { calls.push("clearDevice"); },
+  } as unknown as CloudConnectionRuntime;
+  const pendingSync = { close() { calls.push("closeQueue"); } } as unknown as PendingSyncRuntime;
+  const cloudBrowser = { async releaseAll() { calls.push("releaseAll"); return true; } } as any;
+  const mcpTunnel = {
+    async disconnect() { calls.push("disconnectTunnel"); },
+    refresh() { calls.push("refreshTunnel"); },
+  };
+
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/signout", {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync, cloudBrowser, mcpTunnel });
+
+  expect(response!.status).toBe(200);
+  expect(calls).toEqual(["disconnectTunnel", "releaseAll", "closeQueue", "clearDevice", "signOut"]);
+  s.close();
+});
+
+test("Cloud sign-out returns success after a remote logout failure", async () => {
+  const s = store();
+  const calls: string[] = [];
+  const cloudAuth = new CloudAuthRuntime({
+    async signIn() {
+      return {
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        expiresIn: 60,
+        expiresAt: 61_000,
+        user: { id: "account1", email_confirmed_at: "verified" },
+      };
+    },
+    async signOut() { throw new Error("offline"); },
+  } as unknown as SupabaseAuthClient, () => 1_000, undefined, () => {
+    calls.push("clearCredentials");
+  });
+  await cloudAuth.signIn("user@example.com", "password");
+  const cloudConnection = {
+    clearDevice() { calls.push("clearDevice"); },
+  } as unknown as CloudConnectionRuntime;
+  const pendingSync = { close() { calls.push("closeQueue"); } } as unknown as PendingSyncRuntime;
+  const cloudBrowser = { async releaseAll() { calls.push("releaseAll"); return true; } } as any;
+  const mcpTunnel = {
+    async disconnect() { calls.push("disconnectTunnel"); },
+    refresh() { calls.push("refreshTunnel"); },
+  };
+
+  const response = await handleUiRequest(new Request("http://x/ui/api/cloud-auth/signout", {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  }), {} as any, s, null, { cloudAuth, cloudConnection, pendingSync, cloudBrowser, mcpTunnel });
+
+  expect(response!.status).toBe(200);
+  expect(cloudAuth.state()).toEqual({ authenticated: false });
+  expect(calls).toEqual([
+    "disconnectTunnel",
+    "releaseAll",
+    "closeQueue",
+    "clearDevice",
+    "clearCredentials",
+  ]);
+  s.close();
+});
+
+test("Cloud profile routes use the Cloud browser coordinator without local fallback", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-browser-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const calls: string[] = [];
+  let createdProfile: Profile | undefined;
+  const cloudBrowser = {
+    async listRoster() {
+      calls.push("list");
+      return { profiles: [{ id: "cloud1", name: "Cloud profile" }], healthSources: [] };
+    },
+    async create(profile: Profile) {
+      createdProfile = profile;
+      calls.push(`create:${profile.name}`);
+      return { id: profile.id };
+    },
+    async open(profileId: string) {
+      calls.push(`open:${profileId}`);
+      return { ok: true, port: 9222 };
+    },
+    async close() { return { closed: true, sync: "complete" }; },
+    async resumeAfterAuthentication() {},
+    async retryPending() {},
+    async releaseAll() { return true; },
+  } as any;
+
+  const roster = await handleUiRequest(
+    new Request("http://x/ui/api/profiles"),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+  expect(await roster!.json()).toEqual({
+    profiles: [{ id: "cloud1", name: "Cloud profile" }],
+    healthSources: [],
+  });
+  const opened = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/cloud1/open", { method: "POST" }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+  expect(await opened!.json()).toEqual({ ok: true, port: 9222 });
+  expect(calls).toEqual(["list", "open:cloud1"]);
+
+  const created = await handleUiRequest(
+    new Request("http://x/ui/api/profiles", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "New Cloud profile", engine: "firefox" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+  expect(created!.status).toBe(200);
+  const createdBody = await created!.json();
+  expect(createdBody).toMatchObject({ ok: true, id: expect.any(String) });
+  expect(calls).toEqual(["list", "open:cloud1", "create:New Cloud profile"]);
+  expect(createdProfile).toMatchObject({ engine: "firefox", firefox: expect.any(Object) });
+  expect(s.getProfile(createdBody.id)).toBeNull();
+  s.close();
+});
+
+test("Cloud Firefox open responses do not expose the internal port", async () => {
+  const s = store();
+  s.upsertProfile(firefoxProfile(s, "cloud-firefox"));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/cloud-firefox/open", { method: "POST" }),
+    {} as any,
+    s,
+    null,
+    { cloudBrowser: { open: async () => ({ ok: true, port: 9222 }) } as any },
+  );
+  expect(await response!.json()).toEqual({
+    ok: true,
+    engine: "firefox",
+    capabilities: { cdp: false, pdf: false, chromeExtensions: false },
+  });
+  s.close();
+});
+
+test("Cloud close route separates teardown from Cloud sync outcomes", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-close-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  let result: any = { closed: true, sync: "pending" };
+  const cloudBrowser = { async close() { return result; } } as any;
+  const request = () => handleUiRequest(
+    new Request("http://x/ui/api/profiles/cloud1/close", { method: "POST" }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+
+  let response = await request();
+  expect(response!.status).toBe(200);
+  expect(await response!.json()).toEqual({
+    ok: true,
+    sync: "pending",
+    warning: "Browser closed. Saving this profile to Cloud will retry automatically.",
+  });
+
+  result = { closed: true, sync: "conflict" };
+  response = await request();
+  expect(response!.status).toBe(200);
+  expect(await response!.json()).toEqual({
+    ok: true,
+    sync: "conflict",
+    warning: "Browser closed, but Cloud could not accept the saved session. The encrypted snapshot remains on this device.",
+  });
+
+  result = { closed: false, reason: "teardown_unconfirmed" };
+  response = await request();
+  expect(response!.status).toBe(500);
+  expect(await response!.json()).toEqual({ ok: false, error: "browser teardown unconfirmed" });
+  s.close();
+});
+
+test("app mode API reports when Cloud is unavailable in the build", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-config-"));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "cloud" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig: new AppConfigStore(join(root, "config.json")) },
+  );
+  expect(response!.status).toBe(503);
+  expect((await response!.json()).error).toContain("not configured");
+  s.close();
+});
+
+test("app mode API rejects cross-origin JSON requests", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-config-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://attacker.example" },
+      body: JSON.stringify({ mode: "local" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig },
+  );
+  expect(response!.status).toBe(403);
+  expect(appConfig.read().mode).toBe("unconfigured");
+  s.close();
+});
+
+test("app mode API rejects cross-site simple requests", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-config-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/app-mode", {
+      method: "POST",
+      headers: { "content-type": "text/plain", origin: "https://attacker.example" },
+      body: JSON.stringify({ mode: "local" }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig },
+  );
+  expect(response!.status).toBe(415);
+  expect(appConfig.read().mode).toBe("unconfigured");
+  s.close();
+});
+
+test("Cloud bulk delete keeps closed profiles, rejects opens, and continues after errors", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-delete-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const deleted: string[] = [];
+  const cloudConnection = {
+    accountId: () => "account",
+    client: {
+      async listProfiles() {
+        return { profiles: ["closed", "open", "raced", "broken"].map((id) => ({
+          id, version: 1, activeOpens: id === "open" ? [{}] : [], permission: "edit", trashedAt: null,
+        })) };
+      },
+      async trashProfile(id: string) {
+        if (id === "raced") throw new CloudApiError("profile is open", "profile_open", 409);
+        if (id === "broken") throw new Error("service unavailable");
+        deleted.push(id);
+      },
+    },
+  } as any;
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/delete", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids: ["closed", "open", "raced", "broken"] }),
+    }),
+    { profileDeletionBlocked: () => false } as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+  expect(response!.status).toBe(200);
+  expect(await response!.json()).toEqual({ ok: true, deleted: 1, locked: ["open", "raced"], failed: ["broken"] });
+  expect(deleted).toEqual(["closed"]);
+  s.close();
+});
+
+
+test("Cloud profile editor routes return no session data and forward expectedVersion", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-editor-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const localName = s.getProfile("k1d0cd11")!.name;
+  const payload = encodePortableProfile({
+    ...s.getProfile("k1d0cd11")!,
+    name: "Authoritative Cloud name",
+  });
+  const movedPayload = structuredClone(payload);
+  movedPayload.profile.group = "va2";
+  let updateRequest: any;
+  let moveRequest: any;
+  let moved = false;
+  const cloudConnection = {
+    client: {
+      async getProfile() {
+        return {
+          ok: true,
+          profile: {
+            id: "k1d0cd11",
+            name: "Authoritative Cloud name",
+            group: moved ? "va2" : "va1",
+            platform: "",
+            tags: [],
+            version: moved ? 12 : 11,
+            trashedAt: null,
+            trashedBy: null,
+            updatedAt: 1,
+            activeOpens: [],
+          },
+          payload: moved ? movedPayload : payload,
+          payloadDigest: "digest",
+        };
+      },
+      async moveProfile(_id: string, request: unknown) {
+        moveRequest = request;
+        moved = true;
+        return { ok: true, profile: { version: 12 } };
+      },
+      async updateProfile(_id: string, request: unknown) {
+        updateRequest = request;
+        return { ok: true, profile: {}, payloadDigest: "next" };
+      },
+    },
+  } as any;
+  const cloudBrowser = {} as any;
+
+  const getResponse = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11"),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser, cloudConnection },
+  );
+  expect(getResponse!.status).toBe(200);
+  const getBody = await getResponse!.json();
+  expect(getBody.profile).toMatchObject({ name: "Authoritative Cloud name", expectedVersion: 11, cookieCount: 1 });
+  expect(JSON.stringify(getBody)).not.toContain("COOKIEVAL");
+  expect(JSON.stringify(getBody)).not.toContain('"session"');
+
+  const saveResponse = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedVersion: 11, set: { name: "Saved Cloud name", group: "va2" } }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser, cloudConnection },
+  );
+  expect(saveResponse!.status).toBe(200);
+  expect(moveRequest).toEqual({ destination: "va2", expectedVersion: 11 });
+  expect(updateRequest.expectedVersion).toBe(12);
+  expect(updateRequest.payload.profile.name).toBe("Saved Cloud name");
+  expect(updateRequest.payload.profile.group).toBe("va2");
+  expect(updateRequest.payload.session).toEqual(payload.session);
+  expect(s.getProfile("k1d0cd11")!.name).toBe(localName);
+  s.close();
+});
+
+test("Cloud profile open on this device is edited live through the local cache", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-live-edit-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  // The running session's checkpoint/close sync owns the Cloud version, so the
+  // editor must never be consulted — the local cached copy is the truth.
+  const cloudConnection = {
+    client: new Proxy({}, {
+      get() { throw new Error("Cloud must not be called for a live edit"); },
+    }),
+  } as any;
+  const noted: string[] = [];
+  const cloudBrowser = {
+    canEditLive(id: string) {
+      return id === "k1d0cd11";
+    },
+    async commitLiveEdit(profile: Profile) {
+      s.upsertProfile(profile);
+      noted.push(profile.id);
+      return true;
+    },
+  } as any;
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 1, debugPort: 9412, ws: "ws://x", startedAt: 123 });
+
+  const getResponse = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11"),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser, cloudConnection },
+  );
+  expect(getResponse!.status).toBe(200);
+  const getBody = await getResponse!.json();
+  expect(getBody.profile.liveEdit).toBe(true);
+  expect(getBody.profile.expectedVersion).toBeUndefined();
+
+  // A transient Cloud connectivity outage must not block editing a profile
+  // that is open on this very device — the live path never uses the connection.
+  const offline = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11"),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+  expect(offline!.status).toBe(200);
+
+  const saveResponse = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // customNo is ignored: the portable-profile contract cannot carry it, so
+      // honoring it would only last until the next open erased it.
+      body: JSON.stringify({ set: { name: "Live edited name", customNo: "999" } }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser, cloudConnection },
+  );
+  expect(saveResponse!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")!.name).toBe("Live edited name");
+  expect(s.getProfile("k1d0cd11")!.customNo ?? "").not.toBe("999");
+  // The edit was made durable immediately, not left to ride on the next
+  // session-content change.
+  expect(noted).toEqual(["k1d0cd11"]);
+
+  // Once the browser has closed, a stale live-edit dialog cannot silently fall
+  // through to the versioned editor without an expectedVersion.
+  s.clearLaunch("k1d0cd11");
+  const staleResponse = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ set: { name: "Too late" } }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+  expect(staleResponse!.status).toBe(409);
+  expect((await staleResponse!.json()).error).toContain("reopen Edit");
+  s.close();
+});
+
+test("Cloud live proxy edits leave a legacy locale absent until confirmed close", async () => {
+  const s = store();
+  try {
+    s.recordLaunch({ profileId: "k1d0cd11", pid: 1, debugPort: 9412, ws: "ws://x", startedAt: 123 });
+    (s as any).db.query("UPDATE profiles SET locale = '' WHERE id = ?").run("k1d0cd11");
+    const response = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ set: { proxy: "new-proxy.example:8080" } }),
+    }), {} as any, s, null, {
+      cloudBrowser: {
+        canEditLive: () => true,
+        commitLiveEdit: async (profile: Profile) => { s.upsertProfile(profile); return true; },
+      } as any,
+      timezoneFetch: async () => ({ json: async () => ({ status: "success", timezone: "Europe/Paris", countryCode: "FR" }) }),
+    });
+    expect(response!.status).toBe(200);
+    expect(s.getProfile("k1d0cd11")!.locale).toBeUndefined();
+    s.clearLaunch("k1d0cd11");
+    expect(s.getProfile("k1d0cd11")!.locale).toBe("fr-FR");
+  } finally { s.close(); }
+});
+
+test("Cloud live edit rejects a save that loses the close race", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-live-edit-close-race-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const originalName = s.getProfile("k1d0cd11")!.name;
+  s.recordLaunch({ profileId: "k1d0cd11", pid: 1, debugPort: 9412, ws: "ws://x", startedAt: 123 });
+  let live = true;
+  const cloudBrowser = {
+    canEditLive() {
+      return live;
+    },
+    async commitLiveEdit() {
+      return false;
+    },
+  } as any;
+  const saveRequest = () => new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ set: { name: "Too late" } }),
+  });
+
+  const duringCommit = await handleUiRequest(
+    saveRequest(),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+  expect(duringCommit!.status).toBe(409);
+  expect((await duringCommit!.json()).error).toContain("reopen Edit");
+  expect(s.getProfile("k1d0cd11")!.name).toBe(originalName);
+
+  live = false;
+  const afterCloseStarted = await handleUiRequest(
+    saveRequest(),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+  expect(afterCloseStarted!.status).toBe(409);
+  expect((await afterCloseStarted!.json()).error).toContain("reopen Edit");
+  expect(s.getProfile("k1d0cd11")!.name).toBe(originalName);
+  s.close();
+});
+
+test("Cloud profile save rejects untrusted JSON before calling Cloud", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-cloud-editor-trust-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const cloudConnection = {
+    client: new Proxy({}, {
+      get() { throw new Error("Cloud must not be called"); },
+    }),
+  } as any;
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://attacker.example" },
+      body: JSON.stringify({ expectedVersion: 11, set: { name: "attacker" } }),
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser: {} as any, cloudConnection },
+  );
+  expect(response!.status).toBe(403);
+  s.close();
+});
+
+test("the roster carries each profile's serial and custom NO.", () => {
+  const s = store();
+  const [before] = listUiProfiles(s);
+  expect(before!.serial).toBe(s.getSerial("k1d0cd11")!);
+  expect(before!.customNo).toBe(""); // unset -> the UI falls back to the serial
+
+  s.upsertProfile({ ...s.getProfile("k1d0cd11")!, customNo: "907341" });
+  expect(listUiProfiles(s)[0]!.customNo).toBe("907341");
+  s.close();
+});
+
+test("editing a custom NO. validates digits and survives a reopen of the editor", async () => {
+  const s = store();
+  const save = (customNo: string) => handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/update", {
+      method: "POST",
+      body: JSON.stringify({ set: { customNo } }),
+    }),
+    {} as any,
+    s,
+  );
+
+  expect((await save("4421"))!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")!.customNo).toBe("4421");
+
+  const view = await handleUiRequest(new Request("http://x/ui/api/profiles/k1d0cd11"), {} as any, s);
+  expect((await view!.json()).profile.customNo).toBe("4421");
+
+  const rejected = await save("44-21");
+  expect(rejected!.status).toBe(500);
+  expect((await rejected!.json()).error).toContain("digits only");
+  expect(s.getProfile("k1d0cd11")!.customNo).toBe("4421"); // rejected edit changed nothing
+
+  expect((await save(""))!.status).toBe(200);
+  expect(s.getProfile("k1d0cd11")!.customNo).toBe("");
+  s.close();
+});
+
+test("creating a profile stores the credentials supplied with it", async () => {
+  const s = store();
+  const response = await handleUiRequest(
+    new Request("http://x/ui/api/profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "fresh", group: "Warmup", platform: "x.com", customNo: "5150",
+        username: "fresh_user", password: "fresh-pass",
+        email: "fresh@example.com", emailPassword: "mailbox-pass",
+        twofa: "JBSWY3DPEHPK3PXP",
+      }),
+    }),
+    {} as any,
+    s,
+  );
+  const { ok, id } = await response!.json();
+  expect(ok).toBe(true);
+
+  // The create endpoint has always accepted these; this pins that the dialog is
+  // not the only thing that can set them and that none are silently dropped.
+  expect(s.getProfile(id)).toMatchObject({
+    name: "fresh", group: "Warmup", platform: "x.com", customNo: "5150",
+    username: "fresh_user", password: "fresh-pass",
+    email: "fresh@example.com", emailPassword: "mailbox-pass",
+    twofa: "JBSWY3DPEHPK3PXP",
+  });
+  s.close();
+});
+
+test("the dashboard profile payload carries the fingerprint verdict", () => {
+  const s = store();
+  s.saveObservedFingerprint(
+    "k1d0cd11",
+    { canvas: "deadbeef", capturedAt: "2026-08-29T11:04:22Z" },
+    { verdict: "mismatch", differences: [{ field: "canvas", expected: "a3f19c8e", observed: "deadbeef" }] },
+  );
+  const row = listUiProfiles(s).find((p) => p.id === "k1d0cd11")!;
+  expect(row.fpVerdict!.verdict).toBe("mismatch");
+  expect(row.fpVerdict!.differences[0]!.field).toBe("canvas");
+  expect(row.fpCapturedAt).toBe("2026-08-29T11:04:22Z");
+  s.close();
+});
+
+test("a profile that has never been probed carries no verdict", () => {
+  const s = store();
+  const row = listUiProfiles(s).find((p) => p.id === "k1d0cd11")!;
+  expect(row.fpVerdict).toBeNull();
+  expect(row.fpCapturedAt).toBe("");
+  s.close();
+});
+
+test("Cloud restore-session route reports the restored version and refusals", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "ghosteranti-ui-restore-"));
+  const appConfig = new AppConfigStore(join(root, "config.json"));
+  appConfig.setMode("cloud", "https://cloud.ghosteranti.test");
+  const asked: string[] = [];
+  const cloudBrowser = {
+    restoreParkedSession: async (profileId: string) => {
+      asked.push(profileId);
+      return asked.length === 1
+        ? { ok: true as const, version: 12 }
+        : { ok: false as const, error: "Close this profile's browser before restoring a saved session." };
+    },
+  } as any;
+  const call = () => handleUiRequest(
+    new Request("http://x/ui/api/profiles/k1d0cd11/restore-session", {
+      method: "POST",
+      headers: { origin: "http://x" },
+    }),
+    {} as any,
+    s,
+    null,
+    { appConfig, cloudBrowser },
+  );
+
+  const restored = await call();
+  expect(restored!.status).toBe(200);
+  expect(await restored!.json()).toEqual({ ok: true, version: 12 });
+
+  const refused = await call();
+  expect(refused!.status).toBe(409);
+  expect(await refused!.json()).toMatchObject({ ok: false });
+  expect(asked).toEqual(["k1d0cd11", "k1d0cd11"]);
+  s.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("shell-language round-trips through the server and rejects invalid tags", async () => {
+  const s = store();
+  const root = mkdtempSync(join(tmpdir(), "shell-lang-"));
+  const paths = { root } as any;
+  const call = (req: Request) => handleUiRequest(req, {} as any, s, null, { paths });
+
+  // Nothing stored yet: null, so the UI follows the system language.
+  let res = await call(new Request("http://x/ui/api/shell-language"));
+  expect(res!.status).toBe(200);
+  expect(await res!.json()).toEqual({ language: null });
+
+  // Store Chinese, read it back.
+  res = await call(new Request("http://x/ui/api/shell-language", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ language: "zh-CN" }),
+  }));
+  expect(await res!.json()).toMatchObject({ ok: true, language: "zh-CN" });
+  res = await call(new Request("http://x/ui/api/shell-language"));
+  expect(await res!.json()).toEqual({ language: "zh-CN" });
+  expect(existsSync(join(root, "shell.json"))).toBe(true);
+
+  // Invalid tags fall back to English instead of being stored.
+  res = await call(new Request("http://x/ui/api/shell-language", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ language: "../../etc/passwd" }),
+  }));
+  expect(await res!.json()).toMatchObject({ ok: true, language: "en-US" });
+  res = await call(new Request("http://x/ui/api/shell-language"));
+  expect(await res!.json()).toEqual({ language: "en-US" });
+
+  s.close();
+  rmSync(root, { recursive: true, force: true });
+});

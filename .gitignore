@@ -1,0 +1,38 @@
+node_modules/
+*.log
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/generated/
+src-tauri/binaries/
+src-tauri/resources/cloakbrowser/
+src-tauri/resources/playwright/
+*.msi
+*.exe
+*.dmg
+
+# Local Claude Code state
+.claude/
+
+# Local config and secrets
+.env
+.env.*
+config.json
+pending-sync.sqlite*
+profiles.sqlite*
+pending-sync.sqlite*
+pending-sync.key
+pending-sync.key.*.tmp
+profiles/
+inbox/*.txt
+reports/
+*.export.txt
+*adspower-export*.txt
+extensions/
+
+# Per-install device identity
+.operator-id
+
+# Local editor/agent tooling state
+.serena/

@@ -1,0 +1,26 @@
+GhosterAnti
+Copyright 2026 GhosterAnti contributors
+
+Portions of this software include code from AliasMode
+(https://github.com/aliasmode/aliasmode), Copyright 2026 Xreacher,
+licensed under the Apache License, Version 2.0. The original copyright,
+license, and attribution notices remain in effect.
+
+This product includes software developed by third parties. Their copyright and license terms remain applicable.
+
+CloakBrowser is a third-party browser engine and binary. It is not licensed under this project's Apache-2.0 license and keeps its own applicable license terms. GhosterAnti downloads, verifies, and installs it at no extra cost; users do not need a separate CloakBrowser purchase, subscription, or account.
+
+The browser engines labelled GhosterAnti Firefox and GhosterAnti Chromium in the
+dashboard are published at https://github.com/aliasmode/aliasmode-firefox
+(MPL-2.0) and https://github.com/aliasmode/aliasmode-chromium. They are
+downloaded from those repositories and verified by SHA-256; they are not part of
+this repository.
+
+The dashboard bundles the Inter typeface (web/fonts/inter-latin.woff2 and
+web/fonts/inter-latin-ext.woff2), Copyright (c) 2016 The Inter Project Authors,
+licensed under the SIL Open Font License, Version 1.1. The full license text is
+in web/fonts/Inter-LICENSE.txt.
+
+The speech voice and media device data in firefox-data/ comes from Camoufox,
+Copyright (c) 2024-2026 daijro and the Camoufox contributors, licensed under the
+MIT License. The full license text is in firefox-data/LICENSE.

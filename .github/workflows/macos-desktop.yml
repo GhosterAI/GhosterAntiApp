@@ -1,0 +1,535 @@
+name: macOS desktop build
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit, branch or tag to build
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: Version of the built app
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS arm64 app and smoke test
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      BUNDLE: src-tauri/target/aarch64-apple-darwin/release/bundle
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: bun install --frozen-lockfile
+      - name: Build the app bundle
+        run: bun run desktop:build:macos
+      - name: Verify bundle layout and signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$BUNDLE/macos/GhosterAnti.app"
+          ls -la "$app/Contents/MacOS" "$app/Contents/Resources"
+          for file in ghosteranti ghosteranti-sidecar ghosteranti-mcp; do
+            test -x "$app/Contents/MacOS/$file"
+          done
+          test -x "$app/Contents/Resources/playwright/node/node"
+          # Python scripts download their runtime on first use; the app carries no Python.
+          test ! -e "$app/Contents/Resources/playwright/python"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --verify --deep --strict --verbose=2 "$app/Contents/Resources/firefox/AliasMode.app"
+          codesign --display --verbose=2 "$app" 2>&1 | grep -E "Signature|flags|Identifier"
+          # An ad-hoc signature has no notarization, so Gatekeeper is expected to reject it.
+          spctl --assess --type execute -vv "$app" || true
+      - name: Package the release files
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -er .version src-tauri/tauri.conf.json)"
+          files="$RUNNER_TEMP/release/v$version"
+          mkdir -p "$files"
+          cp "$BUNDLE/dmg/GhosterAnti_${version}_aarch64.dmg" "$files/"
+          tar -czf "$files/GhosterAnti_${version}_aarch64.app.tar.gz" -C "$BUNDLE/macos" GhosterAnti.app
+          (cd "$files" && shasum -a 256 "GhosterAnti_${version}_aarch64.app.tar.gz" "GhosterAnti_${version}_aarch64.dmg" > SHA256SUMS-macos.txt)
+          cat "$files/SHA256SUMS-macos.txt"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install with the terminal installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          # A damaged download must be refused before anything is installed.
+          bad="$RUNNER_TEMP/bad-release/v$version"
+          mkdir -p "$bad"
+          cp "$RUNNER_TEMP/release/v$version/SHA256SUMS-macos.txt" "$bad/"
+          head -c 1000000 "$RUNNER_TEMP/release/v$version/GhosterAnti_${version}_aarch64.app.tar.gz" > "$bad/GhosterAnti_${version}_aarch64.app.tar.gz"
+          if GHOSTERANTI_RELEASE_BASE="file://$RUNNER_TEMP/bad-release" bash scripts/install-macos.sh --version "$version"; then
+            echo "the installer accepted a damaged download"
+            exit 1
+          fi
+          test ! -e /Applications/GhosterAnti.app
+          export GHOSTERANTI_RELEASE_BASE="file://$RUNNER_TEMP/release"
+          bash scripts/install-macos.sh --version "$version"
+          # A second run must find the installed version and change nothing.
+          before="$(stat -f %m /Applications/GhosterAnti.app)"
+          bash scripts/install-macos.sh --version "$version"
+          test "$before" = "$(stat -f %m /Applications/GhosterAnti.app)"
+          codesign --verify --deep --strict /Applications/GhosterAnti.app
+          test -z "$(xattr -p com.apple.quarantine /Applications/GhosterAnti.app 2>/dev/null)"
+      - name: Start the app, open both engines and quit
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="/Applications/GhosterAnti.app"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          data="$HOME/Library/Application Support/com.ghosteranti.desktop"
+          mkdir -p "$data"
+          printf '{"version":1,"mode":"local","localAnalytics":false}\n' > "$data/config.json"
+          helper="$app/Contents/MacOS/ghosteranti-mcp"
+
+          open -n "$app"
+          for attempt in $(seq 1 120); do
+            [[ -f "$data/agent-runtime.json" ]] && break
+            sleep 1
+          done
+          test -f "$data/agent-runtime.json"
+          port="$(jq -er .port "$data/agent-runtime.json")"
+          curl --fail --silent --show-error "http://127.0.0.1:$port/ui/api/health" | jq -e '.ok == true'
+          sleep 5
+          screencapture -x "$RUNNER_TEMP/evidence/dashboard.png"
+
+          # A click on an outside link must open the default browser. The offer host is turned off
+          # on this runner, so Safari keeps the full address and NobleProxy counts no visit.
+          echo "127.0.0.1 nobleproxy.com" | sudo tee -a /etc/hosts >/dev/null
+          sudo dscacheutil -flushcache
+          ui() {
+            DESKTOP_PID="$(jq -er .desktopPid "$data/agent-runtime.json")" ACTION="$1" WANTED="$2" osascript -l JavaScript -e '
+              ObjC.import("stdlib");
+              const action = String($.getenv("ACTION")), wanted = String($.getenv("WANTED"));
+              const events = Application("System Events");
+              const app = events.applicationProcesses.whose({ unixId: Number($.getenv("DESKTOP_PID")) })[0];
+              app.frontmost = true;
+              delay(1);
+              const elements = app.windows[0].entireContents();
+              const element = elements.find((candidate) => Automation.getDisplayString(candidate).includes(wanted));
+              if (!element) throw new Error(wanted + " was not found among " + elements.length + " elements");
+              if (action === "click") element.click();
+              action + " " + wanted;
+            '
+          }
+          browser_shows() {
+            local shown=""
+            for attempt in $(seq 1 45); do
+              if pgrep -x Safari >/dev/null; then
+                shown="$(osascript -l JavaScript -e '
+                  Application("System Events").applicationProcesses.byName("Safari").windows[0].toolbars[0].entireContents()
+                    .filter((element) => Automation.getDisplayString(element).includes("textFields"))
+                    .map((field) => field.value()).join("\n");
+                ' 2>/dev/null || true)"
+                [[ "$shown" == *"$1"* ]] && return 0
+              fi
+              sleep 1
+            done
+            echo "the default browser did not show $1 (it showed: ${shown:-nothing})"
+            return 1
+          }
+          close_browser() {
+            pkill -x Safari
+            for attempt in $(seq 1 20); do pgrep -x Safari >/dev/null || return 0; sleep 1; done
+            return 1
+          }
+          ui click 'uiElements.byName("Buy proxies from NobleProxy'
+          browser_shows "https://nobleproxy.com/t/ghosteranti?src=sidebar-cart"
+          screencapture -x "$RUNNER_TEMP/evidence/link-sidebar.png"
+          close_browser
+          ui click 'buttons.byName("New Profile")'
+          sleep 2
+          # A new Chrome profile on a Mac uses Chromium 155, and the help text must say so.
+          ui find 'buttons.byName("Chrome: Chromium 155 beta")'
+          ui click 'uiElements.byName("Buy static residential proxies from NobleProxy'
+          browser_shows "https://nobleproxy.com/t/ghosteranti?src=profile-dialog"
+          screencapture -x "$RUNNER_TEMP/evidence/link-new-profile.png"
+          close_browser
+          ui click 'buttons.byName("Cancel")'
+
+          created="$("$helper" profiles create --name ci-firefox --temporary --engine firefox)"
+          profile="$(jq -er 'select(.ok) | .result.id' <<<"$created")"
+          # A Firefox launch must show one window only: no second window that opens and closes.
+          PROFILE="$profile" osascript -l JavaScript -e '
+            ObjC.import("stdlib");
+            const events = Application("System Events");
+            const shell = Application.currentApplication(); shell.includeStandardAdditions = true;
+            let most = 0;
+            for (let round = 0; round < 40; round++) {
+              let pids = [];
+              try { pids = shell.doShellScript("pgrep -f profiles/" + $.getenv("PROFILE") + " || true").split(/\s+/).filter(Boolean).map(Number); } catch (error) {}
+              for (const pid of pids) {
+                try { most = Math.max(most, events.applicationProcesses.whose({ unixId: pid })[0].windows.length); } catch (error) {}
+              }
+              delay(0.25);
+            }
+            "most windows at the same time: " + most;
+          ' > "$RUNNER_TEMP/evidence/firefox-launch-windows.txt" &
+          window_count=$!
+          "$helper" browser open --profile "$profile" --url https://example.com/ | jq -e '.ok and .result.engine == "firefox"'
+          wait "$window_count"
+          cat "$RUNNER_TEMP/evidence/firefox-launch-windows.txt"
+          grep -qx "most windows at the same time: 1" "$RUNNER_TEMP/evidence/firefox-launch-windows.txt"
+          screencapture -x "$RUNNER_TEMP/evidence/firefox-profile.png"
+          "$helper" browser status --profile "$profile" | tee "$RUNNER_TEMP/evidence/status.json" | jq -e '.ok'
+
+          # A Firefox profile with a Windows identity must show its own stored graphics card, not this Mac's.
+          created="$(curl --fail --silent --show-error -X POST "http://127.0.0.1:$port/ui/api/profiles" -H 'content-type: application/json' -d '{"name":"ci-firefox-windows","engine":"firefox","platformOs":"windows"}')"
+          winfx="$(jq -er '.profile.id // .id' <<<"$created")"
+          "$helper" browser open --profile "$winfx" --url https://example.com/ | jq -e '.ok'
+          observed=""
+          for attempt in $(seq 1 60); do
+            observed="$(sqlite3 "$data/profiles.sqlite" "select fp_observed_json from profiles where id = '$winfx'")"
+            [[ "$observed" == *webglRenderer* ]] && break
+            sleep 1
+          done
+          jq '{userAgent, platform, webglVendor, webglRenderer, hardwareConcurrency}' <<<"$observed" | tee "$RUNNER_TEMP/evidence/firefox-windows-identity.json"
+          jq -e '(.webglRenderer | contains("Direct3D11")) and (.webglVendor | startswith("Google Inc.")) and (.platform == "Win32")' <<<"$observed"
+          "$helper" browser close --profile "$winfx" | jq -e '.ok'
+
+          # No runtime flag: on macOS a Chromium profile must default to the 155 runtime.
+          created="$("$helper" profiles create --name ci-chromium --temporary --engine chromium)"
+          chromium="$(jq -er 'select(.ok) | .result.id' <<<"$created")"
+          "$helper" browser open --profile "$chromium" --url https://example.com/ | jq -e '.ok and (.result.port | type == "number")'
+          sleep 5
+          screencapture -x "$RUNNER_TEMP/evidence/chromium-profile.png"
+          # Chromium 155 must accept the DuckDuckGo default search setup, which runs after launch.
+          sleep 10
+
+          # Scripts: a JavaScript script runs on the bundled Node and leaves Python alone. The first
+          # Python script downloads the pinned Python runtime into the data folder, then runs.
+          nonce="$(jq -er .nonce "$data/agent-runtime.json")"
+          scripts_api() { curl --fail-with-body --silent --show-error -H "authorization: Bearer $nonce" -H 'content-type: application/json' "$@"; }
+          pyrt="$data/runtimes/python-3.13.7-playwright-1.58.0"
+          test ! -e "$pyrt"
+          run_script() {
+            local language="$1" source="$2" marker="$3" id run status=""
+            id="$(scripts_api -X POST "http://127.0.0.1:$port/ui/api/scripts" -d "$(jq -n --arg l "$language" --arg s "$source" '{name: ("ci-" + $l), description: "", language: $l, source: $s}')" | jq -er .script.id)"
+            run="$(scripts_api -X POST "http://127.0.0.1:$port/ui/api/scripts/run" -d "$(jq -n --arg id "$id" --arg p "$chromium" '{scriptId: $id, profileIds: [$p], inputs: {}, useCredentials: false}')" | jq -er .run.id)"
+            for attempt in $(seq 1 600); do
+              status="$(scripts_api "http://127.0.0.1:$port/ui/api/scripts/run" | jq -c .run)"
+              [[ "$(jq -r .status <<<"$status")" == finished ]] && break
+              sleep 1
+            done
+            scripts_api "http://127.0.0.1:$port/ui/api/scripts/log?runId=$run&offset=0" | jq -r .text | tee "$RUNNER_TEMP/evidence/script-$language.log"
+            jq -e '.status == "finished" and .profiles[0].status == "succeeded"' <<<"$status" || { echo "$status"; return 1; }
+            grep -q "$marker" "$RUNNER_TEMP/evidence/script-$language.log"
+          }
+          run_script javascript 'export default async ({ page, log }) => { await page.goto("data:text/html,js"); log("js-script-ran"); };' js-script-ran
+          test ! -e "$pyrt"
+          run_script python $'async def run(*, page, log, **_):\n    await page.goto("data:text/html,py")\n    log("python-script-ran")\n' python-script-ran
+          test -f "$pyrt/ghosteranti-runtime.sha256"
+          "$pyrt/bin/python3.13" -c "import greenlet, playwright.sync_api; print('python runtime ok')"
+          "$helper" browser close --profile "$chromium" | jq -e '.ok'
+          ! grep -q "search provider setup failed" "$data"/logs/*.log
+
+          # A CloakBrowser profile from Windows arrives without a Chromium runtime. The app must
+          # download the macOS CloakBrowser build for it and must not use Chromium 155.
+          bun -e '
+            import { buildNewProfile } from "./create.ts";
+            import { serializeAdsTxt } from "./parse.ts";
+            const profile = buildNewProfile({ name: "ci-cloakbrowser", platformOs: "windows", chromiumRuntime: "cloakbrowser" }, () => false);
+            // As made on Windows: a CloakBrowser profile with its stored processor cores.
+            process.stdout.write(serializeAdsTxt([{ ...profile, hardware: { cores: 20 } }]));
+          ' > "$data/inbox/ci-cloakbrowser.txt"
+          cloak=""
+          for attempt in $(seq 1 60); do
+            cloak="$("$helper" profiles list | jq -r '.result.profiles[]? | select(.name == "ci-cloakbrowser") | .id' | head -n 1)"
+            [[ -n "$cloak" ]] && break
+            sleep 1
+          done
+          test -n "$cloak"
+          "$helper" browser open --profile "$cloak" --url https://example.com/ | jq -e '.ok and (.result.port | type == "number")'
+          sleep 8
+          screencapture -x "$RUNNER_TEMP/evidence/cloakbrowser-profile.png"
+          pgrep -f "runtimes/cloakbrowser-.*/Chromium.app/Contents/MacOS/Chromium" >/dev/null
+          # The page must read the stored cores, not the engine default of 8 and not this Mac's count.
+          observed=""
+          for attempt in $(seq 1 60); do
+            observed="$(sqlite3 "$data/profiles.sqlite" "select fp_observed_json from profiles where id = '$cloak'")"
+            [[ "$observed" == *hardwareConcurrency* ]] && break
+            sleep 1
+          done
+          jq '{platform, hardwareConcurrency, webglRenderer}' <<<"$observed" | tee "$RUNNER_TEMP/evidence/cloakbrowser-identity.json"
+          jq -e '.hardwareConcurrency == 20 and .platform == "Win32"' <<<"$observed"
+          "$helper" browser close --profile "$cloak" | jq -e '.ok'
+
+          # The stdio MCP host must answer an agent client and list the GhosterAnti tools.
+          {
+            printf '%s\n' \
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+              '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+            sleep 20
+          } | "$helper" serve > "$RUNNER_TEMP/evidence/mcp.jsonl"
+          grep -q '"ghosteranti_profiles_list"' "$RUNNER_TEMP/evidence/mcp.jsonl"
+          grep -q '"ghosteranti_browser_open"' "$RUNNER_TEMP/evidence/mcp.jsonl"
+
+          # Remote MCP: the tunnel must start the packaged MCP host on a Mac and pass messages both
+          # ways. A local server takes the place of GhosterAnti Cloud.
+          test -x "$(dirname "$(ps -o comm= -p "$(jq -er .sidecarPid "$data/agent-runtime.json")")")/ghosteranti-mcp"
+          HELPER="$helper" bun -e '
+            import { WebSocketServer } from "ws";
+            import { MCP_TUNNEL_PROTOCOL } from "./contracts/cloud-v1.ts";
+            import { McpTunnelRuntime } from "./mcp-tunnel.ts";
+            const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+            await new Promise((resolve) => server.once("listening", resolve));
+            const tools = new Promise((resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error("the tunnel returned no tool list")), 60_000);
+              server.on("connection", (socket, request) => {
+                if (request.url !== "/v1/mcp/tunnel" || request.headers["x-ghosteranti-device"] !== "ci-device") return socket.close();
+                const send = (frame) => socket.send(JSON.stringify({ protocol: MCP_TUNNEL_PROTOCOL, sessionId: "ci", ...frame }));
+                socket.on("message", (data) => {
+                  const frame = JSON.parse(data.toString());
+                  if (frame.type !== "message") return reject(new Error("the tunnel sent " + JSON.stringify(frame)));
+                  if (frame.payload.id === 1) {
+                    send({ type: "message", payload: { jsonrpc: "2.0", method: "notifications/initialized" } });
+                    send({ type: "message", payload: { jsonrpc: "2.0", id: 2, method: "tools/list" } });
+                  }
+                  if (frame.payload.id === 2) { clearTimeout(timer); resolve(frame.payload.result.tools.map((tool) => tool.name)); }
+                });
+                send({ type: "open" });
+                send({ type: "message", payload: { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "ci", version: "1" } } } });
+              });
+            });
+            const tunnel = new McpTunnelRuntime({
+              baseUrl: "http://127.0.0.1:" + server.address().port,
+              accessToken: () => "ci-token", deviceId: () => "ci-device-id", deviceCredential: () => "ci-device",
+              helperPath: process.env.HELPER,
+            });
+            tunnel.start();
+            const names = await tools;
+            await tunnel.stop();
+            server.close();
+            if (!names.includes("ghosteranti_profiles_list") || !names.includes("ghosteranti_browser_open")) throw new Error("the tool list is not complete");
+            console.log("Remote MCP tunnel listed " + names.length + " tools");
+          '
+
+          # Cmd+Q with a browser still open must close that browser and stop the sidecar.
+          desktop="$(jq -er .desktopPid "$data/agent-runtime.json")"
+          sidecar="$(jq -er .sidecarPid "$data/agent-runtime.json")"
+          pgrep -f "$profile" >/dev/null
+          osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $desktop)
+            set frontmost to true
+            keystroke \"q\" using command down
+          end tell"
+          for attempt in $(seq 1 90); do
+            kill -0 "$desktop" 2>/dev/null || break
+            sleep 1
+          done
+          screencapture -x "$RUNNER_TEMP/evidence/after-quit.png"
+          ! kill -0 "$desktop" 2>/dev/null
+          ! kill -0 "$sidecar" 2>/dev/null
+          test ! -f "$data/agent-runtime.json"
+          ! pgrep -f "$profile" >/dev/null
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence/logs"
+          cp "$HOME/Library/Application Support/com.ghosteranti.desktop/logs/"*.log "$RUNNER_TEMP/evidence/logs/" 2>/dev/null || true
+          screencapture -x "$RUNNER_TEMP/evidence/final.png" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ghosteranti-macos-evidence
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-macos-arm64
+          path: ${{ runner.temp }}/release/v${{ steps.release.outputs.version }}/
+          if-no-files-found: error
+
+  update:
+    name: macOS in-app update with a test key
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      BUNDLE: src-tauri/target/aarch64-apple-darwin/release/bundle
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: bun install --frozen-lockfile
+      - name: Build the current version with a throwaway update key
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update"
+          mkdir -p "$work"
+          bunx tauri signer generate --ci -p "" -w "$work/update.key" > /dev/null
+          jq -n --arg pubkey "$(cat "$work/update.key.pub")" '{plugins: {updater: {pubkey: $pubkey}}}' > "$work/test-key.json"
+          bun run desktop:prepare:macos
+          bunx tauri build --target aarch64-apple-darwin --bundles app --config "$work/test-key.json"
+          ditto "$BUNDLE/macos/GhosterAnti.app" /Applications/GhosterAnti.app
+      - name: Build and sign the successor version
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update"
+          current="$(jq -er .version src-tauri/tauri.conf.json)"
+          if [[ "$current" == *-* ]]; then
+            successor="$current.acceptance.1"
+          else
+            successor="${current%.*}.$((${current##*.} + 1))-acceptance.1"
+          fi
+          for file in package.json version.ts src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock; do
+            test "$(grep -oF "$current" "$file" | wc -l | tr -d ' ')" = 1
+            CURRENT="$current" SUCCESSOR="$successor" perl -pi -e 's/\Q$ENV{CURRENT}\E/$ENV{SUCCESSOR}/' "$file"
+          done
+          bun run desktop:prepare:macos
+          bunx tauri build --target aarch64-apple-darwin --bundles app --config "$work/test-key.json"
+          archive="GhosterAnti_${successor}_aarch64.app.tar.gz"
+          tar -czf "$work/$archive" -C "$BUNDLE/macos" GhosterAnti.app
+          TAURI_SIGNING_PRIVATE_KEY="$(cat "$work/update.key")" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" bunx tauri signer sign "$work/$archive" > /dev/null
+          url="https://github.com/GhosterAI/GhosterAnti/releases/download/v$successor/$archive"
+          jq -n --arg version "$successor" --arg url "$url" --arg signature "$(cat "$work/$archive.sig")" \
+            '{version: $version, platforms: {"darwin-aarch64": {url: $url, signature: $signature}}}' > "$work/latest-macos.json"
+          {
+            echo "CURRENT=$current"
+            echo "SUCCESSOR=$successor"
+            echo "ARCHIVE=$archive"
+          } >> "$GITHUB_ENV"
+      - name: Serve the successor as a GitHub release on this machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update"
+          cd "$work"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=GhosterAnti update test CA" -keyout ca.key -out ca.pem
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=github.com" -keyout leaf.key -out leaf.csr
+          printf 'subjectAltName=DNS:github.com,DNS:api.github.com\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > leaf.ext
+          openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile leaf.ext -out leaf.pem
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.pem
+          jq -n --arg version "$SUCCESSOR" --arg archive "$ARCHIVE" --arg work "$work" '{
+            candidateVersion: $version,
+            manifestName: "latest-macos.json",
+            installerName: $archive,
+            manifestUrl: "https://github.com/GhosterAI/GhosterAnti/releases/download/v\($version)/latest-macos.json",
+            installerUrl: "https://github.com/GhosterAI/GhosterAnti/releases/download/v\($version)/\($archive)",
+            manifestPath: "\($work)/latest-macos.json",
+            installerPath: "\($work)/\($archive)",
+            certificatePath: "\($work)/leaf.pem",
+            privateKeyPath: "\($work)/leaf.key",
+            statePath: "\($work)/fixture-state.json"
+          }' > fixture.json
+          sudo cp /etc/hosts "$work/hosts.backup"
+          echo "127.0.0.1 github.com api.github.com" | sudo tee -a /etc/hosts > /dev/null
+          sudo dscacheutil -flushcache
+          sudo killall -HUP mDNSResponder || true
+          sudo -b "$(command -v node)" "$GITHUB_WORKSPACE/scripts/windows-updater-https-fixture.mjs" "$work/fixture.json"
+          for attempt in $(seq 1 30); do [[ -f fixture-state.json ]] && break; sleep 1; done
+          curl --fail --silent --show-error --cacert ca.pem "https://api.github.com/repos/GhosterAI/GhosterAnti/releases?per_page=10" | jq -e --arg tag "v$SUCCESSOR" '.[0].tag_name == $tag'
+      - name: Update through the dashboard and verify the relaunched app
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update"
+          mkdir -p "$RUNNER_TEMP/update-evidence"
+          app="/Applications/GhosterAnti.app"
+          helper="$app/Contents/MacOS/ghosteranti-mcp"
+          data="$HOME/Library/Application Support/com.ghosteranti.desktop"
+          mkdir -p "$data"
+          printf '{"version":1,"mode":"local","localAnalytics":false}\n' > "$data/config.json"
+          open -n "$app"
+          for attempt in $(seq 1 120); do [[ -f "$data/agent-runtime.json" ]] && break; sleep 1; done
+          test "$(jq -er .appVersion "$data/agent-runtime.json")" = "$CURRENT"
+          old_pid="$(jq -er .desktopPid "$data/agent-runtime.json")"
+          # A Chromium profile would start its browser download from github.com, which the fixture rejects.
+          kept="$("$helper" profiles create --name keep-me --engine firefox | jq -er 'select(.ok) | .result.id')"
+          # The dashboard checks for updates by itself; wait until it has read the release feed.
+          for attempt in $(seq 1 60); do
+            [[ "$(sudo jq -r '.counts.manifest' "$work/fixture-state.json")" -ge 1 ]] && break
+            sleep 1
+          done
+          sleep 3
+          screencapture -x "$RUNNER_TEMP/update-evidence/before-update.png"
+          # One query returns every element with its path, so the button is found without a slow walk.
+          OLD_PID="$old_pid" osascript -l JavaScript -e '
+            ObjC.import("stdlib");
+            const events = Application("System Events");
+            const app = events.applicationProcesses.whose({ unixId: Number($.getenv("OLD_PID")) })[0];
+            app.frontmost = true;
+            const elements = app.windows[0].entireContents();
+            const button = elements.find((element) => Automation.getDisplayString(element).includes("buttons.byName(\"Update now\")"));
+            if (!button) throw new Error("the Update now button was not found among " + elements.length + " elements");
+            button.click();
+            "clicked Update now";
+          '
+          sleep 5
+          screencapture -x "$RUNNER_TEMP/update-evidence/after-click.png"
+          for attempt in $(seq 1 240); do
+            version="$(jq -r '.appVersion // empty' "$data/agent-runtime.json" 2>/dev/null || true)"
+            [[ "$version" == "$SUCCESSOR" ]] && break
+            sleep 1
+          done
+          sleep 5
+          screencapture -x "$RUNNER_TEMP/update-evidence/after-update.png"
+          cp "$data/update-attempt.json" "$RUNNER_TEMP/update-evidence/" || true
+          test "$(jq -er .appVersion "$data/agent-runtime.json")" = "$SUCCESSOR"
+          ! kill -0 "$old_pid" 2>/dev/null
+          jq -e --arg from "$CURRENT" --arg to "$SUCCESSOR" '.state == "succeeded" and .sourceVersion == $from and .expectedVersion == $to' "$data/update-attempt.json"
+          # The swapped bundle must keep a valid signature seal, and the profile data must survive.
+          codesign --verify --deep --strict "$app"
+          "$helper" profiles list | grep -q "\"$kept\""
+          sudo jq -e '.counts.installer >= 1 and .counts.rejected == 0' "$work/fixture-state.json"
+      - name: Restore name resolution
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          work="$RUNNER_TEMP/update"
+          [[ -f "$work/hosts.backup" ]] && sudo cp "$work/hosts.backup" /etc/hosts
+          sudo dscacheutil -flushcache || true
+          screencapture -x "$RUNNER_TEMP/update-evidence/final.png" || true
+          cp "$HOME/Library/Application Support/com.ghosteranti.desktop/update-attempt.json" "$RUNNER_TEMP/update-evidence/" 2>/dev/null || true
+          cp "$HOME/Library/Application Support/com.ghosteranti.desktop/logs/"*.log "$RUNNER_TEMP/update-evidence/" 2>/dev/null || true
+          sudo cp "$work/fixture-state.json" "$RUNNER_TEMP/update-evidence/" 2>/dev/null || true
+          sudo chmod -R a+r "$RUNNER_TEMP/update-evidence" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ghosteranti-macos-update-evidence
+          path: ${{ runner.temp }}/update-evidence
+          if-no-files-found: warn
+

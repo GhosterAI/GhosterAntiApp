@@ -1,0 +1,3038 @@
+#!/usr/bin/env bun
+/**
+ * GhosterAnti browser profile manager CLI.
+ *
+ * Easiest path (drop-in):
+ *   1. Put your AdsPower export .txt file(s) in inbox/
+ *   2. export CLOAKBROWSER_BINARY_PATH=/path/to/cloakbrowser
+ *      export CLOAKBROWSER_BINARY_SHA256=<approved 64-character sha256>
+ *   3. bun cli.ts start      # imports inbox, then serves on :50400
+ *   4. Set a campaign's "Base URL" to http://127.0.0.1:50400 and run it.
+ *
+ * Other commands:
+ *   bun cli.ts setup               # install the verified source runtime
+ *   bun cli.ts install-browser     # download, verify, and pin CloakBrowser
+ *   bun cli.ts install-browser --engine firefox --archive <owned-build.zip>
+ *   bun cli.ts import [file|dir]   # default: import the inbox
+ *   bun cli.ts serve   [--port 50400] [--headless]
+ *   bun cli.ts list
+ *
+ * Common flags: --db <path>  --state-root <dir>  --data-root <dir>  --port <n>
+ */
+
+import { parseExport, decodeText, splitRecords } from "./parse.ts";
+import { ProfileStore } from "./store.ts";
+import { Launcher, readSnapshotChildBounded } from "./launcher.ts";
+import { linuxChromiumSandboxBlocked } from "./ghosteranti-chromium.ts";
+import { AutofillBridge } from "./autofill-bridge.ts";
+import {
+  defaultPlaywrightRuntimeRoot,
+  runPlaywrightWorker,
+  verifyPlaywrightRuntime,
+} from "./playwright-runtime.ts";
+import { serveDashboard, serveDesktopAutomationApi } from "./web.ts";
+import { LifecycleAdmissionController, type LifecycleAdmissionOptions } from "./lifecycle-admission.ts";
+import { HubClient } from "./hub-client.ts";
+import { RemoteCoordinator } from "./remote.ts";
+import {
+  playwrightTransportAttribution,
+  parseCapturedSessionBundle,
+  readSession,
+  readSessionInSubprocess,
+  READ_SESSION_WORKER_ARG,
+  runReadSessionWorker,
+  writeSession,
+  applySessionToEndpoint,
+  canonicalUserPageUrl,
+} from "./session.ts";
+import { importBuffers, importInbox, watchInbox } from "./inbox.ts";
+import { ensureStateDirectories, profileDataPaths, resolveStateRoot, statePaths, type StatePaths } from "./paths.ts";
+import { migrateLegacyState, type LegacyMigrationResult, type MigrationOptions } from "./migration.ts";
+import {
+  AppConfigStore,
+  legacyHubUrl,
+  normalizeSecureServiceUrl,
+  type AppConfig,
+} from "./app-config.ts";
+import { CloudAuthRuntime } from "./cloud-auth.ts";
+import { CloudConnectionRuntime } from "./cloud-connection.ts";
+import {
+  CloudBrowserCoordinator,
+  type CloudBrowserCloseResult,
+  type CloudBrowserOptions,
+} from "./cloud-browser.ts";
+import { McpTunnelRuntime } from "./mcp-tunnel.ts";
+import { PendingSyncQueue, PendingSyncRuntime } from "./pending-sync.ts";
+import { encodePortableProfile } from "./portable-profile.ts";
+import { createFirefoxProfileConfig } from "./firefox-config.ts";
+import type { Profile, ProfileEngine } from "./types.ts";
+import { SupabaseAuthClient } from "./supabase-auth.ts";
+import { runDiagnostics } from "./diagnose.ts";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { hostname } from "node:os";
+import net from "node:net";
+import { defaultOperatorName } from "./operator.ts";
+import { ensureDuckDuckGoDefault, type SearchProviderSetupResult } from "./search-provider.ts";
+import { installCloakBrowser } from "./browser-install.ts";
+import { installFirefox } from "./firefox-install.ts";
+import { applySourceRuntime, setupSourceRuntime } from "./source-runtime.ts";
+import { resolveEgressEndpoints } from "./egress.ts";
+import { GHOSTERANTI_VERSION } from "./version.ts";
+import {
+  DESKTOP_PROTOCOL,
+  DesktopCredentialBridge,
+  ManagedDesktopRuntime,
+  agentControlNonce,
+  desktopHealthMetadata,
+  desktopReadyRecord,
+  isDesktopShutdownCommand,
+  type DesktopHealthMetadata,
+} from "./desktop-runtime.ts";
+
+function flag(args: string[], name: string): string | undefined {
+  const i = args.indexOf(`--${name}`);
+  return i !== -1 ? args[i + 1] : undefined;
+}
+function has(args: string[], name: string): boolean {
+  return args.includes(`--${name}`);
+}
+
+export const CLOAKPIT_IMPORT_COMMAND = "__import-cloakpit";
+const IMPORT_RESTRICTION = "Windows DPAPI protects persisted browser secrets, so this import works only for the same Windows machine and account. Persisted persona fields are preserved, but runtime or browser differences can change the account-visible fingerprint.";
+
+export async function runCloakpitImportCommand(
+  args: string[],
+  migrate: (source: string, destination: StatePaths, options?: MigrationOptions) => Promise<LegacyMigrationResult> = migrateLegacyState,
+): Promise<{ ok: boolean; message: string }> {
+  const source = flag(args, "source") ?? (existsSync(join("C:\\Cloakpit", "profiles.sqlite")) ? "C:\\Cloakpit" : undefined);
+  if (!source) return { ok: false, message: `No Cloakpit source was selected. Pass an explicit source path. ${IMPORT_RESTRICTION}` };
+  try {
+    const result = await migrate(source, statePaths(resolveStateRoot(args)), {
+      profileRoot: flag(args, "cloakpit-profile-root"),
+    });
+    if (result.status === "not_found") {
+      return { ok: false, message: `No profiles.sqlite was found in ${resolve(source)}. ${IMPORT_RESTRICTION}` };
+    }
+    return {
+      ok: true,
+      message: `Imported ${result.profileCount} Cloakpit profile(s). ${IMPORT_RESTRICTION}`,
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { ok: false, message: `${detail}. ${IMPORT_RESTRICTION}` };
+  }
+}
+
+export const OFFICIAL_CLOUD_URL = "https://cloud.ghosteranti.com";
+export const OFFICIAL_CLOUD_ANON_KEY = "ghosteranti-direct-gotrue";
+
+export interface CloudRuntimeConfiguration {
+  apiUrl: string;
+  authUrl: string;
+  anonKey: string;
+}
+
+function nonblank(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
+export function selectedCloudUrl(
+  config: AppConfig,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return nonblank(env.GHOSTERANTI_CLOUD_URL) ?? config.cloudUrl ?? OFFICIAL_CLOUD_URL;
+}
+
+export function cloudRuntimeConfiguration(
+  config: AppConfig,
+  env: Record<string, string | undefined> = process.env,
+): CloudRuntimeConfiguration | null {
+  if (config.mode !== "cloud") return null;
+  const cloudUrl = normalizeSecureServiceUrl(
+    selectedCloudUrl(config, env),
+    "GhosterAnti Cloud",
+  );
+  return {
+    apiUrl: cloudUrl,
+    authUrl: normalizeSecureServiceUrl(
+      nonblank(env.GHOSTERANTI_SUPABASE_URL) ?? cloudUrl,
+      "GhosterAnti Auth",
+    ),
+    anonKey: nonblank(env.GHOSTERANTI_SUPABASE_ANON_KEY) ?? OFFICIAL_CLOUD_ANON_KEY,
+  };
+}
+
+export function lifecycleAdmissionOptionsFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): LifecycleAdmissionOptions {
+  const options: LifecycleAdmissionOptions = {};
+  const read = (name: string): number | undefined => {
+    const raw = env[name];
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+    return value;
+  };
+  const limit = read("GHOSTERANTI_LIFECYCLE_CAP");
+  const queueWaitMs = read("GHOSTERANTI_LIFECYCLE_WAIT_MS");
+  if (limit !== undefined) options.limit = limit;
+  if (queueWaitMs !== undefined) options.queueWaitMs = queueWaitMs;
+  return options;
+}
+
+function isDir(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function startMemoryAttributionLog(coord?: RemoteCoordinator): void {
+  const report = () => {
+    const memory = process.memoryUsage();
+    const mb = (bytes: number) => Math.round(bytes / 1024 / 1024);
+    const unattributedRss = Math.max(0, memory.rss - memory.heapTotal - memory.external);
+    const transports = playwrightTransportAttribution();
+    const attribution = coord?.memoryAttribution();
+    const captureDetails = attribution
+      ? ` captures=${attribution.sessionCapturesSettled}/${attribution.sessionCapturesStarted}` +
+        ` captureErrors=${attribution.sessionCaptureErrors} pendingReads=${attribution.pendingSessionReads}` +
+        ` capturedTotal=${mb(attribution.sessionCaptureBytes)}MB largestCapture=${mb(attribution.largestSessionCaptureBytes)}MB` +
+        ` syncs=${attribution.pendingSessionSyncs} pushes=${attribution.pendingPushes}` +
+        ` heartbeats=${attribution.pendingHeartbeats} opening=${attribution.opening} closing=${attribution.closing}` +
+        ` retained=${attribution.retainedCleanups} telegram=${attribution.telegramProfiles}`
+      : "";
+    console.log(
+      `[memory] rss=${mb(memory.rss)}MB heap=${mb(memory.heapUsed)}/${mb(memory.heapTotal)}MB ` +
+      `external=${mb(memory.external)}MB buffers=${mb(memory.arrayBuffers)}MB unattributedRss=${mb(unattributedRss)}MB` +
+      ` parentTransports=${transports.active}/${transports.opened}/${transports.closed} forcedTransports=${transports.forced}` +
+      captureDetails,
+    );
+  };
+  report();
+  const timer = setInterval(report, 60_000);
+  timer.unref?.();
+}
+
+export interface RemoteShutdownDrainOptions {
+  /** How long to observe one cleanup call before logging that it is still pending. */
+  attemptLogMs?: number;
+  /** Delay before retrying after releaseAll settles without confirmation. */
+  retryMs?: number;
+  /**
+   * Total cleanup budget. Expiry rejects without releasing locks or deleting
+   * launch rows, so the next process can safely reconcile/reclaim them.
+   */
+  maxDrainMs?: number;
+  log?: (message: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+export const DEFAULT_REMOTE_SHUTDOWN_TIMEOUT_MS = 3 * 60_000;
+
+export class RemoteShutdownTimeoutError extends Error {
+  constructor(
+    readonly timeoutMs: number,
+    readonly attempts: number,
+  ) {
+    super(
+      `remote shutdown cleanup was not confirmed within ${timeoutMs}ms after ${attempts} attempt(s); ` +
+      "launch records and any unconfirmed hub locks were intentionally retained",
+    );
+    this.name = "RemoteShutdownTimeoutError";
+  }
+}
+
+/**
+ * Keep a remote shutdown fail-closed until every browser stop and hub unlock is
+ * confirmed, up to a process-level shutdown budget. A slow releaseAll call is
+ * observed in bounded windows for useful logs, but never overlapped with
+ * another call: two concurrent close/release passes could race the same
+ * profile. A settled false/error is retried because retained browser cleanup
+ * continues in the background. Budget expiry preserves durable ownership and
+ * rejects so the caller can exit non-zero instead of squatting on its API port
+ * forever; a replacement process then reconciles the retained launch rows.
+ */
+export async function drainRemoteShutdown(
+  releaseAll: () => Promise<boolean>,
+  opts: RemoteShutdownDrainOptions = {},
+): Promise<void> {
+  const attemptLogMs = Math.max(1, opts.attemptLogMs ?? 30_000);
+  const retryMs = Math.max(1, opts.retryMs ?? 5_000);
+  const maxDrainMs = Math.max(1, opts.maxDrainMs ?? DEFAULT_REMOTE_SHUTDOWN_TIMEOUT_MS);
+  const log = opts.log ?? ((message: string) => console.error(message));
+  const wait = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = opts.now ?? Date.now;
+  const deadline = now() + maxDrainMs;
+  let attempt = 0;
+
+  while (true) {
+    const remainingBeforeAttempt = deadline - now();
+    if (remainingBeforeAttempt <= 0) throw new RemoteShutdownTimeoutError(maxDrainMs, attempt);
+    attempt++;
+    const pending = Promise.resolve().then(releaseAll);
+    while (true) {
+      const remaining = deadline - now();
+      if (remaining <= 0) throw new RemoteShutdownTimeoutError(maxDrainMs, attempt);
+      const observed = await observeShutdownAttempt(pending, Math.min(attemptLogMs, remaining));
+      if (!observed.settled) {
+        if (now() >= deadline) throw new RemoteShutdownTimeoutError(maxDrainMs, attempt);
+        log(`shutdown cleanup attempt ${attempt} is still pending after ${attemptLogMs}ms; continuing to wait without overlapping it`);
+        continue;
+      }
+      if (observed.ok && observed.confirmed) {
+        if (attempt > 1) log(`shutdown cleanup confirmed on attempt ${attempt}`);
+        return;
+      }
+      const detail = observed.ok ? "teardown or unlock remains unconfirmed" : `failed (${observed.error})`;
+      log(`shutdown cleanup attempt ${attempt} ${detail}; retrying in ${retryMs}ms`);
+      break;
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0) throw new RemoteShutdownTimeoutError(maxDrainMs, attempt);
+    await wait(Math.min(retryMs, remaining));
+  }
+}
+
+async function observeShutdownAttempt(
+  pending: Promise<boolean>,
+  timeoutMs: number,
+): Promise<
+  | { settled: false }
+  | { settled: true; ok: true; confirmed: boolean }
+  | { settled: true; ok: false; error: string }
+> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ settled: false }>((resolve) => {
+    timer = setTimeout(() => resolve({ settled: false }), timeoutMs);
+  });
+  const settled = pending.then(
+    (confirmed) => ({ settled: true as const, ok: true as const, confirmed }),
+    (error) => ({
+      settled: true as const,
+      ok: false as const,
+      error: error instanceof Error ? error.message : String(error),
+    }),
+  );
+  const result = await Promise.race([settled, timeout]);
+  if (timer) clearTimeout(timer);
+  return result;
+}
+
+function attachDesktopControl(
+  runtime: ManagedDesktopRuntime,
+  health: DesktopHealthMetadata,
+  port: number,
+  credentials: DesktopCredentialBridge,
+): void {
+  let input = "";
+  let exiting = false;
+  const shutdown = () => {
+    if (exiting) return;
+    exiting = true;
+    void runtime.shutdown()
+      .then(() => {
+        process.stdout.write(
+          `${JSON.stringify({ protocol: DESKTOP_PROTOCOL, event: "shutdown-complete", nonce: health.instance })}\n`,
+          () => process.exit(0),
+        );
+      })
+      .catch((error) => {
+        console.error(`desktop shutdown cleanup unconfirmed: ${error instanceof Error ? error.message : String(error)}`);
+        process.stdout.write(
+          `${JSON.stringify({ protocol: DESKTOP_PROTOCOL, event: "shutdown-failed", nonce: health.instance })}\n`,
+          () => process.exit(1),
+        );
+      });
+  };
+
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk: string) => {
+    input += chunk;
+    for (;;) {
+      const newline = input.indexOf("\n");
+      if (newline < 0) break;
+      const line = input.slice(0, newline).trim();
+      input = input.slice(newline + 1);
+      if (credentials.handleLine(line)) continue;
+      if (isDesktopShutdownCommand(line, health.instance)) shutdown();
+    }
+  });
+  process.stdin.once("end", shutdown);
+  process.stdin.once("close", shutdown);
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  process.stdout.write(`${JSON.stringify(desktopReadyRecord(health.instance, port))}\n`);
+}
+
+const UNSAFE_CANARY_TIMEOUT_MS = 600_000;
+
+function makeLauncher(
+  store: ProfileStore,
+  rest: string[],
+  remoteMode = false,
+  defaultDataRoot = "profiles",
+  ensureSearchProvider = ensureDuckDuckGoDefault,
+  // Local and Cloud profiles share one downloaded Chromium 155 runtime.
+  chromiumRuntimeRoot?: string,
+): Launcher {
+  const unsafeCanary = has(rest, "unsafe-disable-identity-gates");
+  const autofill = new AutofillBridge(store);
+  autofill.listen();
+  return new Launcher({
+    store,
+    autofill,
+    dataRoot: defaultDataRoot,
+    ...(chromiumRuntimeRoot ? { chromiumRuntimeRoot } : {}),
+    headless: has(rest, "headless"),
+    // Explicit canary-only escape hatch for constrained test hosts where a
+    // full browser identity probe cannot complete. Never enable in production.
+    unsafeDisableIdentityGates: unsafeCanary,
+    ...(unsafeCanary ? { cdpReadyTimeoutMs: UNSAFE_CANARY_TIMEOUT_MS } : {}),
+    // GhosterAnti owns the browser process, but it is not the external campaign
+    // client that requested it. Keep the ownership namespaces distinct so that
+    // client can identify a dead browser while GhosterAnti stays up.
+    // A forwarded external launcher marker remains in launchArgs untouched.
+    // Containers with user namespaces disabled can opt out of Chromium's
+    // sandbox explicitly; normal hosts keep the sandbox enabled by default.
+    baseArgs: [
+      `--ghosteranti-launcher-pid=${process.pid}`,
+      ...(has(rest, "no-sandbox") ? ["--no-sandbox"] : []),
+    ],
+    ...(process.platform === "linux" && !has(rest, "no-sandbox") ? { chromiumSandboxBlocked: () => linuxChromiumSandboxBlocked() } : {}),
+    ...(unsafeCanary ? {} : { ensureSearchProvider }),
+    // In remote mode the coordinator injects the roamed session over CDP, so the launcher's own
+    // bootstrap cookie injection is turned off — and because the login is re-injected from the hub,
+    // it's safe to reset a crash-corrupted profile's volatile storage on launch (auto-heals the
+    // "something went wrong opening your profile" dialog) instead of the login being disk-authoritative.
+    ...(remoteMode ? { ensureCookies: async () => ({ injected: false }), resetStorageOnUncleanExit: true } : {}),
+  });
+}
+
+/** Download the browser runtimes that saved and newly saved profiles need, so a first open does not wait. */
+function prefetchBrowserRuntimes(launcher: Launcher, store: ProfileStore): void {
+  store.onProfileSaved = (profile) => launcher.prefetchBrowserRuntimes([profile]);
+  launcher.prefetchBrowserRuntimes(store.listProfiles());
+}
+
+function makeCloudBrowser(
+  launcher: Launcher,
+  store: ProfileStore,
+  connection: CloudConnectionRuntime | undefined,
+  pendingSync: PendingSyncRuntime | undefined,
+): CloudBrowserCoordinator | undefined {
+  if (!connection || !pendingSync) return undefined;
+  return new CloudBrowserCoordinator({
+    cloud: connection.client,
+    launcher,
+    store,
+    queue: () => pendingSync.queue(),
+    accountId: () => connection.accountId(),
+    deviceId: () => connection.deviceId(),
+    readSession: (endpoint, captureSeed) => readSessionInSubprocess(endpoint, { captureSeed }),
+    applySession: (endpoint, bundle, urls) =>
+      applySessionToEndpoint(endpoint, bundle, urls, { log: (m) => console.log(`[ghosteranti] ${m}`) }),
+    log: (m) => console.log(`[ghosteranti] ${m}`),
+  });
+}
+
+function installCloudShutdown(
+  cloudBrowser: CloudBrowserCoordinator,
+  mcpTunnel?: McpTunnelRuntime,
+): void {
+  let shutdownInFlight: Promise<void> | null = null;
+  const shutdown = (signal: NodeJS.Signals) => {
+    if (shutdownInFlight) {
+      process.exit(signal === "SIGINT" ? 130 : 143);
+      return;
+    }
+    console.error(`received ${signal}; capturing and closing Cloud browsers`);
+    shutdownInFlight = drainRemoteShutdown(
+      async () => {
+        await mcpTunnel?.stop();
+        return cloudBrowser.releaseAll(true);
+      },
+      { maxDrainMs: DEFAULT_REMOTE_SHUTDOWN_TIMEOUT_MS },
+    )
+      .then(() => process.exit(0))
+      .catch((error) => {
+        console.error(`Cloud shutdown cleanup unconfirmed: ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(1);
+      });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+async function importPath(store: ProfileStore, target: string | undefined, defaultInbox: string): Promise<void> {
+  // No arg, or a directory → import the inbox / that directory.
+  if (!target || target.startsWith("--") || isDir(target ?? "")) {
+    const dir = !target || target.startsWith("--") ? defaultInbox : target;
+    const r = await importInbox(store, dir);
+    console.log(`imported ${r.profiles} profile(s) from ${r.files} file(s) in ${dir}; stripped ${r.cookiesStripped} extension cookie(s); reported ${r.errors.length} invalid record(s)`);
+    return;
+  }
+  // A single file.
+  const bytes = new Uint8Array(await Bun.file(target).arrayBuffer());
+  const result = await importBuffers(store, [{ name: target, bytes }]);
+  console.log(
+    `imported ${result.profiles} profile(s) from ${target}; stripped ${result.cookiesStripped} ` +
+    `extension cookie(s); skipped ${result.skipped}; reported ${result.errors.length} invalid record(s)`,
+  );
+}
+
+export async function dispatchReadSessionWorker(
+  argv: string[],
+  deps: Parameters<typeof runReadSessionWorker>[1] = {
+    readSession,
+    write: (value) => Bun.write(Bun.stdout, value),
+    exit: (code) => process.exit(code),
+  },
+): Promise<boolean> {
+  if (argv[0] !== READ_SESSION_WORKER_ARG) return false;
+  await runReadSessionWorker(argv, deps);
+  return true;
+}
+
+export interface CompiledSidecarSmokeDeps {
+  writeSession: (endpoint: string, bundle: string) => Promise<void>;
+  readSession: (endpoint: string) => Promise<string>;
+  navigate: (endpoint: string) => Promise<void>;
+  assertAlive: (endpoint: string) => Promise<void>;
+  webSocketEndpoint: (endpoint: string) => Promise<string>;
+}
+
+async function assertCdpAlive(endpoint: string): Promise<void> {
+  const versionUrl = new URL(endpoint);
+  if (versionUrl.protocol !== "http:" && versionUrl.protocol !== "https:") {
+    throw new Error("compiled sidecar smoke requires an HTTP CDP endpoint");
+  }
+  versionUrl.pathname = "/json/version";
+  versionUrl.search = "";
+  versionUrl.hash = "";
+  const response = await fetch(versionUrl, { signal: AbortSignal.timeout(5_000) });
+  if (!response.ok) throw new Error("compiled sidecar smoke lost the CDP endpoint");
+}
+
+async function currentCdpWebSocketEndpoint(endpoint: string): Promise<string> {
+  const versionUrl = new URL(endpoint);
+  if (versionUrl.protocol !== "http:" && versionUrl.protocol !== "https:") {
+    throw new Error("compiled sidecar smoke requires an HTTP CDP endpoint");
+  }
+  versionUrl.pathname = "/json/version";
+  versionUrl.search = "";
+  versionUrl.hash = "";
+  const response = await fetch(versionUrl, { signal: AbortSignal.timeout(5_000) });
+  if (!response.ok) throw new Error("compiled sidecar smoke could not resolve the CDP websocket");
+  const body = await response.json() as { webSocketDebuggerUrl?: unknown };
+  if (typeof body.webSocketDebuggerUrl !== "string" || !/^wss?:\/\//.test(body.webSocketDebuggerUrl)) {
+    throw new Error("compiled sidecar smoke received an invalid CDP websocket");
+  }
+  return body.webSocketDebuggerUrl;
+}
+
+async function navigateSmokePage(endpoint: string): Promise<void> {
+  await runPlaywrightWorker("navigate", {
+    endpoint,
+    urls: ["about:blank"],
+    connectTimeoutMs: 30_000,
+  });
+}
+
+export async function runCompiledSidecarSmoke(
+  endpoint: string,
+  deps: CompiledSidecarSmokeDeps = {
+    writeSession,
+    readSession: readSessionInSubprocess,
+    navigate: navigateSmokePage,
+    assertAlive: assertCdpAlive,
+    webSocketEndpoint: currentCdpWebSocketEndpoint,
+  },
+): Promise<void> {
+  const smokeCookie = {
+    name: "ghosteranti_smoke",
+    value: "live",
+    domain: ".x.com",
+    path: "/",
+    expires: -1,
+    httpOnly: false,
+    secure: true,
+    sameSite: "Lax",
+  };
+  const smokeBundle = JSON.stringify({
+    cookies: [smokeCookie],
+    origins: [{
+      origin: "https://web.telegram.org",
+      localStorage: [{ name: "ghosteranti_smoke", value: "live" }],
+    }],
+  });
+  await deps.writeSession(endpoint, smokeBundle);
+  await deps.assertAlive(endpoint);
+  // The second authoritative write exercises cookie clearing against pre-existing browser state.
+  await deps.writeSession(endpoint, smokeBundle);
+  await deps.assertAlive(endpoint);
+  // Cloud uses an identity-bound current websocket. Exercise that exact transport too.
+  const webSocketEndpoint = await deps.webSocketEndpoint(endpoint);
+  await deps.writeSession(webSocketEndpoint, smokeBundle);
+  await deps.assertAlive(endpoint);
+  await deps.navigate(endpoint);
+  await deps.assertAlive(endpoint);
+  const bundle = JSON.parse(await deps.readSession(endpoint));
+  if (!bundle || typeof bundle !== "object" || !Array.isArray(bundle.cookies)) {
+    throw new Error("compiled sidecar capture returned an invalid session bundle");
+  }
+  if (!bundle.cookies.some((cookie: any) => cookie?.name === smokeCookie.name && cookie?.value === smokeCookie.value)) {
+    throw new Error("compiled sidecar capture lost the restored cookie");
+  }
+  await deps.assertAlive(endpoint);
+}
+
+export type CloudRestoreFixtureMode = "healthy" | "offline" | "membership-revoked" | "cross-device";
+
+export function parseCloudRestoreFixtureOptions(args: string[]): {
+  port: number;
+  mode: CloudRestoreFixtureMode;
+  initialRefresh: "seeded" | "rotated";
+} {
+  const port = Number(flag(args, "port"));
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("Cloud restore fixture requires a valid loopback port");
+  }
+  const mode = flag(args, "mode");
+  if (mode !== "healthy" && mode !== "offline" && mode !== "membership-revoked" && mode !== "cross-device") {
+    throw new Error("Cloud restore fixture mode must be healthy, offline, membership-revoked, or cross-device");
+  }
+  const initialRefresh = flag(args, "initial-refresh") ?? "seeded";
+  if (initialRefresh !== "seeded" && initialRefresh !== "rotated") {
+    throw new Error("Cloud restore fixture initial refresh must be seeded or rotated");
+  }
+  return { port, mode, initialRefresh };
+}
+
+const CLOUD_RESTORE_FIXTURE_ACCESS_TOKEN = "ghosteranti-fixture-access";
+const CLOUD_RESTORE_FIXTURE_SEEDED_REFRESH_TOKEN = "ghosteranti-acceptance-refresh-seeded";
+const CLOUD_RESTORE_FIXTURE_REFRESH_TOKEN = "ghosteranti-fixture-refresh-rotated";
+const CLOUD_RESTORE_FIXTURE_DEVICE_CREDENTIAL = "ghosteranti-acceptance-device";
+const CLOUD_RESTORE_FIXTURE_LEGAL = {
+  terms: "fixture-terms",
+  privacy: "fixture-privacy",
+  acceptableUse: "fixture-acceptable-use",
+};
+
+function cloudRestoreFixtureStatus() {
+  return {
+    ok: true as const,
+    account: {
+      id: "fixture-account",
+      email: "user@fixture.invalid",
+      emailVerified: true,
+    },
+    workspace: {
+      id: "fixture-workspace",
+      ownerAccountId: "fixture-owner",
+      name: "Fixture workspace",
+      role: "member" as const,
+    },
+    device: {
+      id: "fixture-device",
+      label: "Fixture Windows device",
+      platform: "windows" as const,
+      appVersion: GHOSTERANTI_VERSION,
+      createdAt: 1,
+      lastSeenAt: 1,
+      revokedAt: null,
+      current: true,
+    },
+    legal: {
+      current: CLOUD_RESTORE_FIXTURE_LEGAL,
+      accepted: { ...CLOUD_RESTORE_FIXTURE_LEGAL, acceptedAt: 1 },
+    },
+  };
+}
+
+function fixtureJson(body: unknown, status = 200): Response {
+  return Response.json(body, {
+    status,
+    headers: { "Cache-Control": "no-store" },
+  });
+}
+
+function fixtureAuthorized(request: Request): boolean {
+  return request.headers.get("authorization") === `Bearer ${CLOUD_RESTORE_FIXTURE_ACCESS_TOKEN}`
+    && request.headers.get("x-ghosteranti-device") === CLOUD_RESTORE_FIXTURE_DEVICE_CREDENTIAL;
+}
+
+const CLOUD_CROSS_DEVICE_PROFILE_ID = "ghosteranti-cross-device-profile";
+const CLOUD_CROSS_DEVICE_ACCOUNT_ID = "fixture-cross-device-account";
+const CLOUD_CROSS_DEVICE_INITIAL_SENTINEL = "fixture-session-n37";
+const CLOUD_CROSS_DEVICE_A_SENTINEL = "device-a-session-n38";
+const CLOUD_CROSS_DEVICE_CONFLICT_SENTINEL = "device-a-stale-conflict";
+const CLOUD_CROSS_DEVICE_LATEST_SENTINEL = "fixture-authoritative-n40";
+const CLOUD_CROSS_DEVICE_AMBIGUOUS_SENTINEL = "device-a-ambiguous-n42";
+const CLOUD_CROSS_DEVICE_DEVICES = {
+  a: {
+    id: "fixture-cross-device-a",
+    accessToken: "ghosteranti-cross-device-access-a",
+    credential: "ghosteranti-cross-device-credential-a",
+  },
+  b: {
+    id: "fixture-cross-device-b",
+    accessToken: "ghosteranti-cross-device-access-b",
+    credential: "ghosteranti-cross-device-credential-b",
+  },
+} as const;
+
+type CloudCrossDeviceFixtureDevice = keyof typeof CLOUD_CROSS_DEVICE_DEVICES;
+type CloudCrossDevicePayload = ReturnType<typeof encodePortableProfile>;
+
+export interface CloudCrossDeviceFixtureState {
+  ok: true;
+  version: number;
+  activeDevice: CloudCrossDeviceFixtureDevice | null;
+  counters: {
+    open: Record<CloudCrossDeviceFixtureDevice, number>;
+    close: Record<CloudCrossDeviceFixtureDevice, number>;
+    heartbeat: Record<CloudCrossDeviceFixtureDevice, number>;
+    abandon: Record<CloudCrossDeviceFixtureDevice, number>;
+    acceptedCloses: number;
+    conflicts: number;
+    profileOpen: number;
+    droppedResponses: number;
+  };
+}
+
+function cloudCrossDeviceSession(sentinel: string): string {
+  return JSON.stringify({
+    cookies: [{
+      name: "ghosteranti_cross_device",
+      value: sentinel,
+      domain: ".x.com",
+      path: "/",
+      expires: -1,
+      httpOnly: false,
+      secure: true,
+      sameSite: "Lax",
+    }],
+    origins: [],
+  });
+}
+
+function cloudCrossDevicePayload(sentinel: string): CloudCrossDevicePayload {
+  return encodePortableProfile(
+    smokeProfile(CLOUD_CROSS_DEVICE_PROFILE_ID, "Cross-device fixture", 38),
+    cloudCrossDeviceSession(sentinel),
+  );
+}
+
+function cloudCrossDeviceRequestDevice(request: Request): CloudCrossDeviceFixtureDevice | null {
+  for (const device of ["a", "b"] as const) {
+    const expected = CLOUD_CROSS_DEVICE_DEVICES[device];
+    if (
+      request.headers.get("authorization") === `Bearer ${expected.accessToken}`
+      && request.headers.get("x-ghosteranti-device") === expected.credential
+    ) return device;
+  }
+  return null;
+}
+
+export function createCloudCrossDeviceFixtureHandler(): (request: Request) => Promise<Response> {
+  let version = 37;
+  let payload = cloudCrossDevicePayload(CLOUD_CROSS_DEVICE_INITIAL_SENTINEL);
+  let registrationSequence = 0;
+  let dropNextCloseResponse = false;
+  let active: { registrationId: string; device: CloudCrossDeviceFixtureDevice } | null = null;
+  const registrations = new Map<string, {
+    device: CloudCrossDeviceFixtureDevice;
+    closed: boolean;
+    dropResponses: boolean;
+  }>();
+  const counters: CloudCrossDeviceFixtureState["counters"] = {
+    open: { a: 0, b: 0 },
+    close: { a: 0, b: 0 },
+    heartbeat: { a: 0, b: 0 },
+    abandon: { a: 0, b: 0 },
+    acceptedCloses: 0,
+    conflicts: 0,
+    profileOpen: 0,
+    droppedResponses: 0,
+  };
+  const state = (): CloudCrossDeviceFixtureState => ({
+    ok: true,
+    version,
+    activeDevice: active?.device ?? null,
+    counters: {
+      open: { ...counters.open },
+      close: { ...counters.close },
+      heartbeat: { ...counters.heartbeat },
+      abandon: { ...counters.abandon },
+      acceptedCloses: counters.acceptedCloses,
+      conflicts: counters.conflicts,
+      profileOpen: counters.profileOpen,
+      droppedResponses: counters.droppedResponses,
+    },
+  });
+
+  return async (request) => {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/health") {
+      return fixtureJson({ ok: true, mode: "cross-device" });
+    }
+    if (request.method === "GET" && url.pathname === "/control/state") {
+      return fixtureJson(state());
+    }
+    if (request.method === "POST" && url.pathname === "/control/advance") {
+      if (active?.device !== "a") {
+        return fixtureJson({ ok: false, error: "fixture device A must be open" }, 409);
+      }
+      version++;
+      payload = cloudCrossDevicePayload(CLOUD_CROSS_DEVICE_LATEST_SENTINEL);
+      return fixtureJson({ ok: true, version });
+    }
+    if (request.method === "POST" && url.pathname === "/control/drop-close-response") {
+      if (active?.device !== "a" || dropNextCloseResponse) {
+        return fixtureJson({ ok: false, error: "fixture device A close cannot be armed" }, 409);
+      }
+      dropNextCloseResponse = true;
+      return fixtureJson({ ok: true });
+    }
+
+    const device = cloudCrossDeviceRequestDevice(request);
+    if (!device) {
+      return fixtureJson({
+        ok: false,
+        error: { code: "authentication_required", message: "fixture authentication is required" },
+      }, 401);
+    }
+
+    if (
+      request.method === "POST"
+      && url.pathname === `/v1/profiles/${CLOUD_CROSS_DEVICE_PROFILE_ID}/open`
+    ) {
+      const body = await request.json().catch(() => null) as { deviceId?: unknown } | null;
+      if (body?.deviceId !== CLOUD_CROSS_DEVICE_DEVICES[device].id) {
+        return fixtureJson({
+          ok: false,
+          error: { code: "validation_failed", message: "fixture device identity is invalid" },
+        }, 400);
+      }
+      counters.open[device]++;
+      if (active) {
+        counters.profileOpen++;
+        return fixtureJson({
+          ok: false,
+          error: { code: "profile_open", message: "fixture profile is already open" },
+        }, 409);
+      }
+      const registrationId = `fixture-${device}-${++registrationSequence}`;
+      registrations.set(registrationId, { device, closed: false, dropResponses: false });
+      active = { registrationId, device };
+      return fixtureJson({
+        ok: true,
+        registrationId,
+        baseVersion: version,
+        payload,
+        activeOpens: [],
+      });
+    }
+
+    const route = url.pathname.match(/^\/v1\/open-sessions\/([^/]+)\/(heartbeat|close|abandon)$/);
+    if (!route) {
+      return fixtureJson({
+        ok: false,
+        error: { code: "internal_error", message: "unknown fixture route" },
+      }, 404);
+    }
+    const registrationId = decodeURIComponent(route[1]!);
+    const action = route[2]!;
+    const registration = registrations.get(registrationId);
+    if (!registration || registration.device !== device) {
+      return fixtureJson({
+        ok: false,
+        error: { code: "profile_not_found", message: "fixture registration was not found" },
+      }, 404);
+    }
+
+    if (request.method === "POST" && action === "heartbeat") {
+      counters.heartbeat[device]++;
+      if (registration.closed || active?.registrationId !== registrationId) {
+        return fixtureJson({
+          ok: false,
+          error: { code: "profile_not_found", message: "fixture registration was closed" },
+        }, 404);
+      }
+      return fixtureJson({ ok: true, revoked: false, activeOpens: [] });
+    }
+    if (request.method === "POST" && action === "abandon") {
+      counters.abandon[device]++;
+      registration.closed = true;
+      if (active?.registrationId === registrationId) active = null;
+      return fixtureJson({ ok: true, status: "abandoned" });
+    }
+    if (request.method !== "PUT" || action !== "close") {
+      return fixtureJson({
+        ok: false,
+        error: { code: "internal_error", message: "unknown fixture route" },
+      }, 404);
+    }
+
+    counters.close[device]++;
+    if (registration.dropResponses) {
+      counters.droppedResponses++;
+      return Response.error();
+    }
+    if (registration.closed || active?.registrationId !== registrationId) {
+      return fixtureJson({
+        ok: false,
+        error: { code: "profile_not_found", message: "fixture registration was closed" },
+      }, 404);
+    }
+    const body = await request.json().catch(() => null) as {
+      expectedVersion?: unknown;
+      payload?: unknown;
+    } | null;
+    if (!Number.isSafeInteger(body?.expectedVersion) || !body?.payload || typeof body.payload !== "object") {
+      return fixtureJson({
+        ok: false,
+        error: { code: "validation_failed", message: "fixture close payload is invalid" },
+      }, 400);
+    }
+
+    registration.closed = true;
+    active = null;
+    if (body.expectedVersion !== version) {
+      counters.conflicts++;
+      return fixtureJson({
+        ok: false,
+        error: {
+          code: "version_conflict",
+          message: "fixture close used a stale version",
+          currentVersion: version,
+        },
+      }, 409);
+    }
+
+    payload = body.payload as CloudCrossDevicePayload;
+    version++;
+    counters.acceptedCloses++;
+    if (dropNextCloseResponse && device === "a") {
+      dropNextCloseResponse = false;
+      registration.dropResponses = true;
+      counters.droppedResponses++;
+      return Response.error();
+    }
+    return fixtureJson({ ok: true, status: "accepted", version });
+  };
+}
+
+export function createCloudRestoreFixtureHandler(
+  mode: CloudRestoreFixtureMode,
+  initialRefresh: "seeded" | "rotated" = "seeded",
+): (request: Request) => Promise<Response> {
+  if (mode === "cross-device") return createCloudCrossDeviceFixtureHandler();
+  let expectedRefreshToken = initialRefresh === "seeded"
+    ? CLOUD_RESTORE_FIXTURE_SEEDED_REFRESH_TOKEN
+    : CLOUD_RESTORE_FIXTURE_REFRESH_TOKEN;
+  const waiting: Array<() => void> = [];
+  const waitForRelease = () => new Promise<void>((resolve) => {
+    waiting.push(resolve);
+  });
+  const release = (count: number): boolean => {
+    if (waiting.length < count) return false;
+    for (let index = 0; index < count; index++) waiting.shift()!();
+    return true;
+  };
+
+  return async (request) => {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/health") {
+      return fixtureJson({ ok: true, mode });
+    }
+    if (request.method === "POST" && url.pathname === "/control/release") {
+      const count = Number(url.searchParams.get("count") ?? "1");
+      if (!Number.isInteger(count) || count < 1 || count > 2) {
+        return fixtureJson({ ok: false, error: "fixture release count must be one or two" }, 400);
+      }
+      if (!release(count)) {
+        return fixtureJson({ ok: false, error: "fixture has no waiting refresh request" }, 409);
+      }
+      return fixtureJson({ ok: true, released: count });
+    }
+    if (
+      request.method === "POST"
+      && url.pathname === "/auth/v1/token"
+      && url.searchParams.get("grant_type") === "refresh_token"
+    ) {
+      const body = await request.json().catch(() => null) as { refresh_token?: unknown } | null;
+      if (body?.refresh_token !== expectedRefreshToken) {
+        return fixtureJson({ message: "fixture refresh token is invalid" }, 401);
+      }
+      expectedRefreshToken = CLOUD_RESTORE_FIXTURE_REFRESH_TOKEN;
+      // Hold the response until installed automation has observed the restoring UI.
+      await waitForRelease();
+      if (mode === "offline") return Response.error();
+      return fixtureJson({
+        access_token: CLOUD_RESTORE_FIXTURE_ACCESS_TOKEN,
+        refresh_token: CLOUD_RESTORE_FIXTURE_REFRESH_TOKEN,
+        expires_in: 3_600,
+        user: {
+          id: "fixture-account",
+          email: "user@fixture.invalid",
+          email_confirmed_at: "fixture",
+        },
+      });
+    }
+    if (!url.pathname.startsWith("/v1/") || !fixtureAuthorized(request)) {
+      return fixtureJson({
+        ok: false,
+        error: { code: "authentication_required", message: "fixture authentication is required" },
+      }, 401);
+    }
+    if (mode === "offline") return Response.error();
+    if (mode === "membership-revoked") {
+      return fixtureJson({
+        ok: false,
+        error: { code: "membership_revoked", message: "fixture membership was revoked" },
+      }, 403);
+    }
+    if (request.method === "GET" && url.pathname === "/v1/status") {
+      return fixtureJson(cloudRestoreFixtureStatus());
+    }
+    if (request.method === "GET" && url.pathname === "/v1/profiles") {
+      return fixtureJson({ ok: true, profiles: [] });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/workspace/folders") {
+      return fixtureJson({ ok: true, folders: [] });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/workspace/members") {
+      return fixtureJson({
+        ok: true,
+        members: [{
+          accountId: "fixture-account",
+          email: "user@fixture.invalid",
+          role: "member",
+          joinedAt: 1,
+          grants: [],
+        }],
+      });
+    }
+    return fixtureJson({
+      ok: false,
+      error: { code: "internal_error", message: "unknown fixture route" },
+    }, 404);
+  };
+}
+
+async function runCloudRestoreFixture(args: string[]): Promise<void> {
+  const { port, mode, initialRefresh } = parseCloudRestoreFixtureOptions(args);
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    fetch: createCloudRestoreFixtureHandler(mode, initialRefresh),
+  });
+  if (server.port !== port) {
+    server.stop(true);
+    throw new Error("Cloud restore fixture did not bind the requested loopback port");
+  }
+  console.log(`Cloud restore fixture ready on loopback port ${port} in ${mode} mode`);
+  await new Promise<void>((resolve) => {
+    process.once("SIGINT", resolve);
+    process.once("SIGTERM", resolve);
+  });
+  await server.stop(true);
+}
+
+export interface WindowsNativeWindowCandidate {
+  profileId: string;
+  hwnd: number;
+  minimized: boolean;
+  visible: boolean;
+}
+
+export interface WindowsNativeWindowSnapshot {
+  foregroundHwnd: number;
+  windows: Record<string, Omit<WindowsNativeWindowCandidate, "profileId">>;
+}
+
+export function mapWindowsNativeWindowCandidates(
+  profileIds: readonly string[],
+  candidates: readonly WindowsNativeWindowCandidate[],
+): WindowsNativeWindowSnapshot["windows"] {
+  const windows: WindowsNativeWindowSnapshot["windows"] = {};
+  const handles = new Set<number>();
+  for (const profileId of profileIds) {
+    const matches = candidates.filter((candidate) => candidate.profileId === profileId);
+    if (matches.length !== 1) return {};
+    const { hwnd, minimized, visible } = matches[0]!;
+    if (!Number.isSafeInteger(hwnd) || hwnd <= 0 || handles.has(hwnd)) return {};
+    handles.add(hwnd);
+    windows[profileId] = { hwnd, minimized, visible };
+  }
+  return windows;
+}
+
+export interface WindowsProfileCardObservation {
+  createdPageTargetIds: string[];
+  nativeWindowStayedMinimized: boolean;
+}
+
+export interface WindowsPageLifecycleObservation extends WindowsProfileCardObservation {
+  destroyedPageTargetIds: string[];
+}
+
+export type WindowsWindowAcceptanceStage =
+  | "search_provider_ready"
+  | "tabs_restored"
+  | "page_targets_ready"
+  | "windows_distinct"
+  | "window_minimized"
+  | "profile_card_observed"
+  | "background_page_observed"
+  | "session_capture_observed"
+  | "first_window_raised"
+  | "second_window_raised";
+
+export interface WindowsWindowAcceptanceRuntime {
+  profileIds: readonly [string, string];
+  open(profileId: string): Promise<void>;
+  verifySearchProvider?(profileId: string): Promise<void>;
+  verifyTabsRestored?(): Promise<void>;
+  close(profileId: string): Promise<void>;
+  nativeWindows(): Promise<WindowsNativeWindowSnapshot>;
+  minimize(profileId: string): Promise<void>;
+  pageTargetIds(profileId: string): Promise<string[]>;
+  runProfileCardObserved(profileId: string, hwnd: number): Promise<WindowsProfileCardObservation>;
+  runBackgroundPageObserved(profileId: string, hwnd: number): Promise<WindowsPageLifecycleObservation>;
+  runSessionCaptureObserved(profileId: string, hwnd: number): Promise<WindowsProfileCardObservation>;
+  bringToFront(profileId: string): Promise<void>;
+  reportStage?(stage: WindowsWindowAcceptanceStage): void;
+}
+
+async function waitForNativeWindowState(
+  read: () => Promise<WindowsNativeWindowSnapshot>,
+  accepted: (snapshot: WindowsNativeWindowSnapshot) => boolean,
+  failure: string,
+  timeoutMs = 20_000,
+): Promise<WindowsNativeWindowSnapshot> {
+  const deadline = Date.now() + timeoutMs;
+  let snapshot: WindowsNativeWindowSnapshot | undefined;
+  while (Date.now() < deadline) {
+    snapshot = await read();
+    if (accepted(snapshot)) return snapshot;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(failure);
+}
+
+export async function exerciseWindowsWindowAcceptance(
+  runtime: WindowsWindowAcceptanceRuntime,
+): Promise<void> {
+  const [firstId, secondId] = runtime.profileIds;
+  const opened: string[] = [];
+  let failure: unknown;
+  let cleanupFailure: unknown;
+  try {
+    await runtime.open(firstId);
+    opened.push(firstId);
+    await runtime.open(secondId);
+    opened.push(secondId);
+
+    if (runtime.verifySearchProvider) {
+      await runtime.verifySearchProvider(firstId);
+      await runtime.verifySearchProvider(secondId);
+      runtime.reportStage?.("search_provider_ready");
+    }
+    if (runtime.verifyTabsRestored) {
+      await runtime.verifyTabsRestored();
+      runtime.reportStage?.("tabs_restored");
+    }
+
+    const [firstTargets, secondTargets] = await Promise.all([
+      runtime.pageTargetIds(firstId),
+      runtime.pageTargetIds(secondId),
+    ]);
+    if (!firstTargets.length || !secondTargets.length) {
+      throw new Error("managed CloakBrowser did not expose initial page targets");
+    }
+    runtime.reportStage?.("page_targets_ready");
+
+    const initial = await waitForNativeWindowState(
+      runtime.nativeWindows,
+      (snapshot) => {
+        const first = snapshot.windows[firstId];
+        const second = snapshot.windows[secondId];
+        return !!first && !!second
+          && first.visible && second.visible
+          && first.hwnd > 0 && second.hwnd > 0 && first.hwnd !== second.hwnd;
+      },
+      "managed CloakBrowser windows did not expose distinct native HWNDs",
+    );
+    runtime.reportStage?.("windows_distinct");
+    const firstHwnd = initial.windows[firstId]!.hwnd;
+    const secondHwnd = initial.windows[secondId]!.hwnd;
+
+    await runtime.minimize(firstId);
+    await waitForNativeWindowState(
+      runtime.nativeWindows,
+      (snapshot) => snapshot.windows[firstId]?.hwnd === firstHwnd
+        && snapshot.windows[firstId]?.visible === true
+        && snapshot.windows[firstId]?.minimized === true
+        && snapshot.windows[secondId]?.hwnd === secondHwnd
+        && snapshot.windows[secondId]?.visible === true,
+      "native CloakBrowser window did not remain distinct and minimized",
+    );
+    runtime.reportStage?.("window_minimized");
+    const targetsBefore = (await runtime.pageTargetIds(firstId)).slice().sort();
+    const observation = await runtime.runProfileCardObserved(firstId, firstHwnd);
+    const targetsAfter = (await runtime.pageTargetIds(firstId)).slice().sort();
+    if (JSON.stringify(targetsAfter) !== JSON.stringify(targetsBefore)) {
+      throw new Error("profile-card operation changed the page targets for a minimized window");
+    }
+    await waitForNativeWindowState(
+      runtime.nativeWindows,
+      (snapshot) => snapshot.windows[firstId]?.hwnd === firstHwnd
+        && snapshot.windows[firstId]?.visible === true
+        && snapshot.windows[firstId]?.minimized === true
+        && snapshot.windows[secondId]?.hwnd === secondHwnd
+        && snapshot.windows[secondId]?.visible === true,
+      "profile-card operation restored or replaced the minimized native window",
+    );
+    if (observation.createdPageTargetIds.length > 0) {
+      throw new Error("profile-card operation created a page target while the window was minimized");
+    }
+    if (!observation.nativeWindowStayedMinimized) {
+      throw new Error("profile-card operation transiently restored the minimized native window");
+    }
+    runtime.reportStage?.("profile_card_observed");
+
+    const backgroundPageObservation = await runtime.runBackgroundPageObserved(firstId, firstHwnd);
+    const targetsAfterBackgroundPage = (await runtime.pageTargetIds(firstId)).slice().sort();
+    if (JSON.stringify(targetsAfterBackgroundPage) !== JSON.stringify(targetsAfter)) {
+      throw new Error("background page operation left a page target for a minimized window");
+    }
+    await waitForNativeWindowState(
+      runtime.nativeWindows,
+      (snapshot) => snapshot.windows[firstId]?.hwnd === firstHwnd
+        && snapshot.windows[firstId]?.visible === true
+        && snapshot.windows[firstId]?.minimized === true
+        && snapshot.windows[secondId]?.hwnd === secondHwnd
+        && snapshot.windows[secondId]?.visible === true,
+      "background page operation restored or replaced the minimized native window",
+    );
+    if (backgroundPageObservation.createdPageTargetIds.length !== 1) {
+      throw new Error("background page operation did not observe exactly one created page target");
+    }
+    if (
+      backgroundPageObservation.destroyedPageTargetIds.length !== 1
+      || backgroundPageObservation.destroyedPageTargetIds[0]
+        !== backgroundPageObservation.createdPageTargetIds[0]
+    ) {
+      throw new Error("background page operation did not observe its page target being destroyed");
+    }
+    if (!backgroundPageObservation.nativeWindowStayedMinimized) {
+      throw new Error("background page operation transiently restored the minimized native window");
+    }
+    runtime.reportStage?.("background_page_observed");
+
+    const captureObservation = await runtime.runSessionCaptureObserved(firstId, firstHwnd);
+    const targetsAfterCapture = (await runtime.pageTargetIds(firstId)).slice().sort();
+    if (JSON.stringify(targetsAfterCapture) !== JSON.stringify(targetsAfterBackgroundPage)) {
+      throw new Error("session capture changed the page targets for a minimized window");
+    }
+    await waitForNativeWindowState(
+      runtime.nativeWindows,
+      (snapshot) => snapshot.windows[firstId]?.hwnd === firstHwnd
+        && snapshot.windows[firstId]?.visible === true
+        && snapshot.windows[firstId]?.minimized === true
+        && snapshot.windows[secondId]?.hwnd === secondHwnd
+        && snapshot.windows[secondId]?.visible === true,
+      "session capture restored or replaced the minimized native window",
+    );
+    if (captureObservation.createdPageTargetIds.length > 0) {
+      throw new Error("session capture created a page target while the window was minimized");
+    }
+    if (!captureObservation.nativeWindowStayedMinimized) {
+      throw new Error("session capture transiently restored the minimized native window");
+    }
+    runtime.reportStage?.("session_capture_observed");
+
+    await runtime.bringToFront(firstId);
+    await waitForNativeWindowState(
+      runtime.nativeWindows,
+      (snapshot) => snapshot.foregroundHwnd === firstHwnd
+        && snapshot.windows[firstId]?.hwnd === firstHwnd
+        && snapshot.windows[firstId]?.visible === true
+        && snapshot.windows[firstId]?.minimized === false
+        && snapshot.windows[secondId]?.hwnd === secondHwnd
+        && snapshot.windows[secondId]?.visible === true
+        && snapshot.foregroundHwnd !== secondHwnd,
+      "Bring to front did not select only the first managed window",
+    );
+    runtime.reportStage?.("first_window_raised");
+
+    await runtime.bringToFront(secondId);
+    await waitForNativeWindowState(
+      runtime.nativeWindows,
+      (snapshot) => snapshot.foregroundHwnd === secondHwnd
+        && snapshot.windows[firstId]?.hwnd === firstHwnd
+        && snapshot.windows[firstId]?.visible === true
+        && snapshot.windows[secondId]?.hwnd === secondHwnd
+        && snapshot.windows[secondId]?.visible === true
+        && snapshot.windows[secondId]?.minimized === false
+        && snapshot.foregroundHwnd !== firstHwnd,
+      "Bring to front did not select only the second managed window",
+    );
+    runtime.reportStage?.("second_window_raised");
+  } catch (error) {
+    failure = error;
+  } finally {
+    for (const profileId of opened.reverse()) {
+      try {
+        await runtime.close(profileId);
+      } catch (error) {
+        cleanupFailure ??= error;
+      }
+    }
+  }
+  if (failure !== undefined) throw failure;
+  if (cleanupFailure !== undefined) throw cleanupFailure;
+}
+
+function cloudCloseHasSync(
+  result: CloudBrowserCloseResult,
+  sync: "complete" | "pending" | "conflict",
+): boolean {
+  return result.closed && result.sync === sync;
+}
+
+export interface CloudLauncherSmokeRuntime {
+  coordinator: Pick<CloudBrowserCoordinator, "open" | "close" | "releaseAll">;
+  launcher: Pick<Launcher, "active" | "stop">;
+  store: Pick<ProfileStore, "getLaunch">;
+}
+
+export async function exerciseCloudLauncherSmoke(
+  runtime: CloudLauncherSmokeRuntime,
+  profileId = "ghosteranti-cloud-smoke",
+  launchArgs: string[] = [],
+): Promise<void> {
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const opened = await runtime.coordinator.open(profileId, launchArgs);
+    if (!opened.ok) throw new Error(opened.error ?? "Cloud launcher smoke could not open the profile");
+    if (!await runtime.launcher.active(profileId)) {
+      throw new Error("Cloud launcher smoke browser was not alive after restore");
+    }
+    if (!runtime.store.getLaunch(profileId)) {
+      throw new Error("Cloud launcher smoke lost durable launch ownership");
+    }
+    const closed = await runtime.coordinator.close(profileId);
+    if (!cloudCloseHasSync(closed, "complete")) {
+      throw new Error("Cloud launcher smoke could not close the profile safely");
+    }
+    if (await runtime.launcher.active(profileId)) {
+      throw new Error("Cloud launcher smoke browser survived confirmed close");
+    }
+    if (runtime.store.getLaunch(profileId)) {
+      throw new Error("Cloud launcher smoke retained a launch after confirmed close");
+    }
+  }
+}
+
+type CloudLauncherSmokeProxy = {
+  profileProxy: NonNullable<Profile["proxy"]>;
+  startupUrl?: string;
+  assertComplete?(): void;
+  close?(): void;
+};
+
+const PROXY_MISMATCH_URL = "http://cloud-open.invalid/ok";
+
+/**
+ * Local authenticated upstream used only by the compiled acceptance command.
+ * It rejects every HTTPS tunnel, so the old Node TLS precheck fails, while the
+ * real Chromium HTTP request succeeds through GhosterAnti's credential relay.
+ */
+async function startProxyMismatchFixture(): Promise<CloudLauncherSmokeProxy> {
+  const expectedAuth = `Basic ${Buffer.from("ghosteranti-smoke:ghosteranti-smoke").toString("base64")}`;
+  let targetRequests = 0;
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    let input = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+      input = Buffer.concat([input, typeof chunk === "string" ? Buffer.from(chunk) : chunk]);
+      const end = input.indexOf("\r\n\r\n");
+      if (end === -1) return;
+      const head = input.subarray(0, end).toString("latin1");
+      const lines = head.split("\r\n");
+      const requestLine = lines[0] ?? "";
+      const auth = lines.find((line) => /^proxy-authorization:/i.test(line))
+        ?.replace(/^proxy-authorization:\s*/i, "");
+      if (auth !== expectedAuth) {
+        socket.end("HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\n\r\n");
+      } else if (/^CONNECT\s/i.test(requestLine)) {
+        socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+      } else if (requestLine.startsWith(`GET ${PROXY_MISMATCH_URL} `)) {
+        targetRequests++;
+        socket.end(
+          "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+      } else {
+        socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      }
+    });
+    socket.on("error", () => socket.destroy());
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.removeListener("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("proxy mismatch fixture did not bind a loopback port");
+  }
+  return {
+    profileProxy: {
+      type: "http",
+      host: "127.0.0.1",
+      port: String(address.port),
+      user: "ghosteranti-smoke",
+      pass: "ghosteranti-smoke",
+    },
+    startupUrl: PROXY_MISMATCH_URL,
+    assertComplete() {
+      if (targetRequests < 3) throw new Error("browser proxy mismatch smoke did not reach its target on every cycle");
+    },
+    close() {
+      for (const socket of sockets) socket.destroy();
+      server.close();
+    },
+  };
+}
+
+function cloudLauncherSmokeProxy(
+  rest: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): CloudLauncherSmokeProxy | null {
+  const type = flag(rest, "proxy-type");
+  if (!type) return null;
+  if (type !== "http" && type !== "socks5") {
+    throw new Error("Cloud launcher smoke proxy type must be http or socks5");
+  }
+  const host = env.GHOSTERANTI_LIVE_PROXY_HOST?.trim() ?? "";
+  const port = env.GHOSTERANTI_LIVE_PROXY_PORT?.trim() ?? "";
+  const user = env.GHOSTERANTI_LIVE_PROXY_USER ?? "";
+  const pass = env.GHOSTERANTI_LIVE_PROXY_PASS ?? "";
+  if (!host || !port || !user || !pass) {
+    throw new Error("Cloud launcher smoke proxy environment is incomplete");
+  }
+  return {
+    profileProxy: { type, host, port, user, pass },
+    startupUrl: resolveEgressEndpoints()[0],
+  };
+}
+
+const WINDOWS_ACCEPTANCE_PROFILE_IDS = [
+  "ghosteranti-window-smoke-one",
+  "ghosteranti-window-smoke-two",
+] as const;
+
+function windowsAcceptanceWindowMarker(profileId: string): string {
+  return `ghosteranti-window-acceptance:${profileId}`;
+}
+
+function smokeProfile(
+  id: string,
+  name: string,
+  fingerprintSeed: number,
+  proxy: Profile["proxy"] = null,
+): Profile {
+  return {
+    id,
+    accId: "",
+    name,
+    group: "",
+    platform: "",
+    username: "",
+    password: "",
+    email: "",
+    emailPassword: "",
+    twofa: "",
+    proxy,
+    extensions: [],
+    tags: [],
+    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
+    timezone: "UTC",
+    screenWidth: 1280,
+    screenHeight: 720,
+    fingerprintSeed,
+    cookies: [],
+    seeded: false,
+  };
+}
+
+async function runPowerShellAcceptance(script: string): Promise<string> {
+  const child = Bun.spawn(
+    ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+    { stdout: "pipe", stderr: "ignore" },
+  );
+  const result = await readSnapshotChildBounded(
+    child as unknown as { stdout: ReadableStream<Uint8Array>; exited: Promise<number>; kill(): unknown },
+    10_000,
+  );
+  if (!result) throw new Error("native Windows acceptance helper timed out");
+  if (result.exitCode !== 0) throw new Error("native Windows acceptance helper failed");
+  return result.raw;
+}
+
+const WINDOWS_NATIVE_TYPE = String.raw`
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class GhosterAntiWindowAcceptanceNative {
+  private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+  [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+  [DllImport("user32.dll")] private static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  private delegate void WinEventProc(IntPtr hook, uint eventType, IntPtr hWnd, int objectId, int childId, uint threadId, uint eventTime);
+  [StructLayout(LayoutKind.Sequential)] private struct NativePoint { public int x; public int y; }
+  [StructLayout(LayoutKind.Sequential)] private struct NativeMessage {
+    public IntPtr hWnd;
+    public uint message;
+    public UIntPtr wParam;
+    public IntPtr lParam;
+    public uint time;
+    public NativePoint point;
+    public uint privateValue;
+  }
+  [DllImport("user32.dll")] private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr module, WinEventProc callback, uint processId, uint threadId, uint flags);
+  [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool UnhookWinEvent(IntPtr hook);
+  [DllImport("user32.dll")] private static extern int GetMessage(out NativeMessage message, IntPtr hWnd, uint filterMin, uint filterMax);
+  [DllImport("user32.dll")] private static extern void PostQuitMessage(int exitCode);
+  private static IntPtr monitoredWindow;
+  private static WinEventProc monitorCallback;
+  public static void MonitorMinimized(long windowValue) {
+    monitoredWindow = new IntPtr(windowValue);
+    monitorCallback = delegate(IntPtr _, uint eventType, IntPtr hWnd, int _objectId, int _childId, uint _threadId, uint _eventTime) {
+      if (eventType == 0x0017 && hWnd == monitoredWindow) {
+        Console.WriteLine("restored");
+        Console.Out.Flush();
+        PostQuitMessage(0);
+      }
+    };
+    IntPtr hook = SetWinEventHook(0x0017, 0x0017, IntPtr.Zero, monitorCallback, 0, 0, 0);
+    if (hook == IntPtr.Zero) throw new InvalidOperationException("native minimized-state event hook failed");
+    try {
+      if (!IsIconic(monitoredWindow)) {
+        Console.WriteLine("restored");
+        Console.Out.Flush();
+        return;
+      }
+      Console.WriteLine("ready");
+      Console.Out.Flush();
+      NativeMessage message;
+      while (GetMessage(out message, IntPtr.Zero, 0, 0) > 0) {}
+    } finally {
+      UnhookWinEvent(hook);
+    }
+  }
+  public static long[] TopLevelWindows() {
+    var windows = new List<long>();
+    EnumWindows(delegate(IntPtr hWnd, IntPtr _) {
+      windows.Add(hWnd.ToInt64());
+      return true;
+    }, IntPtr.Zero);
+    return windows.ToArray();
+  }
+  public static string WindowTitle(long windowValue) {
+    var hWnd = new IntPtr(windowValue);
+    int length = GetWindowTextLength(hWnd);
+    if (length <= 0) return "";
+    var title = new StringBuilder(length + 1);
+    return GetWindowText(hWnd, title, title.Capacity) > 0 ? title.ToString() : "";
+  }
+}`;
+
+async function readWindowsNativeWindows(
+  profiles: Array<{ profileId: string; marker: string }>,
+): Promise<WindowsNativeWindowSnapshot> {
+  const encoded = Buffer.from(JSON.stringify(profiles), "utf8").toString("base64");
+  const script = `
+Add-Type -TypeDefinition @'
+${WINDOWS_NATIVE_TYPE}
+'@
+$entries = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')) | ConvertFrom-Json
+$topLevelWindows = @(
+  [GhosterAntiWindowAcceptanceNative]::TopLevelWindows() | ForEach-Object {
+    $handle = [long]$_
+    [pscustomobject]@{
+      hwnd = $handle
+      title = [GhosterAntiWindowAcceptanceNative]::WindowTitle($handle)
+      minimized = [GhosterAntiWindowAcceptanceNative]::IsIconic([IntPtr]$handle)
+      visible = [GhosterAntiWindowAcceptanceNative]::IsWindowVisible([IntPtr]$handle)
+    }
+  }
+)
+$rows = @(
+  foreach ($entry in $entries) {
+    foreach ($window in $topLevelWindows) {
+      if ($window.title.IndexOf([string]$entry.marker, [StringComparison]::Ordinal) -ge 0) {
+        [pscustomobject]@{
+          profileId = [string]$entry.profileId
+          hwnd = [long]$window.hwnd
+          minimized = [bool]$window.minimized
+          visible = [bool]$window.visible
+        }
+      }
+    }
+  }
+)
+[pscustomobject]@{
+  foregroundHwnd = [GhosterAntiWindowAcceptanceNative]::GetForegroundWindow().ToInt64()
+  windows = $rows
+} | ConvertTo-Json -Compress -Depth 4
+`;
+  const raw = await runPowerShellAcceptance(script);
+  const parsed = JSON.parse(raw) as {
+    foregroundHwnd?: unknown;
+    windows?: Array<{
+      profileId?: unknown;
+      hwnd?: unknown;
+      minimized?: unknown;
+      visible?: unknown;
+    }>;
+  };
+  const candidates: WindowsNativeWindowCandidate[] = [];
+  for (const row of Array.isArray(parsed.windows) ? parsed.windows : []) {
+    if (
+      typeof row.profileId === "string"
+      && Number.isSafeInteger(row.hwnd)
+      && typeof row.minimized === "boolean"
+      && typeof row.visible === "boolean"
+    ) {
+      candidates.push({
+        profileId: row.profileId,
+        hwnd: Number(row.hwnd),
+        minimized: row.minimized,
+        visible: row.visible,
+      });
+    }
+  }
+  return {
+    foregroundHwnd: Number.isSafeInteger(parsed.foregroundHwnd) ? Number(parsed.foregroundHwnd) : 0,
+    windows: mapWindowsNativeWindowCandidates(
+      profiles.map(({ profileId }) => profileId),
+      candidates,
+    ),
+  };
+}
+
+async function minimizeWindowsHwnd(hwnd: number): Promise<void> {
+  if (!Number.isSafeInteger(hwnd) || hwnd <= 0) throw new Error("native CloakBrowser HWND is unavailable");
+  const script = `
+Add-Type -TypeDefinition @'
+${WINDOWS_NATIVE_TYPE}
+'@
+[void][GhosterAntiWindowAcceptanceNative]::ShowWindowAsync([IntPtr]${hwnd}, 6)
+`;
+  await runPowerShellAcceptance(script);
+}
+
+async function observeNativeMinimized<T>(
+  hwnd: number,
+  operation: () => Promise<T>,
+): Promise<{ value: T; stayedMinimized: boolean }> {
+  if (!Number.isSafeInteger(hwnd) || hwnd <= 0) throw new Error("native CloakBrowser HWND is unavailable");
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+${WINDOWS_NATIVE_TYPE}
+'@
+[GhosterAntiWindowAcceptanceNative]::MonitorMinimized(${hwnd})
+`;
+  const child = Bun.spawn(
+    ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+    { stdout: "pipe", stderr: "ignore" },
+  );
+  let ready = false;
+  let stayedMinimized = true;
+  let stopRequested = false;
+  let watcherFailure: Error | undefined;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const readyPromise = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const monitor = (async () => {
+    const reader = child.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffered += decoder.decode(value, { stream: true });
+        for (let newline = buffered.indexOf("\n"); newline !== -1; newline = buffered.indexOf("\n")) {
+          const line = buffered.slice(0, newline).trim();
+          buffered = buffered.slice(newline + 1);
+          if (line === "ready" && !ready) {
+            ready = true;
+            resolveReady();
+          } else if (line === "restored") {
+            stayedMinimized = false;
+            if (!ready) rejectReady(new Error("native minimized-state observation could not be armed"));
+          }
+        }
+      }
+    } catch {
+      watcherFailure = new Error("native minimized-state observation failed");
+      if (!ready) rejectReady(watcherFailure);
+    } finally {
+      reader.releaseLock();
+      if (!stopRequested && stayedMinimized) {
+        watcherFailure = new Error("native minimized-state observer exited early");
+        if (!ready) rejectReady(watcherFailure);
+      }
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let value!: T;
+  try {
+    await Promise.race([
+      readyPromise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("native minimized-state observer did not become ready")), 10_000);
+      }),
+    ]);
+    value = await operation();
+  } finally {
+    if (timer) clearTimeout(timer);
+    stopRequested = true;
+    try { child.kill(); } catch {}
+    await child.exited.catch(() => undefined);
+    await monitor;
+  }
+  if (watcherFailure) throw watcherFailure;
+  return { value, stayedMinimized };
+}
+
+async function cdpPageTargetIds(port: number): Promise<string[]> {
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error("managed CloakBrowser target list is unavailable");
+  const targets = await response.json();
+  if (!Array.isArray(targets)) throw new Error("managed CloakBrowser target list is invalid");
+  const pages = targets.filter((target) => target?.type === "page");
+  const ids = pages
+    .map((target) => target?.id)
+    .filter((id): id is string => typeof id === "string" && !!id)
+    .sort();
+  if (ids.length !== pages.length) {
+    throw new Error("managed CloakBrowser page target identity is invalid");
+  }
+  return ids;
+}
+
+async function cdpUserPageUrls(port: number): Promise<string[]> {
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error("managed CloakBrowser target list is unavailable");
+  const targets = await response.json();
+  if (!Array.isArray(targets)) throw new Error("managed CloakBrowser target list is invalid");
+  return targets.flatMap((target) => {
+    if (target?.type !== "page" || typeof target.url !== "string") return [];
+    const url = canonicalUserPageUrl(target.url);
+    return url ? [url] : [];
+  }).sort();
+}
+
+async function waitForWindowsAcceptanceTabs(port: number, expected: readonly string[]): Promise<void> {
+  const wanted = [...expected].sort();
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    try {
+      const actual = await cdpUserPageUrls(port);
+      if (JSON.stringify(actual) === JSON.stringify(wanted)) return;
+    } catch {}
+    await Bun.sleep(250);
+  }
+  throw new Error("clean-close tab restoration did not return the exact saved user pages");
+}
+
+async function runWindowsWindowAcceptance(paths: StatePaths, rest: string[]): Promise<void> {
+  if (process.platform !== "win32") {
+    throw new Error("Windows window acceptance requires Windows");
+  }
+  const store = new ProfileStore(paths.cloudDatabase);
+  const searchProviderResults = new Map<string, SearchProviderSetupResult>();
+  const launcher = makeLauncher(
+    store,
+    rest,
+    true,
+    paths.cloudProfiles,
+    async (options) => {
+      const result = await ensureDuckDuckGoDefault(options);
+      searchProviderResults.set(options.userDataDir, result);
+      return result;
+    },
+  );
+  const [firstId, secondId] = WINDOWS_ACCEPTANCE_PROFILE_IDS;
+  const tabServer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      const profileId = url.searchParams.get("profile") ?? "";
+      const title = WINDOWS_ACCEPTANCE_PROFILE_IDS.includes(profileId as typeof firstId)
+        ? windowsAcceptanceWindowMarker(profileId)
+        : "GhosterAnti window acceptance";
+      return new Response(`<!doctype html><title>${title}</title><main>${url.pathname}</main>`, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    },
+  });
+  const tabOrigin = `http://127.0.0.1:${tabServer.port}`;
+  const initialPageUrl = (profileId: string) =>
+    `${tabOrigin}/window?profile=${encodeURIComponent(profileId)}`;
+  const restoredTabs = ["one", "two", "three"].map((name) =>
+    `${tabOrigin}/tabs/${name}?profile=${encodeURIComponent(firstId)}`
+  );
+  store.upsertProfiles([
+    {
+      ...smokeProfile(firstId, windowsAcceptanceWindowMarker(firstId), 101),
+      platform: "x.com",
+    },
+    smokeProfile(secondId, windowsAcceptanceWindowMarker(secondId), 202),
+  ]);
+  const launch = (profileId: string) => {
+    const value = store.getLaunch(profileId);
+    if (!value) throw new Error(`managed CloakBrowser launch is missing for ${profileId}`);
+    return value;
+  };
+  const nativeWindows = () => readWindowsNativeWindows(
+    WINDOWS_ACCEPTANCE_PROFILE_IDS.map((profileId) => ({
+      profileId,
+      marker: windowsAcceptanceWindowMarker(profileId),
+    })),
+  );
+
+  try {
+    await launcher.reconcileOrphans();
+    for (const profileId of WINDOWS_ACCEPTANCE_PROFILE_IDS) {
+      if (store.getLaunch(profileId) && !await launcher.stop(profileId)) {
+        throw new Error(`managed CloakBrowser pre-acceptance cleanup was not confirmed for ${profileId}`);
+      }
+      rmSync(launcher.userDataDir(profileId), { recursive: true, force: true });
+    }
+    await exerciseWindowsWindowAcceptance({
+      profileIds: WINDOWS_ACCEPTANCE_PROFILE_IDS,
+      async open(profileId) {
+        const opened = await launcher.start(profileId, [], {
+          autoNavigate: false,
+          restoreLastSession: false,
+        });
+        await launcher.navigate(opened.ws, [initialPageUrl(profileId)]);
+      },
+      async verifySearchProvider(profileId) {
+        const result = searchProviderResults.get(launcher.userDataDir(profileId));
+        if (
+          !result
+          || (result.status !== "configured" && result.status !== "already-default")
+          || !result.engine.toLowerCase().includes("duckduckgo")
+        ) {
+          throw new Error(`DuckDuckGo launch-time setup was not confirmed for ${profileId}`);
+        }
+      },
+      async verifyTabsRestored() {
+        const first = launch(firstId);
+        const second = launch(secondId);
+        await launcher.navigate(first.ws, restoredTabs, true);
+        await waitForWindowsAcceptanceTabs(first.debugPort, restoredTabs);
+        if (!await launcher.stop(firstId)) {
+          throw new Error(`managed CloakBrowser clean close was not confirmed for ${firstId}`);
+        }
+        const reopened = await launcher.start(firstId, [], {
+          restoreLastSession: true,
+        });
+        await waitForWindowsAcceptanceTabs(reopened.port, restoredTabs);
+        const currentSecond = launch(secondId);
+        if (
+          currentSecond.debugPort !== second.debugPort
+          || currentSecond.startedAt !== second.startedAt
+          || !await launcher.active(secondId)
+        ) {
+          throw new Error("clean-close tab restoration changed the independent acceptance profile");
+        }
+      },
+      async close(profileId) {
+        if (!await launcher.stop(profileId)) {
+          throw new Error(`managed CloakBrowser cleanup was not confirmed for ${profileId}`);
+        }
+      },
+      nativeWindows,
+      async minimize(profileId) {
+        const snapshot = await nativeWindows();
+        await minimizeWindowsHwnd(snapshot.windows[profileId]?.hwnd ?? 0);
+      },
+      async pageTargetIds(profileId) {
+        return cdpPageTargetIds(launch(profileId).debugPort);
+      },
+      async runProfileCardObserved(profileId, hwnd) {
+        const observed = await observeNativeMinimized(hwnd, () => runPlaywrightWorker<{
+          createdPageTargetIds?: unknown;
+        }>("profile-card", {
+          endpoint: launch(profileId).ws,
+          url: "http://127.0.0.1/ghosteranti-window-acceptance",
+          connectTimeoutMs: 30_000,
+        }));
+        const created = observed.value?.createdPageTargetIds;
+        if (!Array.isArray(created) || created.some((targetId) => typeof targetId !== "string" || !targetId)) {
+          throw new Error("profile-card target observation returned an invalid result");
+        }
+        return {
+          createdPageTargetIds: created,
+          nativeWindowStayedMinimized: observed.stayedMinimized,
+        };
+      },
+      async runBackgroundPageObserved(profileId, hwnd) {
+        const observed = await observeNativeMinimized(hwnd, () => runPlaywrightWorker<{
+          createdPageTargetIds?: unknown;
+          destroyedPageTargetIds?: unknown;
+        }>("profile-card", {
+          endpoint: launch(profileId).ws,
+          url: "about:blank",
+          temporary: true,
+          connectTimeoutMs: 30_000,
+        }));
+        const created = observed.value?.createdPageTargetIds;
+        const destroyed = observed.value?.destroyedPageTargetIds;
+        if (
+          !Array.isArray(created)
+          || created.some((targetId) => typeof targetId !== "string" || !targetId)
+          || !Array.isArray(destroyed)
+          || destroyed.some((targetId) => typeof targetId !== "string" || !targetId)
+        ) {
+          throw new Error("background page target observation returned an invalid result");
+        }
+        return {
+          createdPageTargetIds: created,
+          destroyedPageTargetIds: destroyed,
+          nativeWindowStayedMinimized: observed.stayedMinimized,
+        };
+      },
+      async runSessionCaptureObserved(profileId, hwnd) {
+        const endpoint = launch(profileId).ws;
+        const before = await cdpPageTargetIds(launch(profileId).debugPort);
+        const captureOrigin = "https://ghosteranti-window-acceptance.invalid";
+        const observed = await observeNativeMinimized(hwnd, () => runPlaywrightWorker<string>(
+          "session-capture",
+          {
+            endpoint,
+            captureSeed: { origins: [captureOrigin] },
+            connectTimeoutMs: 30_000,
+          },
+        ));
+        const captured = parseCapturedSessionBundle(observed.value);
+        if (!captured.origins.some((origin) => origin.origin === captureOrigin)) {
+          throw new Error("session capture omitted the closed acceptance origin");
+        }
+        const priorTargets = new Set(before);
+        const after = await cdpPageTargetIds(launch(profileId).debugPort);
+        return {
+          createdPageTargetIds: after.filter((targetId) => !priorTargets.has(targetId)),
+          nativeWindowStayedMinimized: observed.stayedMinimized,
+        };
+      },
+      async bringToFront(profileId) {
+        await launcher.bringToFront(profileId);
+      },
+      reportStage(stage) {
+        console.log(`[ghosteranti] installed window acceptance stage ${stage}`);
+      },
+    });
+  } finally {
+    for (const profileId of [...WINDOWS_ACCEPTANCE_PROFILE_IDS].reverse()) {
+      await launcher.stop(profileId).catch(() => false);
+    }
+    await tabServer.stop(true);
+    store.close();
+  }
+}
+
+interface CloudCrossDeviceSyntheticRuntime {
+  coordinator: CloudBrowserCoordinator;
+  store: ProfileStore;
+  queue: PendingSyncQueue;
+  calls: { start: number; stop: number; applySession: number; readSession: number };
+  appliedSessions: string[];
+  setSession(bundle: string): void;
+  close(): void;
+}
+
+function requireCloudCrossDevice(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(`Cloud cross-device acceptance failed: ${message}`);
+}
+
+function cloudCrossDeviceSentinel(bundle: string): string {
+  const parsed = JSON.parse(bundle) as { cookies?: Array<{ name?: unknown; value?: unknown }> };
+  const cookies = parsed.cookies?.filter((cookie) => cookie?.name === "ghosteranti_cross_device") ?? [];
+  if (cookies.length !== 1 || typeof cookies[0]?.value !== "string") {
+    throw new Error("Cloud cross-device acceptance received an invalid sentinel session");
+  }
+  return cookies[0].value;
+}
+
+function cloudCrossDeviceFixtureOrigin(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Cloud cross-device acceptance requires a loopback fixture URL");
+  }
+  if (
+    url.protocol !== "http:"
+    || url.hostname !== "127.0.0.1"
+    || !url.port
+    || url.username
+    || url.password
+    || url.pathname !== "/"
+    || url.search
+    || url.hash
+  ) {
+    throw new Error("Cloud cross-device acceptance requires a loopback fixture URL");
+  }
+  return url.origin;
+}
+
+async function cloudCrossDeviceControl<T>(
+  fixtureOrigin: string,
+  path: string,
+  method: "GET" | "POST" = "GET",
+): Promise<T> {
+  const response = await fetch(`${fixtureOrigin}${path}`, {
+    method,
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error(`Cloud cross-device fixture control failed at ${path}`);
+  return await response.json() as T;
+}
+
+function createCloudCrossDeviceSyntheticRuntime(
+  paths: StatePaths,
+  fixtureOrigin: string,
+  device: CloudCrossDeviceFixtureDevice,
+): CloudCrossDeviceSyntheticRuntime {
+  ensureStateDirectories(paths);
+  const store = new ProfileStore(paths.cloudDatabase);
+  const queue = new PendingSyncQueue(
+    paths.pendingSync,
+    new Uint8Array(32).fill(device === "a" ? 0xa1 : 0xb2),
+  );
+  const credential = CLOUD_CROSS_DEVICE_DEVICES[device];
+  const connection = new CloudConnectionRuntime({
+    baseUrl: fixtureOrigin,
+    accessToken: () => credential.accessToken,
+    installation: {
+      installationId: `fixture-installation-${device}`,
+      label: `Fixture device ${device.toUpperCase()}`,
+      platform: "windows",
+      appVersion: GHOSTERANTI_VERSION,
+    },
+  });
+  connection.restoreAccount(CLOUD_CROSS_DEVICE_ACCOUNT_ID);
+  connection.restoreDevice(credential.id, credential.credential);
+
+  const calls = { start: 0, stop: 0, applySession: 0, readSession: 0 };
+  const appliedSessions: string[] = [];
+  let sessionBundle = cloudCrossDeviceSession(CLOUD_CROSS_DEVICE_INITIAL_SENTINEL);
+  let generation = 0;
+  const launcher: CloudBrowserOptions["launcher"] = {
+    failedStartGeneration() { return undefined; },
+    matchesCloudSession() { return false; },
+    recordCloudSession() {},
+    async start(profileId, _launchArgs, options) {
+      calls.start++;
+      generation++;
+      const port = (device === "a" ? 31_000 : 32_000) + generation;
+      const startedAt = (device === "a" ? 100_000 : 200_000) + generation;
+      const ws = `ws://127.0.0.1:${port}/fixture-${device}-${generation}`;
+      store.recordLaunch({
+        profileId,
+        pid: port,
+        debugPort: port,
+        ws,
+        startedAt,
+        sessionBaseVersion: options?.sessionBaseVersion,
+        userDataDir: join(paths.cloudProfiles, profileId),
+      });
+      return { ws, port };
+    },
+    async stop(profileId) {
+      calls.stop++;
+      store.clearLaunch(profileId);
+      return true;
+    },
+    async active(profileId) {
+      return !!store.getLaunch(profileId);
+    },
+    async hasPageTargets(profileId) {
+      return !!store.getLaunch(profileId);
+    },
+    async verifyRunningIdentity(profileId) {
+      if (!store.getLaunch(profileId)) throw new Error("synthetic browser generation is missing");
+    },
+    async reconcileOrphan(profileId, expected) {
+      const launch = store.getLaunch(profileId);
+      if (!launch) return "dead";
+      return launch.debugPort === expected.debugPort && launch.startedAt === expected.startedAt
+        ? "alive"
+        : "generation_changed";
+    },
+    browserStorageWatchPaths() {
+      return [];
+    },
+  };
+  const coordinator = new CloudBrowserCoordinator({
+    cloud: connection.client,
+    launcher,
+    store,
+    queue: () => queue,
+    accountId: () => connection.accountId(),
+    deviceId: () => connection.deviceId(),
+    async readSession() {
+      calls.readSession++;
+      return sessionBundle;
+    },
+    async applySession(_endpoint, bundle) {
+      calls.applySession++;
+      sessionBundle = bundle;
+      appliedSessions.push(bundle);
+    },
+    heartbeatMs: 0,
+    storageCheckpoints: false,
+  });
+
+  return {
+    coordinator,
+    store,
+    queue,
+    calls,
+    appliedSessions,
+    setSession(bundle) { sessionBundle = bundle; },
+    close() {
+      store.clearLaunch(CLOUD_CROSS_DEVICE_PROFILE_ID);
+      queue.close();
+      store.close();
+    },
+  };
+}
+
+async function assertCloudCrossDeviceQueueEncryption(
+  path: string,
+  sentinels: readonly string[],
+): Promise<void> {
+  requireCloudCrossDevice(existsSync(path), "pending queue artifact is missing");
+  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+    if (!existsSync(candidate)) continue;
+    const bytes = readFileSync(candidate);
+    for (const sentinel of sentinels) {
+      requireCloudCrossDevice(
+        !bytes.includes(Buffer.from(sentinel, "utf8")),
+        `pending queue artifact exposed ${sentinel}`,
+      );
+    }
+  }
+}
+
+export async function runCloudCrossDeviceAcceptance(
+  paths: StatePaths,
+  fixtureUrl: string,
+): Promise<CloudCrossDeviceFixtureState> {
+  const fixtureOrigin = cloudCrossDeviceFixtureOrigin(fixtureUrl);
+  const deviceARoot = join(paths.root, "device-a");
+  const deviceBRoot = join(paths.root, "device-b");
+  requireCloudCrossDevice(
+    !existsSync(deviceARoot) && !existsSync(deviceBRoot),
+    "isolated device roots must be clean",
+  );
+  const deviceAPaths = statePaths(deviceARoot);
+  const deviceBPaths = statePaths(deviceBRoot);
+  const deviceA = createCloudCrossDeviceSyntheticRuntime(deviceAPaths, fixtureOrigin, "a");
+  const deviceB = createCloudCrossDeviceSyntheticRuntime(deviceBPaths, fixtureOrigin, "b");
+  let finalState: CloudCrossDeviceFixtureState | undefined;
+
+  try {
+    const openedA = await deviceA.coordinator.open(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(openedA.ok, openedA.error ?? "device A did not open version 37");
+    requireCloudCrossDevice(
+      deviceA.store.getLaunch(CLOUD_CROSS_DEVICE_PROFILE_ID)?.sessionBaseVersion === 37,
+      "device A did not commit version 37",
+    );
+
+    const rejectedB = await deviceB.coordinator.open(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(
+      !rejectedB.ok,
+      "device B did not receive profile_open",
+    );
+    requireCloudCrossDevice(
+      JSON.stringify(deviceB.calls) === JSON.stringify({ start: 0, stop: 0, applySession: 0, readSession: 0 }),
+      "device B launched local lifecycle work after profile_open",
+    );
+    requireCloudCrossDevice(
+      !deviceB.store.getProfile(CLOUD_CROSS_DEVICE_PROFILE_ID)
+        && !deviceB.store.getLaunch(CLOUD_CROSS_DEVICE_PROFILE_ID)
+        && deviceB.queue.list(CLOUD_CROSS_DEVICE_ACCOUNT_ID).length === 0
+        && deviceB.queue.listOpens(CLOUD_CROSS_DEVICE_ACCOUNT_ID).length === 0,
+      "device B retained local state after profile_open",
+    );
+
+    deviceA.setSession(cloudCrossDeviceSession(CLOUD_CROSS_DEVICE_A_SENTINEL));
+    const closedA = await deviceA.coordinator.close(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(
+      cloudCloseHasSync(closedA, "complete"),
+      "device A version 37 close was not accepted",
+    );
+    let state = await cloudCrossDeviceControl<CloudCrossDeviceFixtureState>(fixtureOrigin, "/control/state");
+    requireCloudCrossDevice(state.version === 38 && state.activeDevice === null, "device A did not publish version 38");
+
+    const openedB = await deviceB.coordinator.open(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(openedB.ok, openedB.error ?? "device B did not open version 38");
+    requireCloudCrossDevice(
+      deviceB.store.getLaunch(CLOUD_CROSS_DEVICE_PROFILE_ID)?.sessionBaseVersion === 38
+        && cloudCrossDeviceSentinel(deviceB.appliedSessions.at(-1)!) === CLOUD_CROSS_DEVICE_A_SENTINEL,
+      "device B did not restore device A's exact sentinel at version 38",
+    );
+    const closedB = await deviceB.coordinator.close(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(
+      cloudCloseHasSync(closedB, "complete"),
+      "device B version 38 close was not accepted",
+    );
+
+    const staleA = await deviceA.coordinator.open(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(staleA.ok, staleA.error ?? "device A did not reopen before the conflict");
+    deviceA.setSession(cloudCrossDeviceSession(CLOUD_CROSS_DEVICE_CONFLICT_SENTINEL));
+    await cloudCrossDeviceControl(fixtureOrigin, "/control/advance", "POST");
+    const conflictedA = await deviceA.coordinator.close(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(
+      cloudCloseHasSync(conflictedA, "conflict"),
+      "device A stale close did not remain a terminal conflict",
+    );
+    const conflictSummary = deviceA.queue.list(CLOUD_CROSS_DEVICE_ACCOUNT_ID)
+      .find((pending) => pending.status === "conflict");
+    const conflict = conflictSummary
+      ? deviceA.queue.get(conflictSummary.id, CLOUD_CROSS_DEVICE_ACCOUNT_ID)
+      : null;
+    requireCloudCrossDevice(
+      !!conflict
+        && cloudCrossDeviceSentinel(JSON.stringify(conflict.payload.session)) === CLOUD_CROSS_DEVICE_CONFLICT_SENTINEL,
+      "device A conflict snapshot was not preserved and decryptable",
+    );
+
+    const latestB = await deviceB.coordinator.open(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(latestB.ok, latestB.error ?? "device B did not open the authoritative version");
+    requireCloudCrossDevice(
+      deviceB.store.getLaunch(CLOUD_CROSS_DEVICE_PROFILE_ID)?.sessionBaseVersion === 40
+        && cloudCrossDeviceSentinel(deviceB.appliedSessions.at(-1)!) === CLOUD_CROSS_DEVICE_LATEST_SENTINEL,
+      "device B did not restore the authoritative version beside device A's conflict",
+    );
+    const closedLatestB = await deviceB.coordinator.close(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(
+      cloudCloseHasSync(closedLatestB, "complete"),
+      "device B authoritative close was not accepted",
+    );
+
+    const ambiguousA = await deviceA.coordinator.open(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(
+      ambiguousA.ok,
+      ambiguousA.error ?? "device A terminal conflict blocked reopen",
+    );
+    requireCloudCrossDevice(
+      deviceA.store.getLaunch(CLOUD_CROSS_DEVICE_PROFILE_ID)?.sessionBaseVersion === 41,
+      "device A did not open version 41",
+    );
+    deviceA.setSession(cloudCrossDeviceSession(CLOUD_CROSS_DEVICE_AMBIGUOUS_SENTINEL));
+    await cloudCrossDeviceControl(fixtureOrigin, "/control/drop-close-response", "POST");
+    const pendingA = await deviceA.coordinator.close(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(
+      cloudCloseHasSync(pendingA, "pending"),
+      "device A dropped close response was not retained as ambiguous",
+    );
+    const ambiguousSummary = deviceA.queue.list(CLOUD_CROSS_DEVICE_ACCOUNT_ID)
+      .find((pending) => pending.status === "retrying");
+    const ambiguous = ambiguousSummary
+      ? deviceA.queue.get(ambiguousSummary.id, CLOUD_CROSS_DEVICE_ACCOUNT_ID)
+      : null;
+    requireCloudCrossDevice(
+      !!ambiguous
+        && cloudCrossDeviceSentinel(JSON.stringify(ambiguous.payload.session)) === CLOUD_CROSS_DEVICE_AMBIGUOUS_SENTINEL,
+      "device A ambiguous snapshot was not preserved and decryptable",
+    );
+
+    const startsBeforeBlockedReopen = deviceA.calls.start;
+    state = await cloudCrossDeviceControl<CloudCrossDeviceFixtureState>(fixtureOrigin, "/control/state");
+    const opensBeforeBlockedReopen = state.counters.open.a;
+    const blockedA = await deviceA.coordinator.open(CLOUD_CROSS_DEVICE_PROFILE_ID);
+    requireCloudCrossDevice(
+      !blockedA.ok,
+      "device A ambiguous close did not block local reopen",
+    );
+    finalState = await cloudCrossDeviceControl<CloudCrossDeviceFixtureState>(fixtureOrigin, "/control/state");
+    requireCloudCrossDevice(
+      deviceA.calls.start === startsBeforeBlockedReopen
+        && finalState.counters.open.a === opensBeforeBlockedReopen,
+      "device A blocked reopen sent a new open request or launched a browser",
+    );
+    const retainedConflict = conflictSummary
+      ? deviceA.queue.get(conflictSummary.id, CLOUD_CROSS_DEVICE_ACCOUNT_ID)
+      : null;
+    const retainedAmbiguous = ambiguousSummary
+      ? deviceA.queue.get(ambiguousSummary.id, CLOUD_CROSS_DEVICE_ACCOUNT_ID)
+      : null;
+    requireCloudCrossDevice(
+      retainedConflict?.status === "conflict"
+        && cloudCrossDeviceSentinel(JSON.stringify(retainedConflict.payload.session)) === CLOUD_CROSS_DEVICE_CONFLICT_SENTINEL,
+      "device A conflict snapshot did not remain preserved",
+    );
+    requireCloudCrossDevice(
+      retainedAmbiguous?.status === "retrying"
+        && cloudCrossDeviceSentinel(JSON.stringify(retainedAmbiguous.payload.session)) === CLOUD_CROSS_DEVICE_AMBIGUOUS_SENTINEL,
+      "device A ambiguous snapshot did not remain preserved",
+    );
+    const expectedState: CloudCrossDeviceFixtureState = {
+      ok: true,
+      version: 42,
+      activeDevice: null,
+      counters: {
+        open: { a: 3, b: 3 },
+        close: { a: 4, b: 2 },
+        heartbeat: { a: 0, b: 0 },
+        abandon: { a: 0, b: 0 },
+        acceptedCloses: 4,
+        conflicts: 1,
+        profileOpen: 1,
+        droppedResponses: 2,
+      },
+    };
+    requireCloudCrossDevice(
+      JSON.stringify(finalState) === JSON.stringify(expectedState),
+      "fixture request counters were not exact",
+    );
+  } finally {
+    deviceB.close();
+    deviceA.close();
+  }
+
+  await assertCloudCrossDeviceQueueEncryption(deviceAPaths.pendingSync, [
+    CLOUD_CROSS_DEVICE_CONFLICT_SENTINEL,
+    CLOUD_CROSS_DEVICE_AMBIGUOUS_SENTINEL,
+  ]);
+  requireCloudCrossDevice(finalState, "fixture state was not recorded");
+  return finalState;
+}
+
+export function cloudLauncherSmokeEngine(rest: string[]): ProfileEngine {
+  const engine = flag(rest, "engine") ?? (has(rest, "engine") ? "" : "chromium");
+  if (engine !== "chromium" && engine !== "firefox") {
+    throw new Error("Cloud launcher smoke engine must be chromium or firefox");
+  }
+  return engine;
+}
+
+async function runCloudLauncherSmoke(paths: StatePaths, rest: string[]): Promise<void> {
+  if (has(rest, "windows-window-acceptance")) {
+    await runWindowsWindowAcceptance(paths, rest);
+    return;
+  }
+  const engine = cloudLauncherSmokeEngine(rest);
+  const profileId = engine === "firefox" ? "ghosteranti-firefox-cloud-smoke" : "ghosteranti-cloud-smoke";
+  const canaryWorkerTimeoutMs = has(rest, "unsafe-disable-identity-gates")
+    ? UNSAFE_CANARY_TIMEOUT_MS
+    : undefined;
+  const store = new ProfileStore(paths.cloudDatabase);
+  const queue = new PendingSyncQueue(paths.pendingSync, new Uint8Array(32).fill(1));
+  const smokeProxy = has(rest, "proxy-mismatch")
+    ? await startProxyMismatchFixture()
+    : cloudLauncherSmokeProxy(rest);
+  // Exercise the persisted proxy-only preparation path that clean CI profiles previously missed.
+  if (smokeProxy) {
+    const defaultProfileDir = resolve(paths.cloudProfiles, profileId, "Default");
+    mkdirSync(defaultProfileDir, { recursive: true });
+    writeFileSync(resolve(defaultProfileDir, "Preferences"), "[]");
+  }
+  const launcher = makeLauncher(
+    store,
+    rest,
+    true,
+    paths.cloudProfiles,
+    undefined,
+    join(paths.root, "runtimes"),
+  );
+  const profile = smokeProfile(
+    profileId,
+    "Cloud launcher smoke",
+    1,
+    smokeProxy?.profileProxy ?? null,
+  );
+  if (engine === "firefox") {
+    profile.engine = engine;
+    profile.firefox = createFirefoxProfileConfig(profile.screenWidth, profile.screenHeight);
+  }
+  if (flag(rest, "chromium-runtime") === "ghosteranti") profile.chromiumRuntime = "ghosteranti";
+  let payload = encodePortableProfile(profile, JSON.stringify({
+    cookies: [{
+      name: "auth_token",
+      value: "ghosteranti-smoke",
+      domain: ".x.com",
+      path: "/",
+      expires: -1,
+      httpOnly: false,
+      secure: true,
+      sameSite: "Lax",
+    }],
+    origins: [],
+  }));
+  let version = 1;
+  let registration = 0;
+  const cloud = {
+    async listProfiles() { throw new Error("Cloud launcher smoke must not list remote profiles"); },
+    async createProfile() { throw new Error("Cloud launcher smoke must not create remote profiles"); },
+    async openProfile() {
+      registration++;
+      return {
+        ok: true as const,
+        registrationId: `smoke-registration-${registration}`,
+        baseVersion: version,
+        payload,
+        activeOpens: [],
+      };
+    },
+    async heartbeat() {
+      return { ok: true as const, revoked: false as const, activeOpens: [] };
+    },
+    async closeOpen(_registrationId: string, request: { expectedVersion: number; payload: typeof payload }) {
+      if (request.expectedVersion !== version) throw new Error("Cloud launcher smoke received a stale close");
+      if (request.payload.schemaVersion !== payload.schemaVersion) {
+        throw new Error("Cloud launcher smoke close changed the profile's browser runtime");
+      }
+      if (!request.payload.session.cookies.some((cookie) =>
+        cookie.name === "auth_token" && cookie.value === "ghosteranti-smoke"
+      )) {
+        throw new Error("Cloud launcher smoke did not capture the restored session");
+      }
+      payload = request.payload;
+      version++;
+      return { ok: true as const, status: "accepted" as const, version };
+    },
+    async abandon() { return { ok: true as const, status: "abandoned" as const }; },
+  };
+  const coordinator = new CloudBrowserCoordinator({
+    cloud: cloud as any,
+    launcher,
+    store,
+    queue: () => queue,
+    accountId: () => "smoke-account",
+    deviceId: () => "smoke-device",
+    readSession: (endpoint, captureSeed) => readSessionInSubprocess(endpoint, {
+      captureSeed,
+      ...(canaryWorkerTimeoutMs ? { timeoutMs: canaryWorkerTimeoutMs } : {}),
+    }),
+    applySession: (endpoint, bundle, urls) =>
+      applySessionToEndpoint(endpoint, bundle, urls, {
+        log: (m) => console.log(`[ghosteranti] ${m}`),
+        ...(canaryWorkerTimeoutMs ? { writeTimeoutMs: canaryWorkerTimeoutMs } : {}),
+      }),
+    heartbeatMs: 0,
+  });
+
+  try {
+    await exerciseCloudLauncherSmoke(
+      { coordinator, launcher, store },
+      profileId,
+      smokeProxy?.startupUrl ? [smokeProxy.startupUrl] : [],
+    );
+    smokeProxy?.assertComplete?.();
+  } finally {
+    await coordinator.releaseAll(true).catch(() => false);
+    await launcher.stop(profileId).catch(() => false);
+    smokeProxy?.close?.();
+    queue.close();
+    store.close();
+  }
+}
+
+const MAX_LOG_FILE_BYTES = 2 * 1024 * 1024;
+
+/** Mirror console output to <root>/logs/ghosteranti-<date>.log (rotates at 2 MB). Best-effort. */
+function installFileLogging(root: string): void {
+  try {
+    const dir = join(root, "logs");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `ghosteranti-${new Date().toISOString().slice(0, 10)}.log`);
+    appendFileSync(file, `${new Date().toISOString()} sidecar start v${GHOSTERANTI_VERSION} pid=${process.pid}\n`);
+    const write = (stream: NodeJS.WriteStream, args: unknown[]) => {
+      try {
+        const line = new Date().toISOString() + " " + args.map((a) => (typeof a === "string" ? a : String(a))).join(" ") + "\n";
+        if (statSync(file).size > MAX_LOG_FILE_BYTES) renameSync(file, file.replace(/\.log$/, ".1.log"));
+        appendFileSync(file, line);
+      } catch {
+        try { appendFileSync(file, new Date().toISOString() + " " + args.join(" ") + "\n"); } catch {}
+      }
+      stream.write(args.map((a) => (typeof a === "string" ? a : String(a))).join(" ") + "\n");
+    };
+    console.log = (...args: unknown[]) => write(process.stdout, args);
+    console.error = (...args: unknown[]) => write(process.stderr, args);
+  } catch {
+    // Logging must never break startup.
+  }
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv[0] === CLOAKPIT_IMPORT_COMMAND) {
+    const result = await runCloakpitImportCommand(argv.slice(1));
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
+  if (argv[0] === "__cloud-restore-fixture") {
+    await runCloudRestoreFixture(argv.slice(1));
+    return;
+  }
+
+  // Playwright-over-CDP on Bun emits occasional stray websocket rejections
+  // ("ws.WebSocket 'upgrade' event is not implemented in bun"). Left unhandled,
+  // Bun exits the process — which would crash the long-running manager or cut a
+  // diagnose run short. Log and continue instead.
+  process.on("unhandledRejection", (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    // ONLY the known Bun+Playwright ws-upgrade noise is non-fatal. Anything
+    // else (a DB failure, an unhandled launcher path) is a real bug — surface it
+    // loudly and exit rather than masking it as "(non-fatal)" and continuing in
+    // a possibly-corrupt state. The desktop enters a static degraded state.
+    if (msg.includes("not implemented in bun") || msg.includes("WebSocket 'upgrade'")) {
+      console.error("[ghosteranti] (non-fatal) Bun ws-upgrade noise");
+      return;
+    }
+    console.error("[ghosteranti] FATAL unhandled rejection");
+    process.exit(1);
+  });
+
+  const compiled = typeof GHOSTERANTI_COMPILED !== "undefined" && GHOSTERANTI_COMPILED === true;
+  if (compiled) {
+    const runtime = process.env.GHOSTERANTI_PLAYWRIGHT_RUNTIME?.trim() || defaultPlaywrightRuntimeRoot();
+    process.env.GHOSTERANTI_PLAYWRIGHT_RUNTIME = runtime;
+    await verifyPlaywrightRuntime(runtime);
+  }
+  if (await dispatchReadSessionWorker(argv)) return;
+
+  const [cmd, ...rest] = argv;
+  const paths = statePaths(resolveStateRoot(rest));
+  if (cmd === "setup") {
+    ensureStateDirectories(paths);
+    try {
+      await setupSourceRuntime(paths.root);
+    } catch (error) {
+      // Setup errors describe downloads, hashes, and disk space, never credentials.
+      console.error(`[ghosteranti] setup failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      throw error;
+    }
+    console.log(`GhosterAnti source runtime is ready. Restart GhosterAnti to use it:\n  bun cli.ts start --state-root ${paths.root}`);
+    return;
+  }
+  if (!compiled) applySourceRuntime(paths.root);
+  if (!compiled && (cmd === "start" || cmd === "serve")) {
+    try {
+      await verifyPlaywrightRuntime();
+    } catch (error) {
+      console.error(`[ghosteranti] ${error instanceof Error ? error.message : "source Playwright runtime is unavailable"}`);
+      console.error("[ghosteranti] Run bun cli.ts setup to install the verified source runtime.");
+      throw error;
+    }
+  }
+  const desktop = has(rest, "desktop-stdio");
+  // The desktop sidecar's stdout/stderr are discarded by the Tauri shell, which
+  // made device-only failures undebuggable. Mirror every log line to a rotating
+  // file under <state-root>/logs/ so a failed open can be diagnosed for real.
+  installFileLogging(paths.root);
+  if (desktop && cmd !== "start") throw new Error("--desktop-stdio is supported only by the start command");
+  const desktopHealth = desktop
+    ? desktopHealthMetadata(process.env, flag(rest, "desktop-root"))
+    : null;
+  const agentNonce = desktop ? agentControlNonce(process.env) : null;
+  if (desktop && !agentNonce) throw new Error("GHOSTERANTI_AGENT_NONCE is required in desktop mode");
+  const desktopCredentials = desktopHealth
+    ? new DesktopCredentialBridge(desktopHealth.instance)
+    : null;
+  ensureStateDirectories(paths);
+  if (cmd === "__cloud-cross-device-acceptance") {
+    const fixtureUrl = flag(rest, "fixture-url");
+    if (!fixtureUrl) throw new Error("Cloud cross-device acceptance requires --fixture-url");
+    await runCloudCrossDeviceAcceptance(paths, fixtureUrl);
+    console.log("installed sidecar cross-device Cloud acceptance passed");
+    return;
+  }
+  if (cmd === "__cloud-launcher-smoke") {
+    await runCloudLauncherSmoke(paths, rest);
+    console.log(has(rest, "windows-window-acceptance")
+      ? "installed CloakBrowser search provider, native minimize, background page, session capture, target, HWND, and foreground acceptance passed"
+      : "compiled sidecar opened, restored, captured, and closed a fresh and repeated cached Cloud profile");
+    return;
+  }
+  const appConfig = new AppConfigStore(paths.config);
+  let savedMode = appConfig.read();
+  if (
+    desktop &&
+    process.env.GHOSTERANTI_BACKGROUND === "1" &&
+    savedMode.mode === "unconfigured"
+  ) {
+    savedMode = appConfig.setMode("local");
+  }
+  const defaultCloudUrl = selectedCloudUrl(savedMode);
+  const cloudConfig = cloudRuntimeConfiguration(savedMode);
+  const cloudAuth = cloudConfig
+    ? new CloudAuthRuntime(
+        new SupabaseAuthClient({
+          baseUrl: cloudConfig.authUrl,
+          anonKey: cloudConfig.anonKey,
+        }),
+        undefined,
+        desktopCredentials
+          ? (refreshToken) => desktopCredentials.persistRefreshToken(refreshToken)
+          : undefined,
+        desktopCredentials
+          ? () => desktopCredentials.clearCloudSessionCredentials()
+          : undefined,
+      )
+    : undefined;
+  const configuredDbPath = flag(rest, "db");
+  const configuredDataRoot = flag(rest, "data-root");
+  const identityDbPath = configuredDbPath ?? paths.database;
+  const cloudProfileCache = savedMode.mode === "cloud" && (cmd === "start" || cmd === "serve");
+  const activeProfilePaths = profileDataPaths(paths, cloudProfileCache, configuredDbPath, configuredDataRoot);
+  const dbPath = activeProfilePaths.database;
+  const profileDataRoot = activeProfilePaths.profiles;
+  const cloudConnection = cloudAuth && cloudConfig
+    ? new CloudConnectionRuntime({
+        baseUrl: cloudConfig.apiUrl,
+        accessToken: () => cloudAuth.accessTokenOrRefresh(),
+        installation: {
+          installationId: defaultOperatorName(identityDbPath),
+          label: hostname(),
+          platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
+          appVersion: process.env.GHOSTERANTI_APP_VERSION ?? GHOSTERANTI_VERSION,
+        },
+      })
+    : undefined;
+  const mcpTunnel = agentNonce && cloudAuth && cloudConfig && cloudConnection
+    ? new McpTunnelRuntime({
+        baseUrl: cloudConfig.apiUrl,
+        accessToken: () => cloudAuth.accessTokenOrRefresh(),
+        deviceId: () => cloudConnection.deviceId(),
+        deviceCredential: () => cloudConnection.deviceCredential(),
+        log: (message) => console.log(`[ghosteranti] ${message}`),
+      })
+    : undefined;
+  const pendingSync = cloudAuth
+    ? new PendingSyncRuntime(paths.pendingSync, compiled ? undefined : paths.pendingSyncKey)
+    : undefined;
+  const lifecycleAdmissionOptions = cmd === "start" || cmd === "serve"
+    ? lifecycleAdmissionOptionsFromEnv()
+    : undefined;
+  const lifecycleAdmission = lifecycleAdmissionOptions
+    ? new LifecycleAdmissionController(lifecycleAdmissionOptions)
+    : undefined;
+
+  switch (cmd) {
+    case "__sidecar-smoke": {
+      const endpoint = flag(rest, "cdp-endpoint");
+      if (!endpoint) throw new Error("compiled sidecar smoke requires --cdp-endpoint");
+      await runCompiledSidecarSmoke(endpoint);
+      console.log("compiled sidecar restored, navigated, and captured a session over Playwright CDP");
+      break;
+    }
+    case "install-browser": {
+      const engine = flag(rest, "engine") ?? (has(rest, "engine") ? "" : "chromium");
+      if (engine === "firefox") {
+        const archive = flag(rest, "archive");
+        if (!archive || archive.startsWith("--")) {
+          console.error("Usage: bun cli.ts install-browser --engine firefox --archive <owned-build.zip>");
+          process.exitCode = 1;
+          break;
+        }
+        try {
+          const installed = await installFirefox({ archive, cwd: paths.root });
+          console.log(`GhosterAnti Firefox installed and pinned:\n${installed.path}\nSHA-256 ${installed.sha256}`);
+          console.log("Restart GhosterAnti to use it.");
+        } catch (error) {
+          console.error(error instanceof Error ? error.message : "GhosterAnti Firefox installation failed");
+          process.exitCode = 1;
+        }
+        break;
+      }
+      if (engine !== "chromium") {
+        console.error("Browser engine must be chromium or firefox");
+        process.exitCode = 1;
+        break;
+      }
+      console.log("Installing the official CloakBrowser binary (one-time download)...");
+      const installed = await installCloakBrowser({ cwd: paths.root });
+      console.log(`CloakBrowser installed and pinned:\n${installed.path}\nSHA-256 ${installed.sha256}`);
+      console.log("Restart GhosterAnti to use it.");
+      break;
+    }
+    case "import": {
+      const store = new ProfileStore(dbPath);
+      await importPath(store, rest[0], paths.inbox);
+      console.log(`store now holds ${store.count()} profile(s) at ${dbPath}`);
+      store.close();
+      break;
+    }
+    case "start": {
+      const store = new ProfileStore(dbPath);
+      const port = Number(flag(rest, "port") ?? 50400);
+
+      // Persisted mode is authoritative. The legacy HUB_URL fallback exists only
+      // for existing installations that have not completed first-run selection.
+      const configuredMode = savedMode;
+      const hubUrl = legacyHubUrl(configuredMode);
+      if (hubUrl) {
+        const password = process.env.HUB_PASSWORD ?? "";
+        if (!password) {
+          console.error("Remote mode needs HUB_PASSWORD set — the shared hub secret, or a per-operator token from `bun cli.ts user add <name>`.");
+          process.exit(1);
+        }
+        // Each box has a stable, unique operator id (OPERATOR_NAME or an
+        // auto-generated persisted id). With the shared hub secret the hub
+        // attributes locks to this id; a per-operator token overrides it.
+        const owner = defaultOperatorName(identityDbPath);
+        console.log(`local instance "${owner}" (hub lock attribution: this box's operator id)`);
+        const launcher = makeLauncher(store, rest, true, profileDataRoot, undefined, join(paths.root, "runtimes"));
+        await launcher.reconcileOrphans();
+        prefetchBrowserRuntimes(launcher, store);
+        const coord = new RemoteCoordinator({
+          hub: new HubClient(hubUrl, password, owner),
+          launcher,
+          store,
+          readSession: (endpoint, captureSeed) => readSessionInSubprocess(endpoint, { captureSeed }),
+          writeSession,
+        });
+        // Re-claim the lock + resume heartbeats for browsers that survived a
+        // restart (reconcileOrphans kept their rows), so their lease can't lapse
+        // and let another operator open the same account.
+        await coord.reclaimSurvivors();
+        startMemoryAttributionLog(coord);
+        const configuredShutdownTimeout = Number(process.env.GHOSTERANTI_SHUTDOWN_TIMEOUT_MS);
+        const shutdownTimeoutMs = Number.isFinite(configuredShutdownTimeout) && configuredShutdownTimeout > 0
+          ? Math.max(1_000, Math.floor(configuredShutdownTimeout))
+          : DEFAULT_REMOTE_SHUTDOWN_TIMEOUT_MS;
+        console.log(`remote mode: hub ${hubUrl} (authenticated operator identity is token-derived)`);
+        const automationServer = desktopHealth
+          ? serveDesktopAutomationApi({
+              launcher,
+              store,
+              remote: coord,
+              lifecycleAdmission: lifecycleAdmission!,
+              appConfig,
+            })
+          : undefined;
+        const server = serveDashboard({
+          launcher,
+          store,
+          remote: coord,
+          port,
+          lifecycleAdmission,
+          appConfig,
+          paths,
+          defaultCloudUrl,
+          cloudAuth,
+          cloudConnection,
+          pendingSync,
+          health: desktopHealth,
+          agentNonce: agentNonce ?? undefined,
+        });
+
+        if (desktopHealth) {
+          const assignedPort = server.port;
+          if (!assignedPort) throw new Error("desktop sidecar did not receive a loopback port");
+          attachDesktopControl(new ManagedDesktopRuntime({
+            server,
+            automationServer,
+            admission: lifecycleAdmission!,
+            store,
+            launcher,
+            remoteShutdown: (remainingMs) => drainRemoteShutdown(
+              () => coord.releaseAll(),
+              { maxDrainMs: Math.min(shutdownTimeoutMs, remainingMs) },
+            ),
+          }), desktopHealth, assignedPort, desktopCredentials!);
+          break;
+        }
+
+        let shutdownInFlight: Promise<void> | null = null;
+        let firstShutdownSignal: NodeJS.Signals | null = null;
+        const shutdown = (signal: NodeJS.Signals) => {
+          if (shutdownInFlight) {
+            const exitCode = signal === "SIGINT" ? 130 : 143;
+            console.error(
+              `received ${signal} while ${firstShutdownSignal ?? "shutdown"} cleanup is still unconfirmed; ` +
+              "forcing a non-zero exit with launch records and locks retained for next-start recovery",
+            );
+            process.exit(exitCode);
+            return;
+          }
+          firstShutdownSignal = signal;
+          console.error(
+            `received ${signal}; waiting up to ${shutdownTimeoutMs}ms for browser teardown and hub unlock ` +
+            "(send the signal again to force a non-zero exit)",
+          );
+          shutdownInFlight = drainRemoteShutdown(
+            () => coord.releaseAll(),
+            { maxDrainMs: shutdownTimeoutMs },
+          )
+            .then(() => process.exit(0))
+            .catch((error) => {
+              // Never claim clean shutdown or delete durable ownership after a
+              // timeout. A same-operator restart can reclaim locks immediately,
+              // reconcile launch rows, and retry exact browser cleanup.
+              console.error(`shutdown cleanup unconfirmed: ${error instanceof Error ? error.message : String(error)}; exiting non-zero`);
+              process.exit(1);
+            });
+        };
+        process.on("SIGINT", shutdown);
+        process.on("SIGTERM", shutdown);
+        break;
+      }
+
+      // Reconcile/certify durable launch ownership before imports. Otherwise a
+      // stale crash row rejects startup before it can be proven dead.
+      console.log(`${configuredMode.mode} mode: preparing browser recovery`);
+      console.log("startup: initializing autofill bridge");
+      const launcher = makeLauncher(store, rest, savedMode.mode === "cloud", profileDataRoot, undefined, join(paths.root, "runtimes"));
+      console.log(`startup: checking ${store.listLaunches().length} saved browser process(es)`);
+      await launcher.reconcileOrphans();
+      if (savedMode.mode !== "cloud") {
+        console.log("startup: verifying surviving local browsers");
+        await launcher.certifySurvivors();
+      }
+      console.log("startup: browser recovery checks complete");
+      const cloudBrowser = makeCloudBrowser(launcher, store, cloudConnection, pendingSync);
+      startMemoryAttributionLog();
+      prefetchBrowserRuntimes(launcher, store);
+      if (configuredMode.mode === "cloud") {
+        console.log("cloud mode: waiting for verified authentication before loading profiles");
+        if (cloudBrowser && !desktopHealth) installCloudShutdown(cloudBrowser, mcpTunnel);
+        const automationServer = desktopHealth
+          ? serveDesktopAutomationApi({
+              launcher,
+              store,
+              cloudBrowser,
+              lifecycleAdmission: lifecycleAdmission!,
+              appConfig,
+            })
+          : undefined;
+        const server = serveDashboard({
+          launcher,
+          store,
+          port,
+          lifecycleAdmission,
+          appConfig,
+          paths,
+          defaultCloudUrl,
+          cloudAuth,
+          cloudConnection,
+          pendingSync,
+          cloudBrowser,
+          mcpTunnel,
+          health: desktopHealth,
+          agentNonce: agentNonce ?? undefined,
+        });
+        mcpTunnel?.start();
+        if (desktopHealth) {
+          const assignedPort = server.port;
+          if (!assignedPort) throw new Error("desktop sidecar did not receive a loopback port");
+          attachDesktopControl(new ManagedDesktopRuntime({
+            server,
+            automationServer,
+            admission: lifecycleAdmission!,
+            store,
+            launcher,
+            ...(cloudBrowser ? {
+              remoteShutdown: (remainingMs: number) => drainRemoteShutdown(
+                async () => {
+                  await mcpTunnel?.stop();
+                  return cloudBrowser.releaseAll(true);
+                },
+                // Cloud closes capture and upload every open browser in turn, so
+                // many open profiles need the whole desktop shutdown budget.
+                { maxDrainMs: remainingMs },
+              ),
+            } : {}),
+          }), desktopHealth, assignedPort, desktopCredentials!);
+        }
+        break;
+      }
+      const r = await importInbox(store, paths.inbox).catch((error) => {
+        // A live certified survivor can legitimately block a queued identity
+        // replacement. Keep serving the safe stored profile and let the inbox
+        // watcher retry after it closes; never discard the import error.
+        console.error(`startup inbox import deferred: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+      });
+      if (r) console.log(`imported ${r.profiles} profile(s) from ${r.files} file(s); store holds ${store.count()}`);
+      const stopInbox = watchInbox(store, paths.inbox);
+      const automationServer = desktopHealth
+        ? serveDesktopAutomationApi({
+            launcher,
+            store,
+            lifecycleAdmission: lifecycleAdmission!,
+            appConfig,
+          })
+        : undefined;
+      const server = serveDashboard({
+        launcher,
+        store,
+        port,
+        lifecycleAdmission,
+        appConfig,
+        paths,
+        defaultCloudUrl,
+        cloudAuth,
+        cloudConnection,
+        pendingSync,
+        health: desktopHealth,
+        agentNonce: agentNonce ?? undefined,
+      });
+      if (desktopHealth) {
+        const assignedPort = server.port;
+        if (!assignedPort) throw new Error("desktop sidecar did not receive a loopback port");
+        attachDesktopControl(new ManagedDesktopRuntime({
+          server,
+          automationServer,
+          admission: lifecycleAdmission!,
+          store,
+          launcher,
+          stopInbox,
+        }), desktopHealth, assignedPort, desktopCredentials!);
+      }
+      break;
+    }
+    case "serve": {
+      const store = new ProfileStore(dbPath);
+      const launcher = makeLauncher(store, rest, savedMode.mode === "cloud", profileDataRoot, undefined, join(paths.root, "runtimes"));
+      await launcher.reconcileOrphans();
+      if (savedMode.mode !== "cloud") await launcher.certifySurvivors();
+      const cloudBrowser = makeCloudBrowser(launcher, store, cloudConnection, pendingSync);
+      startMemoryAttributionLog();
+      prefetchBrowserRuntimes(launcher, store);
+      if (cloudBrowser) installCloudShutdown(cloudBrowser);
+      serveDashboard({
+        launcher,
+        store,
+        port: Number(flag(rest, "port") ?? 50400),
+        lifecycleAdmission,
+        appConfig,
+        paths,
+        defaultCloudUrl,
+        cloudAuth,
+        cloudConnection,
+        pendingSync,
+        cloudBrowser,
+      });
+      break;
+    }
+    case "diagnose": {
+      const store = new ProfileStore(dbPath);
+      const all = store.listProfiles();
+      store.close();
+      const profiles = all.slice(0, Number(flag(rest, "count") ?? 10));
+      if (profiles.length === 0) {
+        console.error("no profiles imported yet — run `import` or `start` first");
+        process.exit(1);
+      }
+      mkdirSync(paths.reports, { recursive: true });
+      const out = flag(rest, "out") ?? resolve(paths.reports, "diagnose-latest.json");
+      // Write after every profile so a partial/interrupted run still leaves a
+      // usable report on disk instead of nothing.
+      const report = await runDiagnostics({
+        baseUrl: `http://127.0.0.1:${Number(flag(rest, "port") ?? 50400)}`,
+        profiles,
+        relaunch: has(rest, "relaunch"),
+        collectLogin: !has(rest, "no-login"),
+        onProgress: (r) => writeFileSync(out, JSON.stringify(r, null, 2)),
+      });
+      writeFileSync(out, JSON.stringify(report, null, 2));
+      console.log("\n=== VERDICTS ===");
+      for (const line of report.analysis.verdicts) console.log(line);
+      console.log(`\nFull report written to ${out} — forward this file for review.`);
+      break;
+    }
+    case "inspect": {
+      // Diagnostic dump that is SAFE to forward: shows field names and value
+      // lengths only — never cookie/password/2FA values. The bare `id` is shown
+      // because it's a non-secret profile handle and confirms parsing worked.
+      const file = rest[0];
+      if (!file || file.startsWith("--")) throw new Error("usage: inspect <file>");
+      const bytes = new Uint8Array(await Bun.file(file).arrayBuffer());
+      const text = decodeText(bytes);
+      const recs = splitRecords(text);
+      const summary = parseExport(text);
+      const hex = [...bytes.slice(0, 4)].map((b) => b.toString(16).padStart(2, "0")).join(" ");
+      const enc = text.length > 0 && bytes.length / text.length > 1.8 ? "utf-16(ish)" : "utf-8(ish)";
+      console.log(`file: ${file}`);
+      console.log(`bytes: ${bytes.length}  decodedChars: ${text.length}  firstBytes: ${hex}  encoding: ${enc}`);
+      console.log(`records: ${recs.length}  parseableProfiles: ${summary.profiles.length}  skipped(no id): ${summary.skipped}`);
+      if (recs[0]) {
+        console.log(`record[0] id: ${JSON.stringify(recs[0].id ?? "(missing)")}`);
+        const shape = Object.entries(recs[0]).map(([k, v]) => (k === "id" ? `id=${v}` : `${k}=<${v.length} chars>`));
+        console.log(`record[0] fields: ${shape.join("  ")}`);
+      }
+      if (recs.length && !summary.profiles.length) {
+        console.log(`(records found but none had an "id" field — likely a separator or field-name mismatch)`);
+      } else if (!recs.length) {
+        console.log(`(no records split out — check encoding (firstBytes) or the record separator)`);
+      }
+      break;
+    }
+    case "list": {
+      const store = new ProfileStore(dbPath);
+      for (const p of store.listProfiles()) {
+        console.log(
+          `${p.id}\t${p.name}\tseed=${p.fingerprintSeed}\t${p.screenWidth}x${p.screenHeight}\ttz=${p.timezone || "default"}\t` +
+            `proxy=${p.proxy ? `${p.proxy.host}:${p.proxy.port}` : "none"}\tcookies=${p.cookies.length}\tseeded=${p.seeded}`,
+        );
+      }
+      store.close();
+      break;
+    }
+    default:
+      console.log("commands: setup | install-browser | start | import [file|dir] | inspect <file> | serve | diagnose | list");
+      process.exit(cmd ? 1 : 0);
+  }
+}
+
+export function runCli(): void {
+  main().catch(() => {
+    console.error("[ghosteranti] FATAL command failure");
+    process.exit(1);
+  });
+}
+
+// Only run the CLI when executed directly (`bun cli.ts …`), not when imported (e.g. by tests).
+// The compiled sidecar starts it from sidecar-entry.ts.
+if (import.meta.main) runCli();

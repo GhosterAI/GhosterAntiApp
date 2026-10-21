@@ -1,0 +1,102 @@
+export const CLOUD_DIAGNOSTIC_TYPES = [
+  "open_started",
+  "cloud_registered",
+  "browser_started",
+  "browser_launch_preflight_failed",
+  "browser_launch_mode_conflict_failed",
+  "browser_launch_binary_verification_failed",
+  "browser_launch_profile_directory_failed",
+  "browser_launch_relay_setup_failed",
+  "browser_launch_process_spawn_failed",
+  "browser_launch_cdp_readiness_failed",
+  "session_restore_started",
+  "session_restore_completed",
+  "session_restore_unclassified_failed",
+  "session_restore_invalid_bundle_failed",
+  "session_restore_invalid_bundle_timeout",
+  "session_restore_connect_failed",
+  "session_restore_connect_timeout",
+  "session_restore_context_failed",
+  "session_restore_context_timeout",
+  "session_restore_origin_storage_failed",
+  "session_restore_origin_storage_timeout",
+  "session_restore_cookie_clear_failed",
+  "session_restore_cookie_clear_timeout",
+  "session_restore_cookie_add_failed",
+  "session_restore_cookie_add_timeout",
+  "session_restore_navigation_failed",
+  "session_restore_navigation_timeout",
+  "session_restore_disconnect_failed",
+  "session_restore_disconnect_timeout",
+  "open_running",
+  "open_failed",
+  "close_started",
+  "session_captured",
+  "browser_stopped",
+  "session_synced",
+  "checkpoint_saved",
+  "checkpoint_unchanged",
+  "checkpoint_capture_failed",
+  "checkpoint_invalid",
+  "manual_stop_detected",
+  "session_sync_pending",
+  "dirty_monitor_unavailable",
+  "cloud_registration_released",
+  "cleanup_retained",
+  "heartbeat_failed",
+  "heartbeat_terminal_conflict",
+  "heartbeat_terminal_access_ended",
+  "no_page_observed",
+  "no_page_close_requested",
+  "browser_death_confirmed",
+  "browser_teardown_unconfirmed",
+  "session_sync_conflict",
+  "access_ended",
+  "parked_session_restored",
+] as const;
+
+export type CloudDiagnosticType = typeof CLOUD_DIAGNOSTIC_TYPES[number];
+
+export interface CloudDiagnosticEvent {
+  timestamp: number;
+  type: CloudDiagnosticType;
+}
+
+const CLOUD_DIAGNOSTIC_TYPE_SET = new Set<string>(CLOUD_DIAGNOSTIC_TYPES);
+
+export function normalizeCloudDiagnostics(raw: unknown): CloudDiagnosticEvent[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object") return [];
+    const timestamp = (candidate as any).timestamp;
+    const type = (candidate as any).type;
+    if (
+      !Number.isFinite(timestamp) ||
+      !Number.isFinite(new Date(timestamp).getTime()) ||
+      !CLOUD_DIAGNOSTIC_TYPE_SET.has(type)
+    ) return [];
+    return [{ timestamp, type: type as CloudDiagnosticType }];
+  });
+}
+
+const MAX_CLOUD_DIAGNOSTICS = 100;
+
+export class CloudDiagnostics {
+  private readonly events: CloudDiagnosticEvent[] = [];
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  record(type: CloudDiagnosticType): void {
+    if (!CLOUD_DIAGNOSTIC_TYPE_SET.has(type)) {
+      throw new Error("unknown Cloud diagnostic event");
+    }
+    this.events.push({ timestamp: this.now(), type });
+    if (this.events.length > MAX_CLOUD_DIAGNOSTICS) {
+      this.events.splice(0, this.events.length - MAX_CLOUD_DIAGNOSTICS);
+    }
+  }
+
+  snapshot(): CloudDiagnosticEvent[] {
+    return this.events.map((event) => ({ ...event }));
+  }
+}

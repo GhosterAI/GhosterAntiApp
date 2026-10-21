@@ -1,0 +1,577 @@
+import { afterEach, beforeEach, test, expect } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { ProfileStore } from "./store.ts";
+import { importBuffers, importInbox, prepareImportBuffers } from "./inbox.ts";
+import { parseExport, serializeAdsTxt, serializeXlsxRows } from "./parse.ts";
+import { buildNewProfile } from "./create.ts";
+import { writeXlsx } from "./xlsx.ts";
+
+// Imports look up proxy timezones; answer them locally so tests stay offline.
+const realFetch = globalThis.fetch;
+beforeEach(() => { globalThis.fetch = (async () => Response.json({ status: "fail" })) as unknown as typeof fetch; });
+afterEach(() => { globalThis.fetch = realFetch; });
+
+const REC = (id: string) => `id=${id}
+name=acct-${id}
+group=g
+cookie=[{"name":"auth_token","value":"v","domain":".x.com","path":"/","session":false,"expires":1788000000},{"name":"ext","value":"x","domain":"browserext.adspower.net","path":"/","session":true}]
+proxytype=http
+proxy=1.2.3.4:8080:u:p
+ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/143.0.0.0 Safari/537.36
+resolution=1680*1050
+******************`;
+
+test("importInbox imports every .txt and ignores non-txt files", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cloak-inbox-"));
+  writeFileSync(join(dir, "batch1.txt"), REC("k1a0001") + "\n" + REC("k1a0002"));
+  writeFileSync(join(dir, "batch2.txt"), REC("k1a0003"));
+  writeFileSync(join(dir, "notes.md"), "id=should_not_import"); // wrong extension → skipped
+  const store = new ProfileStore(":memory:");
+
+  const r = await importInbox(store, dir);
+  expect(r.files).toBe(2);
+  expect(r.profiles).toBe(3);
+  expect(r.cookiesStripped).toBe(3); // one adspower ext cookie per record
+  expect(store.count()).toBe(3);
+  expect(store.getProfile("should_not_import")).toBeNull();
+
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("re-importing the inbox preserves the seeded flag", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cloak-inbox-"));
+  writeFileSync(join(dir, "batch.txt"), REC("k1a0001"));
+  const store = new ProfileStore(":memory:");
+
+  await importInbox(store, dir);
+  store.markSeeded("k1a0001");
+  await importInbox(store, dir); // drop again / refresh
+  expect(store.getProfile("k1a0001")!.seeded).toBe(true);
+
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("importBuffers applies a group override before upsert", async () => {
+  const store = new ProfileStore(":memory:");
+  const r = await importBuffers(
+    store,
+    [{ name: "batch.txt", bytes: new TextEncoder().encode(REC("k1a0001")) }],
+    () => {},
+    { group: "selected" },
+  );
+  expect(r.profiles).toBe(1);
+  expect(store.getProfile("k1a0001")!.group).toBe("selected");
+  store.close();
+});
+
+test("importBuffers rejects a malformed proxy without partially writing valid records", async () => {
+  const store = new ProfileStore(":memory:");
+  const malformed = REC("bad-proxy").replace("proxytype=http", "proxytype=socks4");
+  const valid = REC("good-profile").replace(
+    "proxytype=http\nproxy=1.2.3.4:8080:u:p",
+    "proxytype=\nproxy=",
+  );
+  const logs: string[] = [];
+
+  await expect(importBuffers(
+    store,
+    [{ name: "mixed.txt", bytes: new TextEncoder().encode(`${malformed}\n${valid}`) }],
+    (message) => logs.push(message),
+  )).rejects.toThrow("unsafe import rejected; no profiles were changed");
+
+  expect(store.count()).toBe(0);
+  expect(store.getProfile("bad-proxy")).toBeNull();
+  expect(store.getProfile("good-profile")).toBeNull();
+  store.close();
+});
+
+test("sparse same-id re-import updates only present fields and preserves identity state", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = {
+    ...parseExport(REC("k1a0001")).profiles[0]!,
+    platform: "x.com",
+    username: "account@example.com",
+    password: "secret",
+    twofa: "JBSWY3DPEHPK3PXP",
+    timezone: "America/New_York",
+    extensions: ["wallet"],
+    tags: ["returning-account"],
+  };
+  store.upsertProfile(original);
+  store.markSeeded(original.id);
+
+  const sparse = new TextEncoder().encode(`id=${original.id}\nname=renamed\n******************`);
+  await importBuffers(store, [{ name: "sparse.txt", bytes: sparse }], () => {});
+
+  const got = store.getProfile(original.id)!;
+  expect(got.name).toBe("renamed");
+  expect(got.platform).toBe("x.com");
+  expect(got.username).toBe("account@example.com");
+  expect(got.password).toBe("secret");
+  expect(got.twofa).toBe("JBSWY3DPEHPK3PXP");
+  expect(got.proxy).toEqual(original.proxy);
+  expect(got.cookies).toEqual(original.cookies);
+  expect(got.ua).toBe(original.ua);
+  expect([got.screenWidth, got.screenHeight]).toEqual([original.screenWidth, original.screenHeight]);
+  expect(got.fingerprintSeed).toBe(original.fingerprintSeed);
+  expect(got.timezone).toBe("America/New_York");
+  expect(got.extensions).toEqual(["wallet"]);
+  expect(got.tags).toEqual(["returning-account"]);
+  expect(got.seeded).toBe(true);
+  store.close();
+});
+
+test("Firefox re-imports preserve the saved config and reject identity replacement", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = {
+    ...parseExport(REC("firefox-import")).profiles[0]!,
+    engine: "firefox" as const,
+    firefox: {
+      version: 1 as const,
+      runtimeVersion: "156.0.1-beta.36",
+      config: { "navigator.userAgent": "Mozilla/5.0 Firefox/156.0", nested: { value: true } },
+    },
+  };
+  store.upsertProfile(original);
+
+  await importBuffers(
+    store,
+    [{ name: "firefox.txt", bytes: new TextEncoder().encode(`id=${original.id}\nname=renamed\n******************`) }],
+    () => {},
+  );
+  expect(store.getProfile(original.id)).toMatchObject({ name: "renamed", engine: "firefox", firefox: original.firefox });
+
+  const changed = {
+    ...original,
+    firefox: { ...original.firefox, config: { ...original.firefox.config, nested: { value: false } } },
+  };
+  await expect(importBuffers(
+    store,
+    [{ name: "changed.txt", bytes: new TextEncoder().encode(serializeAdsTxt([changed])) }],
+    () => {},
+  )).rejects.toThrow("Firefox config cannot change through import");
+  await expect(importBuffers(
+    store,
+    [{ name: "missing.txt", bytes: new TextEncoder().encode(`id=${original.id}\nengine=firefox\n******************`) }],
+    () => {},
+  )).rejects.toThrow("Firefox profiles require a Firefox config");
+  store.close();
+});
+
+test("sparse Local imports preserve timezones for Chromium and Firefox", async () => {
+  const store = new ProfileStore(":memory:");
+  const chromium = { ...parseExport(REC("chromium-import")).profiles[0]!, timezone: "America/New_York" };
+  const firefox = {
+    ...parseExport(REC("firefox-import-timezone")).profiles[0]!,
+    engine: "firefox" as const,
+    timezone: "Europe/London",
+    firefox: {
+      version: 1 as const,
+      runtimeVersion: "156.0.1-beta.36",
+      config: { timezone: "Europe/London" },
+    },
+  };
+  store.upsertProfiles([chromium, firefox]);
+  const logs: string[] = [];
+
+  await importBuffers(store, [{
+    name: "sparse.txt",
+    bytes: new TextEncoder().encode([
+      `id=${chromium.id}\nname=chromium-updated`,
+      `id=${firefox.id}\nname=firefox-updated`,
+    ].join("\n******************\n") + "\n******************"),
+  }], (message) => logs.push(message));
+
+  expect(store.getProfile(chromium.id)).toMatchObject({ name: "chromium-updated", timezone: "America/New_York" });
+  expect(store.getProfile(firefox.id)).toMatchObject({ name: "firefox-updated", timezone: "Europe/London" });
+  expect(logs).toEqual([]);
+  store.close();
+});
+
+test("same-id re-import updates explicit portable identity fields", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = {
+    ...parseExport(REC("k1a0001")).profiles[0]!,
+    fingerprintSeed: 11,
+    timezone: "UTC",
+    platformOs: "windows" as const,
+    extensions: ["old-extension"],
+    tags: ["old-tag"],
+    fpObserved: { canvas: "local-observation" },
+    fpExpected: { canvas: "old-expectation" },
+    fpVerdict: { verdict: "mismatch" as const, differences: [] },
+  };
+  store.upsertProfile(original);
+  const upload = new TextEncoder().encode([
+    `id=${original.id}`,
+    "seed=99",
+    "timezone=Europe/Paris",
+    "platform_os=macos",
+    "extensions=ext-one,ext-two",
+    "tags=warm,priority",
+    "fp_canvas=new-expectation",
+    "fp_hw_concurrency=12",
+    "******************",
+  ].join("\n"));
+
+  await importBuffers(store, [{ name: "identity.txt", bytes: upload }], () => {});
+
+  expect(store.getProfile(original.id)).toMatchObject({
+    fingerprintSeed: 99,
+    timezone: "Europe/Paris",
+    platformOs: "macos",
+    extensions: ["ext-one", "ext-two"],
+    tags: ["warm", "priority"],
+    fpObserved: { canvas: "local-observation" },
+    fpExpected: { canvas: "new-expectation", hardwareConcurrency: 12 },
+  });
+  expect(store.getProfile(original.id)!.fpVerdict).toBeUndefined();
+  store.close();
+});
+
+test("an explicit imported timezone is retained without a lookup", async () => {
+  const logs: string[] = [];
+  const batch = await prepareImportBuffers(
+    [{
+      name: "timezone.txt",
+      bytes: new TextEncoder().encode(
+        "id=timezone1\ntimezone=Europe/London\nproxytype=http\nproxy=1.2.3.4:8080\n******************",
+      ),
+    }],
+    (message) => logs.push(message),
+  );
+
+  expect(batch.profiles[0]!.timezone).toBe("Europe/London");
+  expect(logs.some((message) => message.includes("resolved timezone"))).toBe(false);
+});
+
+test("a proxy import sets the new proxy's timezone and keeps the saved one when the lookup fails", async () => {
+  for (const [row, timezone] of [[{ status: "success", timezone: "Europe/Paris" }, "Europe/Paris"], [{ status: "fail" }, "America/Los_Angeles"]] as const) {
+    const store = new ProfileStore(":memory:");
+    const original = parseExport(REC("existing")).profiles[0]!;
+    original.timezone = "America/Los_Angeles";
+    store.upsertProfile(original);
+    const logs: string[] = [];
+
+    await importBuffers(store, [{
+      name: "proxy.txt",
+      bytes: new TextEncoder().encode(`id=${original.id}\nproxytype=http\nproxy=8.8.8.8:8080:user:pass\n******************`),
+    }], (message) => logs.push(message), {}, undefined, async () => ({ json: async () => row }));
+
+    expect(store.getProfile(original.id)).toMatchObject({
+      proxy: { host: "8.8.8.8", port: "8080" },
+      timezone,
+    });
+    expect(logs).toContain(`import: resolved timezone for ${timezone === "Europe/Paris" ? 1 : 0}/1 supplied proxy/proxies`);
+    store.close();
+  }
+});
+
+test("re-importing an unchanged proxy keeps the saved timezone without a lookup", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = parseExport(REC("existing")).profiles[0]!;
+  original.timezone = "America/Los_Angeles";
+  store.upsertProfile(original);
+  let lookups = 0;
+
+  await importBuffers(store, [{ name: "refresh.txt", bytes: new TextEncoder().encode(REC("existing")) }], () => {}, {}, undefined, async () => {
+    lookups++;
+    return { json: async () => ({ status: "success", timezone: "Europe/Paris" }) };
+  });
+
+  expect(lookups).toBe(0);
+  expect(store.getProfile(original.id)!.timezone).toBe("America/Los_Angeles");
+  store.close();
+});
+
+test("sparse re-import preserves a quarantined legacy proxy for later repair", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = parseExport(REC("legacy-proxy")).profiles[0]!;
+  store.upsertProfile(original);
+  const raw = JSON.stringify({ type: "socks4", host: "legacy.example", port: "1080", user: "u", pass: "p" });
+  (store as any)["db"].query("UPDATE profiles SET proxy_json = ? WHERE id = ?").run(raw, original.id);
+  expect(store.getProfile(original.id)!.proxyError).toContain("unsupported proxy type");
+
+  await importBuffers(
+    store,
+    [{ name: "sparse.txt", bytes: new TextEncoder().encode(`id=${original.id}\nname=renamed\n******************`) }],
+    () => {},
+  );
+  const got = store.getProfile(original.id)!;
+  expect(got.name).toBe("renamed");
+  expect(got.proxy).toBeNull();
+  expect(got.proxyError).toContain("unsupported proxy type");
+  expect((store as any)["db"].query("SELECT proxy_json FROM profiles WHERE id = ?").get(original.id).proxy_json).toBe(raw);
+  store.close();
+});
+
+test("malformed same-id import rejects the whole batch before any profile changes", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = parseExport(REC("existing")).profiles[0]!;
+  store.upsertProfile(original);
+  const upload = `id=new-profile\nname=new\n******************\nid=existing\nname=erased\ncookie={broken\n******************`;
+
+  await expect(importBuffers(
+    store,
+    [{ name: "bad.txt", bytes: new TextEncoder().encode(upload) }],
+    () => {},
+  )).rejects.toThrow("unsafe import rejected; no profiles were changed");
+  expect(store.count()).toBe(1);
+  expect(store.getProfile("new-profile")).toBeNull();
+  expect(store.getProfile("existing")!.name).toBe(original.name);
+  expect(store.getProfile("existing")!.cookies).toEqual(original.cookies);
+  store.close();
+});
+
+test("impossible screens and invalid proxies reject the whole re-import batch", async () => {
+  const invalidFields = [
+    "resolution=0x0",
+    "resolution=99999x1080",
+    "proxytype=gopher\nproxy=9.9.9.9:8080:u:p",
+    "proxytype=http\nproxy=bad host:8080:u:p",
+  ];
+  for (const field of invalidFields) {
+    const store = new ProfileStore(":memory:");
+    const original = parseExport(REC("existing")).profiles[0]!;
+    store.upsertProfile(original);
+    const upload = [
+      "id=new-profile\nname=must-not-land\nresolution=1280x720",
+      `id=existing\nname=must-not-change\n${field}`,
+    ].join("\n******************\n") + "\n******************";
+
+    await expect(importBuffers(
+      store,
+      [{ name: "invalid-identity.txt", bytes: new TextEncoder().encode(upload) }],
+      () => {},
+    )).rejects.toThrow("unsafe import rejected; no profiles were changed");
+    expect(store.count()).toBe(1);
+    const got = store.getProfile("existing")!;
+    expect(got.name).toBe(original.name);
+    expect(got.proxy).toEqual(original.proxy);
+    expect([got.screenWidth, got.screenHeight]).toEqual([original.screenWidth, original.screenHeight]);
+    expect(store.getProfile("new-profile")).toBeNull();
+    store.close();
+  }
+});
+
+test("an unsafe profile id rejects the whole import before any row changes", async () => {
+  for (const unsafeId of ["../shared", "safe/shared", "safe\\shared", "safe%2Fshared", ".", "C:\\shared"]) {
+    const store = new ProfileStore(":memory:");
+    const original = parseExport(REC("existing")).profiles[0]!;
+    store.upsertProfile(original);
+    const upload = [
+      "id=existing\nname=must-not-change",
+      `id=${unsafeId}\nname=must-not-land`,
+    ].join("\n******************\n") + "\n******************";
+
+    await expect(importBuffers(
+      store,
+      [{ name: "unsafe-id.txt", bytes: new TextEncoder().encode(upload) }],
+      () => {},
+    )).rejects.toThrow("invalid profile id");
+    expect(store.count()).toBe(1);
+    expect(store.getProfile("existing")!.name).toBe(original.name);
+    expect(store.getProfile(unsafeId)).toBeNull();
+    store.close();
+  }
+});
+
+test("blank same-id fields cannot silently erase stored proxy, cookies, UA, or screen", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = parseExport(REC("existing")).profiles[0]!;
+  store.upsertProfile(original);
+  const upload = `id=existing\nproxy=\ncookie=\nua=\nresolution=\n******************`;
+
+  await expect(importBuffers(
+    store,
+    [{ name: "blank.txt", bytes: new TextEncoder().encode(upload) }],
+    () => {},
+  )).rejects.toThrow("blank proxy would erase the stored proxy");
+  const got = store.getProfile("existing")!;
+  expect(got.proxy).toEqual(original.proxy);
+  expect(got.cookies).toEqual(original.cookies);
+  expect(got.ua).toBe(original.ua);
+  expect([got.screenWidth, got.screenHeight]).toEqual([original.screenWidth, original.screenHeight]);
+  store.close();
+});
+
+test("valid explicit empty cookie array can intentionally clear stored cookies", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = parseExport(REC("existing")).profiles[0]!;
+  store.upsertProfile(original);
+  await importBuffers(
+    store,
+    [{ name: "clear.txt", bytes: new TextEncoder().encode("id=existing\ncookie=[]\n******************") }],
+    () => {},
+  );
+  expect(store.getProfile("existing")!.cookies).toEqual([]);
+  expect(store.getProfile("existing")!.proxy).toEqual(original.proxy);
+  store.close();
+});
+
+test("stripping extension-only cookie input cannot accidentally clear stored auth cookies", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = parseExport(REC("existing")).profiles[0]!;
+  store.upsertProfile(original);
+  const onlyExtension = JSON.stringify([{ name: "ext", value: "x", domain: "browserext.adspower.net", path: "/" }]);
+  await expect(importBuffers(
+    store,
+    [{ name: "extensions.txt", bytes: new TextEncoder().encode(`id=existing\ncookie=${onlyExtension}\n******************`) }],
+    () => {},
+  )).rejects.toThrow("contained only stripped extension cookies");
+  expect(store.getProfile("existing")!.cookies).toEqual(original.cookies);
+  store.close();
+});
+
+test("duplicate ids across an import batch reject deterministically instead of last-file-wins", async () => {
+  const store = new ProfileStore(":memory:");
+  await expect(importBuffers(
+    store,
+    [
+      { name: "old.txt", bytes: new TextEncoder().encode("id=duplicate\nname=old\n******************") },
+      { name: "new.txt", bytes: new TextEncoder().encode("id=duplicate\nname=new\n******************") },
+    ],
+    () => {},
+  )).rejects.toThrow("duplicate profile id duplicate");
+  expect(store.count()).toBe(0);
+  store.close();
+});
+
+test("an unsafe provider ID re-imports the same generated profile", async () => {
+  const store = new ProfileStore(":memory:");
+  const first = "Profile ID,Profile Name\nunsafe/profile-id,First name\n";
+  const second = "Profile ID,Profile Name\nunsafe/profile-id,Updated name\n";
+
+  await importBuffers(store, [{ name: "first.csv", bytes: new TextEncoder().encode(first) }], () => {});
+  const id = store.listProfiles()[0]!.id;
+  await importBuffers(store, [{ name: "second.csv", bytes: new TextEncoder().encode(second) }], () => {});
+
+  expect(store.count()).toBe(1);
+  expect(store.getProfile(id)).toMatchObject({ accId: "unsafe/profile-id", name: "Updated name" });
+  store.close();
+});
+
+test("the pre-commit guard can abort an import without writing any prepared rows", async () => {
+  const store = new ProfileStore(":memory:");
+  const upload = "id=guarded\nname=must-not-land\n******************";
+  let guardedIds: string[] = [];
+  await expect(importBuffers(
+    store,
+    [{ name: "guarded.txt", bytes: new TextEncoder().encode(upload) }],
+    () => {},
+    {},
+    (profiles) => {
+      guardedIds = profiles.map((profile) => profile.id);
+      throw new Error("became locked");
+    },
+  )).rejects.toThrow("became locked");
+  expect(guardedIds).toEqual(["guarded"]);
+  expect(store.getProfile("guarded")).toBeNull();
+  store.close();
+});
+
+test("an empty file rejects a mixed provider batch before any profile is written", async () => {
+  const store = new ProfileStore(":memory:");
+  await expect(importBuffers(
+    store,
+    [
+      { name: "valid.json", bytes: new TextEncoder().encode('{"id":"valid-json","name":"Valid"}') },
+      { name: "empty.csv", bytes: new TextEncoder().encode("\r\n") },
+    ],
+    () => {},
+  )).rejects.toThrow("empty.csv: export file is empty");
+  expect(store.count()).toBe(0);
+  store.close();
+});
+
+test("re-import refuses to change a profile with a live local launch", async () => {
+  const store = new ProfileStore(":memory:");
+  const original = parseExport(REC("live-profile")).profiles[0]!;
+  store.upsertProfile(original);
+  store.recordLaunch({
+    profileId: original.id,
+    pid: 123,
+    debugPort: 9333,
+    ws: "ws://127.0.0.1:9333/devtools/browser/live",
+    startedAt: Date.now(),
+  });
+  await expect(importBuffers(
+    store,
+    [{ name: "live.txt", bytes: new TextEncoder().encode(`id=${original.id}\nname=changed\n******************`) }],
+    () => {},
+  )).rejects.toThrow("currently open; close them before importing");
+  expect(store.getProfile(original.id)!.name).toBe(original.name);
+  store.close();
+});
+
+test("importInbox creates the inbox dir when missing", async () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "cloak-inbox-")), "nested-inbox");
+  const store = new ProfileStore(":memory:");
+  const r = await importInbox(store, dir); // dir does not exist yet
+  expect(r.files).toBe(0);
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/** Runs `run` as if on Windows x64, Apple Silicon macOS, or Linux x64. */
+async function onHost(platform: "win32" | "darwin" | "linux", run: () => Promise<void>): Promise<void> {
+  const host = { platform: process.platform, arch: process.arch };
+  Object.defineProperties(process, { platform: { value: platform }, arch: { value: platform === "darwin" ? "arm64" : "x64" } });
+  try {
+    await run();
+  } finally {
+    Object.defineProperties(process, { platform: { value: host.platform }, arch: { value: host.arch } });
+  }
+}
+
+test.each([
+  ["win32", "chromium", "ghosteranti"],
+  ["darwin", "firefox", undefined],
+  ["linux", "firefox", undefined],
+] as const)("on %s a new import that names no browser gets %s; an export that names one keeps it", async (platform, engine, runtime) => {
+  const cloak = buildNewProfile({ chromiumRuntime: "cloakbrowser", name: "cloak" }, () => false);
+  const beta = buildNewProfile({ chromiumRuntime: "ghosteranti", name: "beta" }, () => false);
+  const firefox = buildNewProfile({ engine: "firefox", name: "firefox" }, () => false);
+  const ours = serializeAdsTxt([cloak, beta, firefox]);
+  // A CloakBrowser export from before runtimes were named still carries its stored hardware.
+  const older = serializeAdsTxt([{ ...cloak, id: "k1older1" }]).replace(/^chromium_runtime=cloakbrowser\n/m, "");
+  expect(older).not.toContain("chromium_runtime=");
+  const sheet = serializeXlsxRows([{ ...cloak, id: "k1sheet1" }, { ...beta, id: "k1sheet2" }]);
+  const store = new ProfileStore(":memory:");
+  store.upsertProfile({ ...buildNewProfile({ chromiumRuntime: "cloakbrowser" }, () => false), id: "k1saved1" });
+  const file = (name: string, text: string) => ({ name, bytes: new TextEncoder().encode(text) });
+  await onHost(platform, async () => {
+    await importBuffers(store, [
+      file("ours.txt", ours),
+      file("older.txt", older),
+      file("adspower.txt", `${REC("k1ads001")}\n${REC("k1saved1")}`),
+      { name: "ours.xlsx", bytes: await writeXlsx(sheet.headers, sheet.rows) },
+    ], () => {});
+  });
+  const browser = (id: string) => {
+    const profile = store.getProfile(id)!;
+    return [profile.engine ?? "chromium", profile.chromiumRuntime, profile.hardware?.cores];
+  };
+  expect(browser(cloak.id)).toEqual(["chromium", undefined, cloak.hardware!.cores]);
+  expect(browser(beta.id)).toEqual(["chromium", "ghosteranti", undefined]);
+  expect(browser(firefox.id)).toEqual(["firefox", undefined, undefined]);
+  expect(browser("k1older1")).toEqual(["chromium", undefined, cloak.hardware!.cores]);
+  expect(browser("k1sheet1")).toEqual(["chromium", undefined, cloak.hardware!.cores]);
+  expect(browser("k1sheet2")).toEqual(["chromium", "ghosteranti", undefined]);
+  // A saved profile keeps its browser.
+  expect(browser("k1saved1")).toEqual(["chromium", undefined, store.getProfile("k1saved1")!.hardware?.cores]);
+  // An AdsPower record gets this computer's default and keeps its account, screen and session.
+  const ads = store.getProfile("k1ads001")!;
+  expect([ads.engine, ads.chromiumRuntime]).toEqual([engine, runtime]);
+  expect([ads.screenWidth, ads.screenHeight]).toEqual([1680, 1050]);
+  expect(ads.cookies.map((cookie) => cookie.name)).toEqual(["auth_token"]);
+  if (engine === "firefox") {
+    expect(ads.ua).toContain("Firefox");
+    expect(ads.firefox!.config["navigator.userAgent"]).toBe(ads.ua);
+  }
+  store.close();
+});

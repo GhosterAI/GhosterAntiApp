@@ -1,0 +1,222 @@
+diff --git a/lib/utilsBundle.js b/lib/utilsBundle.js
+index 188aa33465d8f91ca457237873952f966be4272e..7324a9f0d4b7f7d9370d428216952ba26cf82dfc 100644
+--- a/lib/utilsBundle.js
++++ b/lib/utilsBundle.js
+@@ -58,8 +58,9 @@ const program = require("./utilsBundleImpl").program;
+ const ProgramOption = require("./utilsBundleImpl").ProgramOption;
+ const progress = require("./utilsBundleImpl").progress;
+ const SocksProxyAgent = require("./utilsBundleImpl").SocksProxyAgent;
+-const ws = require("./utilsBundleImpl").ws;
+-const wsServer = require("./utilsBundleImpl").wsServer;
++const _rawWs = require("ws");
++const ws = _rawWs.default || _rawWs;
++const wsServer = _rawWs.WebSocketServer || _rawWs.Server;
+ const wsReceiver = require("./utilsBundleImpl").wsReceiver;
+ const wsSender = require("./utilsBundleImpl").wsSender;
+ const yaml = require("./utilsBundleImpl").yaml;
+diff --git a/lib/server/transport.js b/lib/server/transport.js
+index 2502a8e..211c914 100644
+--- a/lib/server/transport.js
++++ b/lib/server/transport.js
+@@ -25,21 +25,22 @@ module.exports = __toCommonJS(transport_exports);
+ var import_utils = require("../utils");
+ var import_happyEyeballs = require("./utils/happyEyeballs");
+ var import_utilsBundle = require("../utilsBundle");
+-const perMessageDeflate = {
+-  clientNoContextTakeover: true,
+-  zlibDeflateOptions: {
+-    level: 3
+-  },
+-  zlibInflateOptions: {
+-    chunkSize: 10 * 1024
+-  },
+-  threshold: 10 * 1024
++const perMessageDeflate = false;
++const webSocketTransportStats = globalThis[Symbol.for("ghosteranti.playwrightTransportStats")] ??= {
++  opened: 0,
++  closed: 0,
++  forced: 0,
++  active: 0
+ };
++const kWebSocketCloseTimeout = 5e3;
+ class WebSocketTransport {
+   constructor(progress, url, logUrl, options) {
+     this.headers = [];
+     this.wsEndpoint = url;
+     this._logUrl = logUrl;
++    this._closeTimer = void 0;
++    this._closeRequested = false;
++    this._closed = false;
+     this._ws = new import_utilsBundle.ws(url, [], {
+       maxPayload: 256 * 1024 * 1024,
+       // 256Mb,
+@@ -48,6 +49,8 @@ class WebSocketTransport {
+       agent: /^(https|wss):\/\//.test(url) ? import_happyEyeballs.httpsHappyEyeballsAgent : import_happyEyeballs.httpHappyEyeballsAgent,
+       perMessageDeflate
+     });
++    webSocketTransportStats.opened++;
++    webSocketTransportStats.active++;
+     this._ws.on("upgrade", (response) => {
+       for (let i = 0; i < response.rawHeaders.length; i += 2) {
+         this.headers.push({ name: response.rawHeaders[i], value: response.rawHeaders[i + 1] });
+@@ -65,7 +68,7 @@ class WebSocketTransport {
+           parsedJson = JSON.parse(eventData);
+         } catch (e) {
+           this._progress?.log(`<closing ws> Closing websocket due to malformed JSON. eventData=${eventData} e=${e?.message}`);
+-          this._ws.close();
++          this.close();
+           return;
+         }
+         try {
+@@ -73,11 +76,12 @@ class WebSocketTransport {
+             this.onmessage.call(null, parsedJson);
+         } catch (e) {
+           this._progress?.log(`<closing ws> Closing websocket due to failed onmessage callback. eventData=${eventData} e=${e?.message}`);
+-          this._ws.close();
++          this.close();
+         }
+       });
+     });
+     this._ws.addEventListener("close", (event) => {
++      this._didClose();
+       this._progress?.log(`<ws disconnected> ${logUrl} code=${event.code} reason=${event.reason}`);
+       if (this.onclose)
+         this.onclose.call(null, event.reason);
+@@ -105,12 +109,12 @@ class WebSocketTransport {
+       transport._ws.on("error", (event) => {
+         progress?.log(`<ws connect error> ${logUrl} ${event.message}`);
+         reject(new Error("WebSocket error: " + event.message));
+-        transport._ws.close();
++        transport.close();
+       });
+       transport._ws.on("unexpected-response", (request, response) => {
+         if (options.followRedirects && !hadRedirects && (response.statusCode === 301 || response.statusCode === 302 || response.statusCode === 307 || response.statusCode === 308)) {
+           fulfill({ redirect: response });
+-          transport._ws.close();
++          transport.close();
+           return;
+         }
+         for (let i = 0; i < response.rawHeaders.length; i += 2) {
+@@ -125,7 +129,7 @@ class WebSocketTransport {
+ ${Buffer.concat(chunks)}` : errorPrefix;
+           progress?.log(`<ws unexpected response> ${error}`);
+           reject(new Error("WebSocket error: " + error));
+-          transport._ws.close();
++          transport.close();
+         });
+       });
+     });
+@@ -152,15 +156,43 @@ ${Buffer.concat(chunks)}` : errorPrefix;
+   send(message) {
+     this._ws.send(JSON.stringify(message));
+   }
+-  close() {
++  _didClose() {
++    if (this._closeTimer)
++      clearTimeout(this._closeTimer);
++    this._closeTimer = void 0;
++    if (this._closed)
++      return;
++    this._closed = true;
++    webSocketTransportStats.closed++;
++    webSocketTransportStats.active = Math.max(0, webSocketTransportStats.active - 1);
++  }
++  close(forceTimeout = kWebSocketCloseTimeout) {
++    if (this._ws.readyState === import_utilsBundle.ws.CLOSED) {
++      this._didClose();
++      return;
++    }
++    if (this._closeRequested)
++      return;
++    this._closeRequested = true;
+     this._progress?.log(`<ws disconnecting> ${this._logUrl}`);
++    this._closeTimer = setTimeout(() => {
++      if (this._ws.readyState === import_utilsBundle.ws.CLOSED) {
++        this._didClose();
++        return;
++      }
++      webSocketTransportStats.forced++;
++      this._ws.terminate();
++    }, Math.max(1, forceTimeout));
++    this._closeTimer.unref?.();
+     this._ws.close();
+   }
+-  async closeAndWait() {
+-    if (this._ws.readyState === import_utilsBundle.ws.CLOSED)
++  async closeAndWait(forceTimeout = kWebSocketCloseTimeout) {
++    if (this._ws.readyState === import_utilsBundle.ws.CLOSED) {
++      this._didClose();
+       return;
++    }
+     const promise = new Promise((f) => this._ws.once("close", f));
+-    this.close();
++    this.close(forceTimeout);
+     await promise;
+   }
+ }
+diff --git a/lib/server/browserContext.js b/lib/server/browserContext.js
+--- a/lib/server/browserContext.js
++++ b/lib/server/browserContext.js
+@@ -214,6 +214,10 @@ class BrowserContext extends import_instrumentation.SdkObject {
+     return await this.doGetCookies(urls);
+   }
+   async clearCookies(options) {
++    if (!options.name && !options.domain && !options.path) {
++      await this.doClearCookies();
++      return;
++    }
+     const currentCookies = await this.cookies();
+     await this.doClearCookies();
+     const matches = (cookie, prop, value) => {
+diff --git a/lib/server/chromium/crPage.js b/lib/server/chromium/crPage.js
+--- a/lib/server/chromium/crPage.js
++++ b/lib/server/chromium/crPage.js
+@@ -408,7 +408,9 @@ class FrameSession {
+     if (!this._page.isStorageStatePage) {
+       if (this._crPage._browserContext.needsPlaywrightBinding())
+         promises.push(this.exposePlaywrightBinding());
+-      if (this._isMainFrame())
++      // Focus emulation makes every attached tab read document.hasFocus() as true and fire focus
++      // and blur events. GhosterAnti's own helpers turn it off, so the user's tabs never see them.
++      if (this._isMainFrame() && globalThis[Symbol.for("ghosteranti.playwrightFocusEmulation")] !== false)
+         promises.push(this._client.send("Emulation.setFocusEmulationEnabled", { enabled: true }));
+       const options = this._crPage._browserContext._options;
+       if (options.bypassCSP)
+diff --git a/lib/server/chromium/crBrowser.js b/lib/server/chromium/crBrowser.js
+--- a/lib/server/chromium/crBrowser.js
++++ b/lib/server/chromium/crBrowser.js
+@@ -315,7 +315,7 @@ class CRBrowserContext extends import_browserContext.BrowserContext {
+     return this._crPages().map((crPage) => crPage._page);
+   }
+   async doCreateNewPage() {
+-    const { targetId } = await this._browser._session.send("Target.createTarget", { url: "about:blank", browserContextId: this._browserContextId });
++    const { targetId } = await this._browser._session.send("Target.createTarget", { url: "about:blank", browserContextId: this._browserContextId, background: true });
+     return this._browser._crPages.get(targetId)._page;
+   }
+   async doGetCookies(urls) {diff --git a/lib/server/firefox/ffBrowser.js b/lib/server/firefox/ffBrowser.js
+--- a/lib/server/firefox/ffBrowser.js
++++ b/lib/server/firefox/ffBrowser.js
+@@ -221,7 +221,8 @@ class FFBrowserContext extends import_browserContext.BrowserContext {
+   }
+   async doCreateNewPage() {
+     const { targetId } = await this._browser.session.send("Browser.newPage", {
+-      browserContextId: this._browserContextId
++      browserContextId: this._browserContextId,
++      ...this._creatingStorageStatePage ? { hidden: true } : {}
+     }).catch((e) => {
+       if (e.message.includes("Failed to override timezone"))
+         throw new Error(`Invalid timezone ID: ${this._options.timezoneId}`);
+diff --git a/lib/server/chromium/chromium.js b/lib/server/chromium/chromium.js
+--- a/lib/server/chromium/chromium.js
++++ b/lib/server/chromium/chromium.js
+@@ -98,7 +98,9 @@
+       const wsEndpoint = await urlToWSEndpoint(progress, endpointURL, headersMap);
+       chromeTransport = await import_transport.WebSocketTransport.connect(progress, wsEndpoint, { headers: headersMap });
+       const browserProcess = { close: doClose, kill: doClose };
+-      const persistent = { noDefaultViewport: true };
++      // Attaching to the user's browser never changes the colour scheme, motion, forced colours or
++      // contrast its open pages see: Playwright's defaults would emulate light, no-preference and none.
++      const persistent = { noDefaultViewport: true, colorScheme: "no-override", reducedMotion: "no-override", forcedColors: "no-override", contrast: "no-override" };
+       const browserOptions = {
+         slowMo: options.slowMo,
+         name: "chromium",

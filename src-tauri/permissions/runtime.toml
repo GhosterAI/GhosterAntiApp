@@ -1,0 +1,9 @@
+[[permission]]
+identifier = "allow-runtime-ready"
+description = "Allows the GhosterAnti UI to publish non-secret agent runtime readiness."
+commands.allow = ["agent_runtime_ready"]
+
+[[permission]]
+identifier = "allow-script-capability"
+description = "Allows the trusted GhosterAnti window to authenticate script operations."
+commands.allow = ["script_capability"]

@@ -1,0 +1,641 @@
+name: Linux desktop build
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit, branch or tag to build
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: Version of the built app
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Linux x64 app
+    # The oldest supported runner sets the glibc baseline of the app.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install the build libraries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev build-essential pkg-config
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: bun install --frozen-lockfile
+      - name: Build the app
+        run: bun run desktop:build:linux
+      - name: Package the release files
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -er .version src-tauri/tauri.conf.json)"
+          data="$(find src-tauri/target/release/bundle/deb -mindepth 2 -maxdepth 2 -type d -name data | head -n 1)"
+          test -n "$data"
+          app="$RUNNER_TEMP/GhosterAnti"
+          rm -rf "$app"
+          # The app folder is the package's /usr tree: bin/ beside lib/GhosterAnti, where Tauri finds resources.
+          cp -a "$data/usr" "$app"
+          find "$app" -maxdepth 4 -not -path "*/lib/GhosterAnti/*" | sort
+          for file in ghosteranti ghosteranti-sidecar ghosteranti-mcp; do
+            test -x "$app/bin/$file"
+          done
+          test -x "$app/lib/GhosterAnti/firefox/ghosteranti"
+          test -x "$app/lib/GhosterAnti/playwright/node/node"
+          "$app/lib/GhosterAnti/playwright/node/node" --version
+          # Python scripts download their runtime on first use; the app carries no Python.
+          test ! -e "$app/lib/GhosterAnti/playwright/python"
+          test -f "$app/share/icons/hicolor/512x512/apps/ghosteranti.png"
+          echo "System libraries of the app:"
+          ldd "$app/bin/ghosteranti" | awk '{ print $1 }' | sort | tr '\n' ' '
+          echo
+          files="$RUNNER_TEMP/release/v$version"
+          mkdir -p "$files"
+          tar --hard-dereference -czf "$files/GhosterAnti_${version}_x86_64-linux.tar.gz" -C "$RUNNER_TEMP" GhosterAnti
+          (cd "$files" && sha256sum "GhosterAnti_${version}_x86_64-linux.tar.gz" > SHA256SUMS-linux.txt)
+          ls -l "$files"
+          cat "$files/SHA256SUMS-linux.txt"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-linux-x64
+          path: ${{ runner.temp }}/release/v${{ steps.release.outputs.version }}/
+          if-no-files-found: error
+          compression-level: 0
+
+  smoke:
+    name: Linux smoke test (${{ matrix.os }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-linux-x64
+          path: ${{ runner.temp }}/release/v${{ needs.build.outputs.version }}
+      - name: Start a desktop session
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q xvfb openbox wmctrl xdotool imagemagick dbus-x11 sqlite3
+          # Ubuntu desktops since 23.10 restrict user namespaces as below; the runner image may not.
+          # Ubuntu 22.04 does not, and its AppArmor 3 has no rule to allow them.
+          if [[ "${{ matrix.os }}" == ubuntu-24.04 ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          fi
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          eval "$(dbus-launch --sh-syntax)"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          sleep 2
+          DISPLAY=:99 openbox > "$RUNNER_TEMP/openbox.log" 2>&1 &
+      - name: Install with the terminal installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.local/share/ghosteranti"
+          archive="GhosterAnti_${VERSION}_x86_64-linux.tar.gz"
+          # A damaged download must be refused before anything is installed.
+          bad="$RUNNER_TEMP/bad-release/v$VERSION"
+          mkdir -p "$bad"
+          cp "$RUNNER_TEMP/release/v$VERSION/SHA256SUMS-linux.txt" "$bad/"
+          head -c 1000000 "$RUNNER_TEMP/release/v$VERSION/$archive" > "$bad/$archive"
+          if GHOSTERANTI_RELEASE_BASE="file://$RUNNER_TEMP/bad-release" bash scripts/install-linux.sh --version "$VERSION"; then
+            echo "the installer accepted a damaged download"
+            exit 1
+          fi
+          test ! -e "$root"
+          export GHOSTERANTI_RELEASE_BASE="file://$RUNNER_TEMP/release"
+          bash scripts/install-linux.sh --version "$VERSION"
+          # A second run must find the installed version and change nothing.
+          before="$(stat -c %Y "$root")"
+          bash scripts/install-linux.sh --version "$VERSION"
+          test "$before" = "$(stat -c %Y "$root")"
+          test -x "$root/bin/ghosteranti"
+          grep -qx "Exec=\"$root/bin/ghosteranti\"" "$HOME/.local/share/applications/ghosteranti.desktop"
+          if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true)" == 1 ]]; then
+            sudo grep -q "^ghosteranti-chromium " /sys/kernel/security/apparmor/profiles
+          fi
+      - name: Start the app, open the engines and close it
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.local/share/ghosteranti"
+          data="$HOME/.local/share/com.ghosteranti.desktop"
+          helper="$root/bin/ghosteranti-mcp"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence" "$data"
+          printf '{"version":1,"mode":"local","localAnalytics":false}\n' > "$data/config.json"
+          shot() { import -window root "$evidence/$1.png" || true; }
+
+          "$root/bin/ghosteranti" > "$evidence/desktop.log" 2>&1 &
+          for attempt in $(seq 1 120); do
+            [[ -f "$data/agent-runtime.json" ]] && break
+            sleep 1
+          done
+          test -f "$data/agent-runtime.json"
+          port="$(jq -er .port "$data/agent-runtime.json")"
+          desktop="$(jq -er .desktopPid "$data/agent-runtime.json")"
+          sidecar="$(jq -er .sidecarPid "$data/agent-runtime.json")"
+          curl --fail --silent --show-error "http://127.0.0.1:$port/ui/api/health" | jq -e '.ok == true'
+          sleep 5
+          shot dashboard
+          wmctrl -lp | tee "$evidence/windows.txt"
+          grep -q " GhosterAnti$" "$evidence/windows.txt"
+
+          # A second start hands over to the running app and ends by itself.
+          timeout 60 "$root/bin/ghosteranti"
+          kill -0 "$desktop"
+          test "$(jq -er .desktopPid "$data/agent-runtime.json")" = "$desktop"
+
+          created="$("$helper" profiles create --name ci-firefox --temporary --engine firefox)"
+          profile="$(jq -er 'select(.ok) | .result.id' <<<"$created")"
+          # A Firefox launch must show one window only: no second window that opens and closes.
+          (
+            most=0
+            for round in $(seq 1 40); do
+              pids="$(pgrep -f "profiles/$profile" | paste -sd '|' - || true)"
+              if [[ -n "$pids" ]]; then
+                count="$(wmctrl -lp | awk -v pids="^($pids)\$" '$3 ~ pids' | wc -l)"
+                (( count > most )) && most="$count"
+              fi
+              sleep 0.25
+            done
+            echo "most windows at the same time: $most"
+          ) > "$evidence/firefox-launch-windows.txt" &
+          window_count=$!
+          "$helper" browser open --profile "$profile" --url https://example.com/ | jq -e '.ok and .result.engine == "firefox"'
+          wait "$window_count"
+          cat "$evidence/firefox-launch-windows.txt"
+          grep -qx "most windows at the same time: 1" "$evidence/firefox-launch-windows.txt"
+          shot firefox-profile
+          "$helper" browser status --profile "$profile" | tee "$evidence/status.json" | jq -e '.ok'
+
+          observe() {
+            local id="$1" key="$2" observed=""
+            for attempt in $(seq 1 60); do
+              observed="$(sqlite3 "$data/profiles.sqlite" "select fp_observed_json from profiles where id = '$id'")"
+              [[ "$observed" == *"$key"* ]] && break
+              sleep 1
+            done
+            printf '%s' "$observed"
+          }
+
+          # A Firefox profile with a Windows identity must show its own stored graphics card, not this computer's.
+          created="$(curl --fail --silent --show-error -X POST "http://127.0.0.1:$port/ui/api/profiles" -H 'content-type: application/json' -d '{"name":"ci-firefox-windows","engine":"firefox","platformOs":"windows"}')"
+          winfx="$(jq -er '.profile.id // .id' <<<"$created")"
+          "$helper" browser open --profile "$winfx" --url https://example.com/ | jq -e '.ok'
+          observed="$(observe "$winfx" webglRenderer)"
+          printf "%s" "$observed" > "$evidence/firefox-windows-observed.json"
+          jq '{userAgent, platform, webglVendor, webglRenderer, hardwareConcurrency}' <<<"$observed" | tee "$evidence/firefox-windows-identity.json"
+          jq -e '(.webglRenderer | contains("Direct3D11")) and (.webglVendor | startswith("Google Inc.")) and (.platform == "Win32")' <<<"$observed"
+          "$helper" browser close --profile "$winfx" | jq -e '.ok'
+
+          # Chromium 155 is downloaded on first use and runs with its sandbox.
+          created="$(curl --fail --silent --show-error -X POST "http://127.0.0.1:$port/ui/api/profiles" -H 'content-type: application/json' -d '{"name":"ci-chromium-155","chromiumRuntime":"ghosteranti","platformOs":"windows"}')"
+          chromium="$(jq -er '.profile.id // .id' <<<"$created")"
+          "$helper" browser open --profile "$chromium" --url https://example.com/ | jq -e '.ok and (.result.port | type == "number")'
+          sleep 5
+          shot chromium-155-profile
+          pgrep -af "runtimes/chromium-155.0.8059.31/chrome" | head -n 3 | tee "$evidence/chromium-155-processes.txt"
+          ! grep -q -- "--no-sandbox" "$evidence/chromium-155-processes.txt"
+          observed="$(observe "$chromium" platform)"
+          printf "%s" "$observed" > "$evidence/chromium-155-observed.json"
+          jq '{userAgent, platform, webglVendor, webglRenderer, hardwareConcurrency}' <<<"$observed" | tee "$evidence/chromium-155-identity.json"
+          jq -e '.platform == "Win32"' <<<"$observed"
+          # Chromium 155 must accept the DuckDuckGo default search setup, which runs after launch.
+          sleep 10
+
+          # Scripts: a JavaScript script runs on the bundled Node and leaves Python alone. The first
+          # Python script downloads the pinned Python runtime into the data folder, then runs.
+          nonce="$(jq -er .nonce "$data/agent-runtime.json")"
+          scripts_api() { curl --fail-with-body --silent --show-error -H "authorization: Bearer $nonce" -H 'content-type: application/json' "$@"; }
+          pyrt="$data/runtimes/python-3.13.7-playwright-1.58.0"
+          test ! -e "$pyrt"
+          run_script() {
+            local language="$1" source="$2" marker="$3" id run status=""
+            id="$(scripts_api -X POST "http://127.0.0.1:$port/ui/api/scripts" -d "$(jq -n --arg l "$language" --arg s "$source" '{name: ("ci-" + $l), description: "", language: $l, source: $s}')" | jq -er .script.id)"
+            run="$(scripts_api -X POST "http://127.0.0.1:$port/ui/api/scripts/run" -d "$(jq -n --arg id "$id" --arg p "$chromium" '{scriptId: $id, profileIds: [$p], inputs: {}, useCredentials: false}')" | jq -er .run.id)"
+            for attempt in $(seq 1 600); do
+              status="$(scripts_api "http://127.0.0.1:$port/ui/api/scripts/run" | jq -c .run)"
+              [[ "$(jq -r .status <<<"$status")" == finished ]] && break
+              sleep 1
+            done
+            scripts_api "http://127.0.0.1:$port/ui/api/scripts/log?runId=$run&offset=0" | jq -r .text | tee "$evidence/script-$language.log"
+            jq -e '.status == "finished" and .profiles[0].status == "succeeded"' <<<"$status" || { echo "$status"; return 1; }
+            grep -q "$marker" "$evidence/script-$language.log"
+          }
+          run_script javascript 'export default async ({ page, log }) => { await page.goto("data:text/html,js"); log("js-script-ran"); };' js-script-ran
+          test ! -e "$pyrt"
+          run_script python $'async def run(*, page, log, **_):\n    await page.goto("data:text/html,py")\n    log("python-script-ran")\n' python-script-ran
+          test -f "$pyrt/ghosteranti-runtime.sha256"
+          "$pyrt/bin/python3.13" -c "import greenlet, playwright.sync_api; print('python runtime ok')"
+          "$helper" browser close --profile "$chromium" | jq -e '.ok'
+          ! grep -q "search provider setup failed" "$data"/logs/*.log
+
+          # A CloakBrowser profile from Windows arrives without a Chromium runtime. The app must
+          # download the Linux CloakBrowser build for it and must not use Chromium 155.
+          bun -e '
+            import { buildNewProfile } from "./create.ts";
+            import { serializeAdsTxt } from "./parse.ts";
+            const profile = buildNewProfile({ name: "ci-cloakbrowser", platformOs: "windows", chromiumRuntime: "cloakbrowser" }, () => false);
+            // As made on Windows: a CloakBrowser profile with its stored processor cores.
+            process.stdout.write(serializeAdsTxt([{ ...profile, hardware: { cores: 20 } }]));
+          ' > "$data/inbox/ci-cloakbrowser.txt"
+          cloak=""
+          for attempt in $(seq 1 60); do
+            cloak="$("$helper" profiles list | jq -r '.result.profiles[]? | select(.name == "ci-cloakbrowser") | .id' | head -n 1)"
+            [[ -n "$cloak" ]] && break
+            sleep 1
+          done
+          test -n "$cloak"
+          "$helper" browser open --profile "$cloak" --url https://example.com/ | jq -e '.ok and (.result.port | type == "number")'
+          sleep 8
+          shot cloakbrowser-profile
+          pgrep -af "runtimes/cloakbrowser-146.0.7680.177.5/chrome" | head -n 3 | tee "$evidence/cloakbrowser-processes.txt"
+          test -s "$evidence/cloakbrowser-processes.txt"
+          ! grep -q -- "--no-sandbox" "$evidence/cloakbrowser-processes.txt"
+          # The page must read the stored cores, not the engine default and not this computer's count.
+          observed="$(observe "$cloak" hardwareConcurrency)"
+          printf "%s" "$observed" > "$evidence/cloakbrowser-observed.json"
+          jq '{platform, hardwareConcurrency, webglRenderer}' <<<"$observed" | tee "$evidence/cloakbrowser-identity.json"
+          jq -e '.hardwareConcurrency == 20 and .platform == "Win32"' <<<"$observed"
+          "$helper" browser close --profile "$cloak" | jq -e '.ok'
+
+          # The stdio MCP host must answer an agent client and list the GhosterAnti tools.
+          {
+            printf '%s\n' \
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+              '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+            sleep 20
+          } | "$helper" serve > "$evidence/mcp.jsonl"
+          grep -q '"ghosteranti_profiles_list"' "$evidence/mcp.jsonl"
+          grep -q '"ghosteranti_browser_open"' "$evidence/mcp.jsonl"
+
+          # Remote MCP: the tunnel must start the packaged MCP host and pass messages both ways.
+          # A local server takes the place of GhosterAnti Cloud.
+          test "$(readlink "/proc/$sidecar/exe")" = "$root/bin/ghosteranti-sidecar"
+          HELPER="$helper" bun -e '
+            import { WebSocketServer } from "ws";
+            import { MCP_TUNNEL_PROTOCOL } from "./contracts/cloud-v1.ts";
+            import { McpTunnelRuntime } from "./mcp-tunnel.ts";
+            const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+            await new Promise((resolve) => server.once("listening", resolve));
+            const tools = new Promise((resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error("the tunnel returned no tool list")), 60_000);
+              server.on("connection", (socket, request) => {
+                if (request.url !== "/v1/mcp/tunnel" || request.headers["x-ghosteranti-device"] !== "ci-device") return socket.close();
+                const send = (frame) => socket.send(JSON.stringify({ protocol: MCP_TUNNEL_PROTOCOL, sessionId: "ci", ...frame }));
+                socket.on("message", (data) => {
+                  const frame = JSON.parse(data.toString());
+                  if (frame.type !== "message") return reject(new Error("the tunnel sent " + JSON.stringify(frame)));
+                  if (frame.payload.id === 1) {
+                    send({ type: "message", payload: { jsonrpc: "2.0", method: "notifications/initialized" } });
+                    send({ type: "message", payload: { jsonrpc: "2.0", id: 2, method: "tools/list" } });
+                  }
+                  if (frame.payload.id === 2) { clearTimeout(timer); resolve(frame.payload.result.tools.map((tool) => tool.name)); }
+                });
+                send({ type: "open" });
+                send({ type: "message", payload: { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "ci", version: "1" } } } });
+              });
+            });
+            const tunnel = new McpTunnelRuntime({
+              baseUrl: "http://127.0.0.1:" + server.address().port,
+              accessToken: () => "ci-token", deviceId: () => "ci-device-id", deviceCredential: () => "ci-device",
+              helperPath: process.env.HELPER,
+            });
+            tunnel.start();
+            const names = await tools;
+            await tunnel.stop();
+            server.close();
+            if (!names.includes("ghosteranti_profiles_list") || !names.includes("ghosteranti_browser_open")) throw new Error("the tool list is not complete");
+            console.log("Remote MCP tunnel listed " + names.length + " tools");
+          '
+
+          # Closing the window with a browser still open asks first, then closes that browser
+          # and stops the sidecar.
+          pgrep -f "profiles/$profile" >/dev/null
+          wmctrl -c GhosterAnti
+          dialog=""
+          for attempt in $(seq 1 30); do
+            dialog="$(xdotool search --name "Close GhosterAnti" 2>/dev/null | head -n 1 || true)"
+            [[ -n "$dialog" ]] && break
+            sleep 1
+          done
+          shot close-dialog
+          test -n "$dialog"
+          # GTK ignores keys sent to a window, so the dialog gets focus and real key presses.
+          xdotool windowactivate --sync "$dialog" || true
+          sleep 1
+          xdotool key alt+y
+          sleep 3
+          if xdotool search --name "Close GhosterAnti" >/dev/null 2>&1; then
+            # The Yes button fills the right half of the dialog's button row.
+            eval "$(xdotool getwindowgeometry --shell "$dialog")"
+            xdotool mousemove --window "$dialog" $((WIDTH * 3 / 4)) $((HEIGHT - 16)) click 1
+          fi
+          for attempt in $(seq 1 90); do
+            kill -0 "$desktop" 2>/dev/null || break
+            sleep 1
+          done
+          shot after-close
+          ! kill -0 "$desktop" 2>/dev/null
+          ! kill -0 "$sidecar" 2>/dev/null
+          test ! -f "$data/agent-runtime.json"
+          ! pgrep -f "profiles/$profile" >/dev/null
+      - name: Click outside links in the app window
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.local/share/ghosteranti"
+          data="$HOME/.local/share/com.ghosteranti.desktop"
+          evidence="$RUNNER_TEMP/evidence"
+          sudo apt-get install -y -q webkit2gtk-driver
+          # The app opens outside links with xdg-open; this one records the address instead.
+          fake="$RUNNER_TEMP/fake-browser"
+          mkdir -p "$fake"
+          OPENED="$evidence/opened-urls.txt"
+          : > "$OPENED"
+          printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$OPENED" > "$fake/xdg-open"
+          chmod +x "$fake/xdg-open"
+          cat "$fake/xdg-open"
+          # WebKitWebDriver starts the app with its window under automation, as tauri-driver does.
+          PATH="$fake:$PATH" TAURI_WEBVIEW_AUTOMATION=true WebKitWebDriver --port=4445 > "$evidence/webdriver.log" 2>&1 &
+          wd="http://127.0.0.1:4445"
+          for attempt in $(seq 1 30); do curl -sf -m 60 "$wd/status" >/dev/null && break; sleep 1; done
+          session="$(jq -nc --arg app "$root/bin/ghosteranti" '{capabilities: {alwaysMatch: {"webkitgtk:browserOptions": {binary: $app, args: []}}}}' \
+            | curl -sf -m 60 -X POST "$wd/session" -H 'content-type: application/json' -d @- | jq -er .value.sessionId)"
+          element() {
+            jq -nc --arg using "$1" --arg value "$2" '{using: $using, value: $value}' \
+              | curl -sf -m 60 -X POST "$wd/session/$session/element" -H 'content-type: application/json' -d @- \
+              | jq -er '.value | to_entries[0].value'
+          }
+          wait_element() {
+            local found=""
+            for attempt in $(seq 1 90); do
+              found="$(element "$1" "$2" 2>/dev/null || true)"
+              [[ -n "$found" ]] && { echo "$found"; return 0; }
+              sleep 1
+            done
+            echo "the app shows no $2" >&2
+            return 1
+          }
+          click() { curl -sf -m 60 -X POST "$wd/session/$session/element/$1/click" -H 'content-type: application/json' -d '{}' >/dev/null; }
+          opened() {
+            for attempt in $(seq 1 30); do
+              grep -qF "$1" "$OPENED" && return 0
+              sleep 1
+            done
+            echo "the app did not open $1 (it opened: $(tr '\n' ' ' < "$OPENED"))"
+            return 1
+          }
+          click "$(wait_element "css selector" 'a[href*="src=sidebar-cart"]')"
+          opened "https://nobleproxy.com/t/ghosteranti?src=sidebar-cart"
+          click "$(wait_element xpath "//button[normalize-space()='New Profile']")"
+          # A new Chrome profile on Linux starts on Chromium 155, and the help text must say so.
+          wait_element "css selector" 'button[aria-label="Chrome: Chromium 155 beta"]' >/dev/null
+          click "$(wait_element "css selector" 'a[href*="src=profile-dialog"]')"
+          opened "https://nobleproxy.com/t/ghosteranti?src=profile-dialog"
+          import -window root "$evidence/link-new-profile.png" || true
+          cat "$OPENED"
+          desktop="$(jq -er .desktopPid "$data/agent-runtime.json")"
+          wmctrl -c GhosterAnti
+          for attempt in $(seq 1 60); do kill -0 "$desktop" 2>/dev/null || break; sleep 1; done
+          ! kill -0 "$desktop" 2>/dev/null
+          curl -sf -m 60 -X DELETE "$wd/session/$session" >/dev/null || true
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence/logs"
+          cp "$HOME/.local/share/com.ghosteranti.desktop/logs/"*.log "$RUNNER_TEMP/evidence/logs/" 2>/dev/null || true
+          import -window root "$RUNNER_TEMP/evidence/final.png" || true
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns > "$RUNNER_TEMP/evidence/userns-restriction.txt" 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ghosteranti-linux-evidence-${{ matrix.os }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: warn
+
+  update:
+    name: Linux in-app update with a test key
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install the build libraries and a desktop session
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev build-essential pkg-config \
+            xvfb openbox wmctrl imagemagick dbus-x11 webkit2gtk-driver
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: bun install --frozen-lockfile
+      - name: Build and install the current version with a throwaway update key
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update"
+          mkdir -p "$work"
+          bunx tauri signer generate --ci -p "" -w "$work/update.key" > /dev/null
+          jq -n --arg pubkey "$(cat "$work/update.key.pub")" '{plugins: {updater: {pubkey: $pubkey}}}' > "$work/test-key.json"
+          bun run desktop:prepare:linux
+          bunx tauri build --bundles deb --config "$work/test-key.json"
+          data="$(find src-tauri/target/release/bundle/deb -mindepth 2 -maxdepth 2 -type d -name data | head -n 1)"
+          root="$HOME/.local/share/ghosteranti"
+          mkdir -p "$(dirname "$root")"
+          cp -a "$data/usr" "$root"
+          rm -rf src-tauri/target/release/bundle/deb
+      - name: Build and sign the successor version
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update"
+          current="$(jq -er .version src-tauri/tauri.conf.json)"
+          if [[ "$current" == *-* ]]; then
+            successor="$current.acceptance.1"
+          else
+            successor="${current%.*}.$((${current##*.} + 1))-acceptance.1"
+          fi
+          for file in package.json version.ts src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock; do
+            test "$(grep -oF "$current" "$file" | wc -l | tr -d ' ')" = 1
+            CURRENT="$current" SUCCESSOR="$successor" perl -pi -e 's/\Q$ENV{CURRENT}\E/$ENV{SUCCESSOR}/' "$file"
+          done
+          bun run desktop:prepare:linux
+          bunx tauri build --bundles deb --config "$work/test-key.json"
+          data="$(find src-tauri/target/release/bundle/deb -mindepth 2 -maxdepth 2 -type d -name data | head -n 1)"
+          cp -a "$data/usr" "$work/GhosterAnti"
+          archive="GhosterAnti_${successor}_x86_64-linux.tar.gz"
+          tar --hard-dereference -czf "$work/$archive" -C "$work" GhosterAnti
+          rm -rf "$work/GhosterAnti" src-tauri/target/release/bundle/deb
+          TAURI_SIGNING_PRIVATE_KEY="$(cat "$work/update.key")" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" bunx tauri signer sign "$work/$archive" > /dev/null
+          url="https://github.com/GhosterAI/GhosterAnti/releases/download/v$successor/$archive"
+          jq -n --arg version "$successor" --arg url "$url" --arg signature "$(cat "$work/$archive.sig")" \
+            '{version: $version, platforms: {"linux-x86_64": {url: $url, signature: $signature}}}' > "$work/latest-linux.json"
+          {
+            echo "CURRENT=$current"
+            echo "SUCCESSOR=$successor"
+            echo "ARCHIVE=$archive"
+          } >> "$GITHUB_ENV"
+      - name: Serve the successor as a GitHub release on this machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update"
+          cd "$work"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=GhosterAnti update test CA" -keyout ca.key -out ca.pem
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=github.com" -keyout leaf.key -out leaf.csr
+          printf 'subjectAltName=DNS:github.com,DNS:api.github.com\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > leaf.ext
+          openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile leaf.ext -out leaf.pem
+          sudo cp ca.pem /usr/local/share/ca-certificates/ghosteranti-update-test.crt
+          sudo update-ca-certificates
+          jq -n --arg version "$SUCCESSOR" --arg archive "$ARCHIVE" --arg work "$work" '{
+            candidateVersion: $version,
+            manifestName: "latest-linux.json",
+            installerName: $archive,
+            manifestUrl: "https://github.com/GhosterAI/GhosterAnti/releases/download/v\($version)/latest-linux.json",
+            installerUrl: "https://github.com/GhosterAI/GhosterAnti/releases/download/v\($version)/\($archive)",
+            manifestPath: "\($work)/latest-linux.json",
+            installerPath: "\($work)/\($archive)",
+            certificatePath: "\($work)/leaf.pem",
+            privateKeyPath: "\($work)/leaf.key",
+            statePath: "\($work)/fixture-state.json"
+          }' > fixture.json
+          sudo cp /etc/hosts "$work/hosts.backup"
+          echo "127.0.0.1 github.com api.github.com" | sudo tee -a /etc/hosts > /dev/null
+          sudo -b "$(command -v node)" "$GITHUB_WORKSPACE/scripts/windows-updater-https-fixture.mjs" "$work/fixture.json"
+          for attempt in $(seq 1 30); do [[ -f fixture-state.json ]] && break; sleep 1; done
+          curl --fail --silent --show-error "https://api.github.com/repos/GhosterAI/GhosterAnti/releases?per_page=10" | jq -e --arg tag "v$SUCCESSOR" '.[0].tag_name == $tag'
+      - name: Update through the dashboard and verify the relaunched app
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update"
+          evidence="$RUNNER_TEMP/update-evidence"
+          mkdir -p "$evidence"
+          root="$HOME/.local/share/ghosteranti"
+          helper="$root/bin/ghosteranti-mcp"
+          data="$HOME/.local/share/com.ghosteranti.desktop"
+          mkdir -p "$data"
+          printf '{"version":1,"mode":"local","localAnalytics":false}\n' > "$data/config.json"
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp > "$evidence/xvfb.log" 2>&1 &
+          export DISPLAY=:99
+          eval "$(dbus-launch --sh-syntax)"
+          sleep 2
+          openbox > "$evidence/openbox.log" 2>&1 &
+          # WebKitWebDriver starts the app with its window under automation, so the test can click.
+          TAURI_WEBVIEW_AUTOMATION=true WebKitWebDriver --port=4445 > "$evidence/webdriver.log" 2>&1 &
+          wd="http://127.0.0.1:4445"
+          for attempt in $(seq 1 30); do curl -sf -m 60 "$wd/status" >/dev/null && break; sleep 1; done
+          session="$(jq -nc --arg app "$root/bin/ghosteranti" '{capabilities: {alwaysMatch: {"webkitgtk:browserOptions": {binary: $app, args: []}}}}' \
+            | curl -sf -m 60 -X POST "$wd/session" -H 'content-type: application/json' -d @- | jq -er .value.sessionId)"
+          for attempt in $(seq 1 120); do [[ -f "$data/agent-runtime.json" ]] && break; sleep 1; done
+          test "$(jq -er .appVersion "$data/agent-runtime.json")" = "$CURRENT"
+          old_pid="$(jq -er .desktopPid "$data/agent-runtime.json")"
+          # A Chromium profile would start its browser download from github.com, which the fixture rejects.
+          kept="$("$helper" profiles create --name keep-me --engine firefox | jq -er 'select(.ok) | .result.id')"
+          # The dashboard checks for updates by itself; wait until it has read the release feed.
+          for attempt in $(seq 1 60); do
+            [[ "$(sudo jq -r '.counts.manifest' "$work/fixture-state.json")" -ge 1 ]] && break
+            sleep 1
+          done
+          button=""
+          for attempt in $(seq 1 60); do
+            button="$(jq -nc '{using: "xpath", value: "//button[normalize-space()=\"Update now\"]"}' \
+              | curl -sf -m 60 -X POST "$wd/session/$session/element" -H 'content-type: application/json' -d @- \
+              | jq -er '.value | to_entries[0].value' 2>/dev/null || true)"
+            [[ -n "$button" ]] && break
+            sleep 1
+          done
+          import -window root "$evidence/before-update.png" || true
+          test -n "$button"
+          curl -sf -m 60 -X POST "$wd/session/$session/element/$button/click" -H 'content-type: application/json' -d '{}' >/dev/null
+          sleep 5
+          import -window root "$evidence/after-click.png" || true
+          for attempt in $(seq 1 240); do
+            version="$(jq -r '.appVersion // empty' "$data/agent-runtime.json" 2>/dev/null || true)"
+            [[ "$version" == "$SUCCESSOR" ]] && break
+            sleep 1
+          done
+          sleep 5
+          import -window root "$evidence/after-update.png" || true
+          cp "$data/update-attempt.json" "$evidence/" || true
+          test "$(jq -er .appVersion "$data/agent-runtime.json")" = "$SUCCESSOR"
+          ! kill -0 "$old_pid" 2>/dev/null
+          jq -e --arg from "$CURRENT" --arg to "$SUCCESSOR" '.state == "succeeded" and .sourceVersion == $from and .expectedVersion == $to' "$data/update-attempt.json"
+          # The new folder replaced the old one in place, and the profile data survived.
+          "$root/bin/ghosteranti-mcp" version | grep -q "\"$SUCCESSOR\""
+          ls -a "$(dirname "$root")" | tee "$evidence/data-home.txt"
+          ! grep -q "^\.ghosteranti-" "$evidence/data-home.txt"
+          "$helper" profiles list | grep -q "\"$kept\""
+          sudo jq -e '.counts.installer >= 1 and .counts.rejected == 0' "$work/fixture-state.json"
+      - name: Restore name resolution
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          work="$RUNNER_TEMP/update"
+          [[ -f "$work/hosts.backup" ]] && sudo cp "$work/hosts.backup" /etc/hosts
+          cp "$HOME/.local/share/com.ghosteranti.desktop/update-attempt.json" "$RUNNER_TEMP/update-evidence/" 2>/dev/null || true
+          cp "$HOME/.local/share/com.ghosteranti.desktop/logs/"*.log "$RUNNER_TEMP/update-evidence/" 2>/dev/null || true
+          sudo cp "$work/fixture-state.json" "$RUNNER_TEMP/update-evidence/" 2>/dev/null || true
+          sudo chmod -R a+r "$RUNNER_TEMP/update-evidence" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ghosteranti-linux-update-evidence
+          path: ${{ runner.temp }}/update-evidence
+          if-no-files-found: warn

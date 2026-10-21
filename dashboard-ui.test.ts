@@ -1,0 +1,1005 @@
+import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const app = readFileSync(join(import.meta.dir, "web", "app.tsx"), "utf8").replaceAll("\r\n", "\n");
+const proxyOffer = readFileSync(join(import.meta.dir, "web", "proxy-offer.tsx"), "utf8");
+const styles = readFileSync(join(import.meta.dir, "web", "styles.css"), "utf8").replaceAll("\r\n", "\n");
+const logo = readFileSync(join(import.meta.dir, "web", "ghost-mark.svg"), "utf8").replaceAll("\r\n", "\n");
+const notice = readFileSync(join(import.meta.dir, "NOTICE"), "utf8");
+
+test("dashboard renders the approved GhosterAnti logo and it survives dark mode", () => {
+  // The mark is inlined so the outline can ride currentColor: the packaged
+  // SVG's #111827 stroke is invisible on a dark surface.
+  expect(app).toContain("function GhostMark(");
+  expect(app).toContain('stroke="currentColor"');
+  expect(app).toContain('<div className="brand"><GhostMark />GhosterAnti</div>');
+  expect(app).toContain('<div className="onboarding-brand"><GhostMark />GhosterAnti');
+  expect(styles).toContain(".ghost-mark .ghost-eyes { stroke: var(--accent); }");
+  expect(styles).not.toContain(".brand::before");
+  // Both marks draw the same approved paths as the packaged asset.
+  const paths = [
+    'd="M128 400V240C128 169 185 112 256 112C327 112 384 169 384 240V400L352 368L320 400L288 368L256 400L224 368L192 400L160 368Z"',
+    'd="M216 256V288M296 256V288"',
+  ];
+  for (const path of paths) {
+    expect(app).toContain(path);
+    expect(logo).toContain(path);
+  }
+});
+
+test("dashboard exposes account settings and confirms mode switching", () => {
+  expect(app).toContain('aria-label={t("Open Account and Settings")}');
+  expect(app).toContain("<ModeSwitchConfirmation");
+  expect(app).toContain("Cloud profiles will not appear until you switch back");
+  expect(app).toContain("does not upload them to Cloud automatically");
+  expect(app).toContain("Accept and continue to Cloud");
+  expect(app).not.toContain(">Stay Local</button>");
+  expect(app).toContain('t("Switch to {target}", { target: isCloudMode ? t("Local") : t("Cloud") })');
+  expect(app).toContain('invoke("restart_after_mode_change")');
+});
+
+test("dashboard offers HTTPS proxies in both profile forms", () => {
+  expect(app.match(/<option value="https">https<\/option>/g)).toHaveLength(2);
+});
+
+test("dashboard shows curated desktop update notes and live progress", () => {
+  expect(app).toContain('import { Channel } from "@tauri-apps/api/core"');
+  expect(app).toContain('type DesktopUpdateStatus =');
+  expect(app).toContain('invoke("check_for_updates")');
+  expect(app).toContain('invoke("update_now", { onProgress })');
+  expect(app).toContain('message.phase === "ready"');
+  expect(app).toContain('{ ...status, version: message.version, highlights: message.highlights }');
+  expect(app).not.toContain('invoke("check_for_updates",');
+  expect(app).toContain("desktopUpdateCheckStarted.current = true");
+  expect(app).toContain("GhosterAnti checks for updates when it starts.");
+  expect(app).toContain('className="update-highlights"');
+  expect(app).toContain('<summary>What’s new in {version}</summary>');
+  expect(app).toContain('<progress max={100} value={percent ?? undefined}');
+  expect(app).toContain("Preparing update…");
+  expect(app).toContain("Downloading update…");
+  expect(app).toContain("Verifying update…");
+  expect(app).toContain("Saving and closing browsers…");
+  expect(app).toContain("Installing and restarting…");
+  expect(app).toContain('{desktopUpdateErr && <span className="modal-err" role="alert">{desktopUpdateErr}</span>}');
+  expect(app).toContain('disabled={modeBusy || desktopUpdateInstalling}');
+  expect(app).toContain('className="update-banner"');
+  expect(styles).toContain(".update-banner");
+  expect(styles).toContain(".update-highlights");
+  expect(styles).toContain(".update-progress progress");
+  expect(styles).toContain("accent-color: var(--accent)");
+});
+
+test("dashboard shows the durable result in its banner and Updates panel", () => {
+  expect(app).toContain('parseDesktopUpdateResult');
+  expect(app).toContain('invoke("last_update_result")');
+  expect(app).toContain('setDesktopUpdateResult(parseDesktopUpdateResult(value))');
+  expect(app).toContain('className={`update-banner update-result ${desktopUpdateResultSummary.tone}`}');
+  expect(app).toContain('aria-label={t("Dismiss last update result")}');
+  expect(app).toContain('className={`update-last-result ${desktopUpdateResultSummary.tone}`}');
+  expect(app).toContain('{desktopUpdateResultSummary.title}');
+  expect(app).toContain('{desktopUpdateResultSummary.detail}');
+  expect(styles).toContain('.update-banner.update-result.success');
+  expect(styles).toContain('.update-last-result.warning');
+  expect(styles).toContain('.update-last-result.error');
+});
+
+test("dashboard contains long roster labels inside the window", () => {
+  expect(app).toContain('className="profile-table"');
+  // The name sits in its own truncatable span; the fingerprint badge rides
+  // alongside it inside that span, so match the wrapper rather than the whole
+  // element (which changes whenever anything is added next to the name).
+  expect(app).toContain('<span className="n">{p.name}');
+  expect(app).toContain('<td className="col-group" title={p.group}>');
+  expect(app).toContain('className="select move-group"');
+  // Every truncatable cell carries its full value as a title, so hovering shows
+  // what the ellipsis hid.
+  expect(app).toContain('title={`${p.name}\\n${p.id}`}');
+  expect(app).toContain('title={p.tags?.length ? p.tags.join(", ") : "No tags"}');
+  expect(app).toContain('title={p.proxyError || p.proxy || "no proxy"}');
+  // Fixed layout plus per-column clipping keeps a long value inside its cell.
+  expect(styles).toContain("table-layout: fixed");
+  expect(styles).toContain("td.col-no, td.col-name, td.col-group, td.col-tags, td.col-proxy { overflow: hidden; text-overflow: ellipsis; }");
+});
+
+test("Account settings offers fenced Cloud sign-out and clears account state", () => {
+  expect(app).toContain('"Sign out / Switch account"');
+  expect(app).toContain("await signOutCloud();");
+  expect(app).toContain("authGeneration.current++;");
+  expect(app).toContain("setCloudAuth({ authenticated: false });");
+  expect(app).toContain("setProfiles([]);");
+  expect(app).toContain("setTeam(null);");
+  expect(app).toContain("generation !== authGeneration.current");
+
+  const account = app.slice(
+    app.indexOf('<h2 className="sect-title">{t("Account information")}</h2>'),
+    app.indexOf('className="settings-card remote-mcp-settings"'),
+  );
+  expect(account).toContain('{authErr && <p className="modal-err" role="alert">{authErr}</p>}');
+});
+
+test("dashboard accepts a server-persisted pending queue key", () => {
+  expect(app).toContain("result.queueKeyPersisted !== true");
+  expect(app).toContain('typeof result.queueKey === "string" ? result.queueKey : undefined');
+});
+
+test("Account settings prepares and protects one app-owned Remote MCP connector", () => {
+  expect(app).toContain('key: "remote_mcp_connector"');
+  expect(app).toContain('createCloudConnector()');
+  expect(app).toContain('fetchCloudConnector(stored.connectorId)');
+  expect(app).toContain('storeDesktopRemoteMcpCredential({ version: 1, state: "disabled" })');
+  expect(app).toContain('{t("Remote MCP")}</h2>');
+  expect(app).toContain('{t("MCP server URL")}</span>');
+  expect(app).toContain('{t("Access key")}</span>');
+  expect(app).toContain('remoteMcpTokenVisible ? remoteMcp.token : "••••••••••••••••••••••••"');
+  expect(app).toContain('{t("Connect Claude.ai or ChatGPT")}</strong>');
+  expect(app).toContain('t("Paste the MCP server URL and select Connect.")');
+  expect(app).toContain('t("Sign into GhosterAnti and select Allow.")');
+  expect(app).toContain('t("Claude.ai and ChatGPT use OAuth and do not need the access key.")');
+  expect(app).not.toContain('web connectors are not supported');
+  expect(app).toContain('t("Regenerate key")');
+  expect(app).toContain('t("Enable Remote MCP")');
+  expect(app).toContain('if (remoteMcpAccountExit.current) return Promise.resolve();');
+  expect(app).toContain('await prepareRemoteMcpForAccountExit(true);\n      await forgetCloudSession();');
+  expect(app).toContain('if (view !== "settings" || !isCloudMode || !workspaceReady || restartRequired) return;');
+  expect(app).toContain('await prepareRemoteMcpForAccountExit();\n      await signOutCloud();');
+  expect(styles).toContain('.remote-mcp-status.active');
+  expect(styles).toContain('.remote-mcp-value input');
+});
+
+test("dashboard recovers saved Cloud sessions without false sign-out", () => {
+  expect(app).toContain('type SavedSessionPhase = "restoring" | "manual-signin" | "retryable-failure";');
+  expect(app).toContain('useState<SavedSessionPhase>("restoring")');
+  expect(app).toContain("Restoring saved session");
+  expect(app).toContain(">Try again</button>");
+  expect(app).toContain(">Sign in instead</button>");
+  expect(app).toContain("error instanceof CloudSessionRestoreError && !error.retryable");
+  expect(app).toContain("setScheduledRefreshPending(true)");
+  expect(app).toContain('window.addEventListener("online", retryWhenOnline)');
+  expect(app).toContain("await forgetCloudSession()");
+  expect(app).toContain("const savedSessionRestoreEnabled = useRef(true)");
+  expect(app).toContain("if (!savedSessionRestoreEnabled.current || restoreInFlight.current) return;");
+  expect(app).toContain("generation !== authGeneration.current || !savedSessionRestoreEnabled.current");
+  expect(app).toContain("savedSessionRestoreEnabled.current = false");
+  expect(app).toContain("cloudSessionContextReady(state)");
+});
+
+test("Account settings exposes fixed Cloud diagnostics without raw server messages", () => {
+  expect(app).toContain("fetchCloudEvents");
+  expect(app).toContain("Recent diagnostics");
+  expect(app).toContain("CLOUD_DIAGNOSTIC_LABELS[event.type]");
+  expect(app).toContain("Cloud lease ended after a version conflict");
+  expect(app).toContain("Browser teardown could not be confirmed");
+  expect(app).toContain("Session synchronization has a terminal conflict");
+  expect(app).toContain("They exclude profile data and credentials");
+  expect(styles).toContain(".diagnostics-list");
+});
+
+test("dashboard shows close warnings without an open-only prefix", () => {
+  expect(app).toContain("else if (r && r.warning) setActionErr(r.warning);");
+  expect(app).not.toContain("Opened — ${r.warning}");
+  expect(app).toContain("if (r?.ok === false) issues.push");
+  expect(app).toContain("else if (r?.warning) issues.push");
+});
+
+test("dashboard lists the supported profile platforms", () => {
+  for (const platform of [
+    "x.com",
+    "instagram.com",
+    "facebook.com",
+    "tiktok.com",
+    "linkedin.com",
+    "reddit.com",
+    "telegram.org",
+  ]) {
+    expect(app).toContain(`value: "${platform}"`);
+  }
+});
+
+test("New and Edit profile dialogs check proxies and show only relevant provider offers", () => {
+  const createModal = app.slice(app.indexOf("{showCreate && ("), app.indexOf("{editId && ("));
+  const editModal = app.slice(app.indexOf("{editId && ("), app.indexOf("{showBulk && ("));
+
+  expect(proxyOffer).toContain('const PROXY_PROVIDER_URL = "https://nobleproxy.com/t/ghosteranti";');
+  // Every link names its placement, so NobleProxy can report which one sells.
+  expect(proxyOffer).toContain('url.searchParams.set("src", placement);');
+  expect(app).not.toContain("<ProxyProviderOffer />");
+  expect(app).not.toContain("<ProxyProviderOffer replacement />");
+  expect(proxyOffer).toContain("replacement ?");
+  expect(app).not.toContain("outreachproxy.com");
+  expect(app).not.toContain("OutreachProxy");
+  for (const modal of [createModal, editModal]) {
+    expect(modal).toContain("Check proxy");
+    expect(modal).toContain("<ProxyCheckFeedback");
+  }
+  expect(proxyOffer).toContain('target="_blank"');
+  expect(proxyOffer).toContain('rel="noreferrer"');
+  // A profile that already has a proxy keeps the offer, so Edit profile shows it too.
+  expect(app).toContain('if (!result) return <ProxyProviderOffer placement="profile-dialog" />;');
+  // In the desktop app the shell plugin cancels outside-link clicks that reach <body>.
+  // The root stops them first, so the shell's allowlist opens the link.
+  expect(app).toContain(`if (event.target instanceof Element && event.target.closest('a[target="_blank"]')) event.stopPropagation();`);
+  expect(proxyOffer).toContain('aria-label={t("Buy static residential proxies from NobleProxy at the GhosterAnti user price (opens externally)")}');
+  expect(proxyOffer).toContain('replacement ? t("Buy Replacement Proxy") : t("Buy Static Residential Proxy")');
+  // The offer is an GhosterAnti-only price, not a sale banner.
+  expect(proxyOffer).toContain("GhosterAnti price");
+  expect(proxyOffer).toContain("Only GhosterAnti users pay 40% less");
+  expect(proxyOffer).not.toContain("40% OFF");
+  expect(proxyOffer).not.toContain("Need a proxy?");
+  expect(app).toContain('if (k === "proxyType" || k === "host" || k === "port" || k === "user" || k === "pass")');
+  expect(app).toContain('if (k === "proxy" || k === "proxyType") {\n      resetEditProxyCheck();');
+  expect(app).toContain("generation === createProxyCheckGeneration.current");
+  expect(app).toContain("generation === editProxyCheckGeneration.current");
+  expect(app).toContain("createProxyCheckGeneration.current++");
+  expect(app).toContain("editProxyCheckGeneration.current++");
+  expect(createModal).toContain('className="btn primary" disabled={creating}');
+  expect(editModal).toContain('className="btn primary" disabled={editSaving || editLoading || timezoneBusy}');
+  for (const tone of ["working", "unstable", "failed", "unavailable"]) {
+    expect(styles).toContain(`.proxy-check-result.${tone}`);
+  }
+  expect(styles).toContain(".proxy-referral {");
+  expect(styles).toContain(".proxy-referral:focus-visible");
+  // Both Proxies tools (check and replace) show the offer, and the page names
+  // how many profiles have no proxy. That count is Local-mode only.
+  const proxiesPage = readFileSync(join(import.meta.dir, "web", "proxies.tsx"), "utf8");
+  expect(proxiesPage.match(/<ProxyProviderOffer /g)).toHaveLength(3);
+  expect(proxiesPage).toContain('<ProxyProviderOffer placement="proxies-no-proxy" missing={profilesWithoutProxy} />');
+  expect(app).toContain("const profilesWithoutProxy = isCloudMode ? 0 : profiles.filter((p) => !p.proxy?.trim()).length;");
+  expect(app).toContain('<ProxyProviderOffer placement="import-no-proxy" missing={profilesWithoutProxy} />');
+  // Sidebar cart beside Proxies opens the same offer; the icon rail hides it.
+  expect(app).toContain('className="navbuy"');
+  expect(app).toContain('href={proxyOfferUrl("sidebar-cart", language)}');
+  expect(styles).toContain(".sidebar.collapsed .navbuy { display: none; }");
+});
+
+test("dashboard selects browser for new profiles", () => {
+  const createModal = app.slice(app.indexOf("{showCreate && ("), app.indexOf("{editId && ("));
+  const editModal = app.slice(app.indexOf("{editId && ("), app.indexOf("{showBulk && ("));
+  expect(createModal).toContain('className="browser-options"');
+  expect(createModal).toContain('engine: "chromium", label: "Chrome"');
+  expect(createModal).toContain('engine: "firefox", label: "Firefox"');
+  // The help text follows the engine that this computer creates, such as Chromium 155 on a Mac.
+  expect(createModal).toContain('const runtime = browserLabel(engine, appMode?.legacyRemote ? "" : appMode?.chromiumRuntime ?? form.chromiumRuntime, ownChromium);');
+  expect(createModal).toContain('type="radio" name="browser-engine"');
+  expect(createModal).toContain('checked={form.engine === engine}');
+  expect(createModal).toContain('setF("engine", engine)');
+  expect(createModal).toContain('aria-label={`${label}: ${runtime}`}');
+  expect(createModal).toContain('data-tip={runtime}');
+  expect(createModal).not.toContain('<select value={form.engine}');
+  expect(createModal.indexOf('className="browser-options"')).toBeGreaterThan(createModal.indexOf('<FingerprintSettings'));
+  expect(createModal.indexOf('className="browser-options"')).toBeLessThan(createModal.indexOf('className="modal-foot"'));
+  expect(styles).toContain('.browser-info:focus-visible::after');
+  expect(styles).toContain('.browser-card:has(input:focus-visible)');
+  expect(styles).toContain('.browser-card:has(input:checked) { background: var(--browser-selected);');
+  expect(styles).not.toContain('.browser-option:has(input:checked) { color: var(--browser-surface); }');
+  expect(app).toContain("engine: form.engine,");
+  expect(editModal).toContain("value={browserLabel(editEngine, editChromiumRuntime, ownChromium)} readOnly");
+  expect(editModal).not.toContain('setEF("engine"');
+  expect(editModal).not.toContain('setEF("chromiumRuntime"');
+  // New profiles start on this computer's default engine: GhosterAnti Chromium on Windows, GhosterAnti
+  // Firefox on macOS and Linux. Chromium 155 is GhosterAnti Chromium on Windows and a beta elsewhere.
+  expect(app).toContain('const ownChromium = appMode?.defaultEngine === "chromium";');
+  expect(app).toContain('return ownChromium ? "GhosterAnti Chromium" : "Chromium 155 beta";');
+  expect(app).toContain('setForm({ ...BLANK_FORM, engine: appMode?.defaultEngine ?? "chromium", chromiumRuntime: appMode?.defaultChromiumRuntime ?? "", group:');
+  // Chrome version: 155 is the default where this computer can run it, and 146 stays the default
+  // elsewhere. 155 works in Local and Cloud, not legacy Remote. Choosing 146 asks for CloakBrowser.
+  expect(createModal).toContain('{form.engine === "chromium" && !appMode?.legacyRemote && !appMode?.chromiumRuntime && (');
+  expect(createModal).toContain('? <><option value="ghosteranti">{ownChromium ? t("155 (default)") : t("155 beta")}</option><option value="">{t("146")}</option></>');
+  expect(createModal).toContain(': <><option value="">{t("146 (default)")}</option><option value="ghosteranti">{t("155 beta")}</option></>}');
+  expect(app).toContain('chromiumRuntime: "" as "" | "ghosteranti"');
+  expect(app).toContain('...(form.engine === "chromium" && !appMode?.legacyRemote ? { chromiumRuntime: form.chromiumRuntime || "cloakbrowser" } : {}),');
+  // A CloakBrowser choice or profile shows the linkability note, in every bundled language.
+  const note = "CloakBrowser profiles on one computer can be linked to each other. Use GhosterAnti Chromium or GhosterAnti Firefox for separate identities.";
+  expect(app).toContain(`const CLOAKBROWSER_NOTE = "${note}";`);
+  expect(createModal).toMatch(/<small>\{!form\.chromiumRuntime\s+\? t\(CLOAKBROWSER_NOTE\)/);
+  expect(editModal).toContain('{editEngine === "chromium" && !editChromiumRuntime && <small>{t(CLOAKBROWSER_NOTE)}</small>}');
+  // The fingerprint hints hold for every engine, so they name none.
+  const hints = [
+    "The browser keeps the locked values coordinated. Screen and operating system are the only fingerprint settings you can override.",
+    "Screen, operating system, and timezone can be changed. The browser keeps the other values coordinated.",
+  ];
+  for (const hint of hints) expect(app).toContain(`t("${hint}")`);
+  expect(app).not.toContain("CloakBrowser keeps the locked values");
+  expect(app).not.toContain("CloakBrowser controls the other values");
+  for (const locale of ["ru-RU", "zh-CN"]) {
+    const catalog = JSON.parse(readFileSync(join(import.meta.dir, "web", "locales", `${locale}.json`), "utf8"));
+    expect(catalog[note]).toContain("GhosterAnti Chromium");
+    for (const hint of hints) expect(catalog[hint]).toBeTruthy();
+  }
+  expect(app).toContain('Native Firefox profile · no CDP, PDF, or Chrome extensions');
+  expect(app).toContain('{p.engine === "chromium" && <>');
+  expect(app).toContain('selectedProfilesSupportChromeExtensions');
+});
+
+test("both engines offer OS choices at creation and only Chromium allows later OS edits", () => {
+  const settings = app.slice(app.indexOf("function FingerprintSettings("), app.indexOf("function FingerprintSettings(") + 3300);
+  expect(settings).not.toMatch(/\{engine === "chromium" && \(\s*<label className="fld">\s*<span>Operating system/);
+  for (const os of ["windows", "macos", "linux"]) expect(settings).toContain(`<option value="${os}">`);
+  expect(settings).toContain("{onPlatformOsChange ? (");
+  expect(settings).toContain("onPlatformOsChange(event.target.value)");
+  expect(settings).toContain('readOnly tabIndex={-1} className="ro"');
+  expect(app).toContain('platformOs={form.platformOs} onPlatformOsChange={(value) => setF("platformOs", value)}');
+  expect(app).toContain('platformOs={editForm.platformOs ?? ""} onPlatformOsChange={editEngine === "chromium" ? (value) => setEF("platformOs", value) : undefined}');
+});
+
+test("Local timezone follows the proxy and can be refreshed on request", () => {
+  expect(app).toContain("Stored · set from the proxy automatically");
+  expect(app).toContain("refreshProfileTimezone(id)");
+  expect(app).toContain("Set timezone from proxy");
+});
+
+test("running profile rows expose Bring to front in Local and Cloud mode", () => {
+  expect(app).toContain('data-tip={t("Bring to front")}');
+  expect(app).toContain('aria-label={t("Bring this browser window to the front")}');
+  expect(app).toContain('onClick={() => act(p.id, raiseProfile)}');
+  // The running-row branch must stay mode-agnostic: raising a window is a local
+  // action on a browser this machine already opened, in Cloud mode too.
+  const runningBranch = app.slice(app.indexOf("{p.running ? ("), app.indexOf(") : p.mobilePersona ? ("));
+  expect(runningBranch).toContain("Bring to front");
+  expect(runningBranch).not.toContain("isCloudMode");
+});
+
+test("running profile rows expose live cookie addition in every mode", () => {
+  expect(app).toContain('data-tip={t("Add cookie")}');
+  expect(app).toContain('aria-label={`Add a cookie to ${p.name}`}');
+  expect(app).toContain('onClick={() => openCookie(p)}');
+
+  const runningBranch = app.slice(app.indexOf("{p.running ? ("), app.indexOf(") : p.mobilePersona ? ("));
+  expect(runningBranch).toContain("Add cookie");
+  expect(runningBranch).not.toContain("isCloudMode");
+
+  expect(app).toContain('aria-labelledby="add-cookie-title"');
+  expect(app).toContain('<span>{t("Name")}</span>');
+  expect(app).toContain('<span>{t("Value")}</span>');
+  expect(app).toContain('<span>{t("Domain")}</span>');
+  expect(app).toContain('<span>{t("Path")}</span>');
+  expect(app).toContain('type="password" autoComplete="off"');
+  expect(app).toContain("await addProfileCookie(cookieProfile.id, cookieForm);");
+  expect(app).toContain('flash("Cookie added to the open browser.");');
+  expect(app).not.toContain('className="modal-backdrop" onClick={closeCookie}');
+});
+
+test("Cloud rows expose Edit and Convert device only with effective Edit permission", () => {
+  // Running rows are editable (live edit through the local cache); only rows
+  // locked by ANOTHER session stay read-only.
+  expect(app).toContain('(p.permission === "edit" && !p.lockedBy)');
+  expect(app).toContain('(!isCloudMode || p.permission === "edit")');
+  expect(app).toContain('title={t("Convert this mobile persona to a desktop device")}');
+  expect(app).toContain("setEditExpectedVersion(p.expectedVersion ?? null)");
+  expect(app).toContain("isCloudMode && !editLive ? editExpectedVersion ?? undefined : undefined");
+  expect(app).toContain("!isCloudMode && editTotp");
+  expect(app).toContain("!isCloudMode && editMobile");
+});
+
+test("Cloud profile pickers use only editable folders", () => {
+  expect(app).toContain('<GroupPicker value={form.group} onChange={(v) => setF("group", v)} groups={editableGroups} allowCreate={!isCloudMode} />');
+  expect(app).toContain('<GroupPicker value={editForm.group ?? ""} onChange={(v) => setEF("group", v)} groups={editableGroups} allowCreate={!isCloudMode} />');
+  expect(app).toContain('group !== "all" && (!isCloudMode || editableGroups.includes(group))');
+  expect(app).toContain('<GroupPicker value={bulkGroup} onChange={setBulkGroup} groups={isCloudMode ? editableGroups : existingGroups} allowCreate={!isCloudMode} />');
+});
+
+test("bulk import accepts pasted AdsPower text in Local and Cloud mode", () => {
+  expect(app).toContain('className="btn importbtn tip"');
+  expect(app).toContain('disabled={!canEditCloud}');
+  expect(app).toContain('value={bulkText}');
+  expect(app).toContain('onChange={(event) => setBulkText(event.target.value)}');
+  expect(app).toContain('new File([bulkText], "pasted-adspower.txt", { type: "text/plain" })');
+  expect(app).toContain('setBulkText("")');
+  expect(app).toContain('bulkBusy || (!bulkFiles.length && !bulkText.trim()) || (isCloudMode && !bulkGroup)');
+  expect(app).not.toContain('max 1000');
+});
+
+test("bulk import uploads provider files unchanged", () => {
+  expect(app).toContain('const list = Array.from(files);');
+  expect(app).toContain('const uploads = [...bulkFiles];');
+  expect(app).not.toContain("prepUploads");
+  expect(app).not.toContain("csvToBlocks");
+  expect(app).toContain('accept=".csv,.txt,.json,.xlsx,text/plain,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"');
+  for (const provider of ["AdsPower", "GoLogin", "Multilogin", "Dolphin Anty", "HideMyAcc", "Incogniton", "Donut"]) {
+    expect(app).toContain(provider);
+  }
+});
+
+test("Cloud workspace loads independently and refreshes with Account Settings", () => {
+  expect(app).toContain("if (!isCloudMode || !workspaceReady || restartRequired) return;\n    void loadTeam();");
+  expect(app).toContain("void loadCloudEvents();\n    void loadTeam();");
+  expect(app).toContain("await Promise.all([load(), loadTeam()]);");
+});
+
+test("manual Cloud refresh reloads folder access as well as profiles", async () => {
+  const source = app.slice(app.indexOf("  const refreshRoster ="), app.indexOf("  useEffect(() => {", app.indexOf("  const refreshRoster =")));
+  for (const cloud of [false, true]) {
+    const calls: string[] = [];
+    const refresh = new Function("load", "loadTeam", "isCloudMode", "setRefreshing", `${source}\nreturn refreshRoster;`)(
+      async () => { calls.push("profiles"); }, async () => { calls.push("team"); }, cloud, () => {},
+    );
+    await refresh();
+    expect(calls).toEqual(cloud ? ["profiles", "team"] : ["profiles"]);
+  }
+});
+
+test("sidebar creates persistent groups and gates Cloud deletion to workspace managers", () => {
+  expect(app).toContain("const [registeredGroups, setRegisteredGroups] = useState<string[]>([]);");
+  expect(app).toContain("team?.folders.filter((folder) => !folder.archivedAt) ?? []");
+  expect(app).toContain("folderTree(folders)");
+  expect(app).toContain("const canManageCloudFolders = cloudAuth?.workspace?.role === \"owner\" || cloudAuth?.workspace?.role === \"admin\";");
+  expect(app).toContain('className="newgroup"');
+  expect(app).toContain('{isCloudMode ? t("New folder") : t("New group")}');
+  expect(app).toContain('if (name === "all") {');
+  expect(app).toContain('cloudWorkspaceAction("delete-folder", { name: g })');
+  expect(app).toContain("!isCloudMode || canManageCloudFolders");
+  expect(styles).toContain(".newgroup");
+});
+
+test("Team settings guide invitations and explicit folder access", () => {
+  for (const heading of ["Members", "Invitations", "Join another workspace"]) expect(app).toContain(`{t("${heading}")}</h3>`);
+  // The "Your folder access" self-listing was removed on request: an owner or
+  // admin already sees every folder, so the list said nothing.
+  expect(app).not.toContain("Your folder access");
+  expect(app).toContain('t("Invitations go to that exact verified email. New members see no folders until you grant access here.")');
+  expect(app).toContain('t("Paste the code from your invitation email. It works only for the email you signed in with.")');
+  expect(app).toContain('t(statusCode === "expired" ? "Expired" : "Pending")');
+  expect(app).toContain('t("{folder} access for {email}", { folder: folder.name, email: member.email })');
+  expect(app).toContain('t("Resend invitation to {email}", { email: invite.email })');
+  expect(app).toContain('if (ok) setTeamEmail("")');
+  expect(app).toContain('className="notice" role="status"');
+  expect(styles).toContain(".team-tag");
+  expect(styles).toContain(".team-code input:focus");
+});
+
+test("Admin invitations are read-only for Admin viewers", () => {
+  expect(app).toContain('cloudAuth?.workspace?.role === "owner" || invite.role === "member"');
+  expect(app).toContain("Resend");
+  expect(app).toContain("Revoke");
+});
+
+test("Cloud Delete requires edit permission for every selected profile", () => {
+  expect(app).toContain('const selectedEditable = [...selected].every((id) => profiles.find((profile) => profile.id === id)?.permission === "edit");');
+  expect(app).toContain('{(!isCloudMode || selectedEditable) && (');
+  expect(app).toContain('data-tip={appMode?.legacyRemote ? t("Delete selected profiles") : t("Move selected profiles to Trash")} disabled={!selected.size || deleting} onClick={deleteSelected}');
+  expect(app).toContain('setSelected(new Set([...(r.locked ?? []), ...(r.failed ?? [])]));');
+});
+
+test("the roster numbers every profile and prefers a custom NO. over the serial", () => {
+  // Mirrors profileDisplayNo in launcher.ts so the row, the browser window title
+  // and the identity bookmark all show the same number.
+  expect(app).toContain("function displayNo(profile: UiProfile, fallbackIndex: number)");
+  expect(app).toContain('const custom = (profile.customNo ?? "").trim();');
+  expect(app).toContain("if (custom) return { value: custom, custom: true };");
+  expect(app).toContain("if (profile.serial != null) return { value: String(profile.serial), custom: false };");
+  // Numbering is resolved against the unsorted roster, so sorting cannot renumber rows.
+  expect(app).toContain("profiles.forEach((profile, index) => map.set(profile.id, displayNo(profile, index)));");
+  expect(app).toContain('className={`no-text${no.custom ? " custom" : ""}`}');
+  // The number stands alone — the colored identity disc was removed on request.
+  expect(app).not.toContain("ProfileAvatar");
+  expect(styles).not.toContain(".no-avatar");
+});
+
+test("the custom NO. editor is Local-only and digits-only", () => {
+  expect(app).toContain("const MAX_CUSTOM_NO = 12;"); // matches MAX_CUSTOM_NO_LENGTH in parse.ts
+  expect(app).toContain("<span>{t(\"Custom NO.\")}</span>");
+  expect(app).toContain("<small>{t(\"Digits only · blank uses the serial\")}</small>");
+  // The placeholder shows the serial that would be used instead, so an empty
+  // field is never ambiguous about what the browser window will display.
+  expect(app).toContain('placeholder={editSerial != null ? String(editSerial) : "auto"}');
+  expect(app).toContain('setEF("customNo", e.target.value.replace(/\\D/g, "").slice(0, MAX_CUSTOM_NO))');
+  // Cloud profiles round-trip through the portable-profile contract, which has
+  // no custom NO. field — so it is never offered or sent in Cloud mode.
+  expect(app).toContain('...(!isCloudMode ? { customNo: editForm.customNo ?? "" } : {}),');
+  expect(app).toContain('...(isCloudMode ? {} : { customNo: form.customNo }),');
+});
+
+test("the roster is sortable, pageable and its columns are selectable", () => {
+  expect(app).toContain("const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: \"no\", dir: 1 });");
+  expect(app).toContain("current.key === key ? { key, dir: current.dir === 1 ? -1 : 1 } : { key, dir: 1 }");
+  // A running browser is the row an operator acts on next, so it outranks the sort column.
+  expect(app).toContain("if (a.running !== b.running) return a.running ? -1 : 1;");
+  expect(app).toContain('aria-sort={sort.key === key ? (sort.dir === 1 ? "ascending" : "descending") : "none"}');
+  expect(app).toContain('aria-label={t("Choose visible columns")}');
+  expect(app).toContain('aria-label={t("Rows per page")}');
+  expect(app).toContain("const PAGE_SIZES = [25, 50, 100, 200];");
+  expect(app).toContain('const DEFAULT_HIDDEN_COLUMNS: ColumnKey[] = ["tags"];');
+  // Layout preferences are a convenience; disabled storage must not break the roster.
+  expect(app).toContain("catch { return new Set(DEFAULT_HIDDEN_COLUMNS); }");
+  expect(app).toContain("catch { /* private mode / disabled storage */ }");
+});
+
+test("tag search shares the existing folder, number, name, and ID filter", () => {
+  const source = app.slice(app.indexOf("    const matched = profiles.filter"), app.indexOf("    // Running profiles stay on top"));
+  const filter = new Function("profiles", "group", "q", "numbering", "sharedOnly = false", "sharedProfiles = []", "selectedScope = new Set([group])", `${source}\nreturn matched;`);
+  const profiles = [
+    { id: "alpha", name: "First", group: "A", tags: ["Warm", "Priority"] },
+    { id: "beta", name: "Second", group: "B", tags: ["warm"] },
+    { id: "gamma", name: "Third", group: "A", tags: [] },
+    { id: "delta", name: "Fourth", group: "A" },
+  ];
+  const numbering = new Map(profiles.map((p, i) => [p.id, { value: String(i + 101) }]));
+  const ids = (q: string, group = "all") => filter(profiles, group, q, numbering).map((p: { id: string }) => p.id);
+  expect(ids("WARM")).toEqual(["alpha", "beta"]);
+  expect(ids("warm", "A")).toEqual(["alpha"]);
+  expect(ids("rior")).toEqual(["alpha"]);
+  expect(ids("GAMMA")).toEqual(["gamma"]);
+  expect(ids("FOURTH")).toEqual(["delta"]);
+  expect(ids("103")).toEqual(["gamma"]);
+  expect(ids("missing")).toEqual([]);
+  expect(ids("", "A")).toEqual(["alpha", "gamma", "delta"]);
+  expect(filter(profiles, "Parent", "warm", numbering, false, [], new Set(["Parent", "A"])).map((p: { id: string }) => p.id)).toEqual(["alpha"]);
+  expect(filter(profiles, "all", "warm", numbering, true, [profiles[1]]).map((p: { id: string }) => p.id)).toEqual(["beta"]);
+
+  const tagged = Array.from({ length: 60 }, (_, i) => ({ id: `p-${i}`, name: "Profile", group: "A", tags: ["Warm"] }));
+  const matched = filter(tagged, "A", "warm", new Map());
+  const selection = rosterSelection(matched, new Set(["other-folder"]), "A", "warm");
+  selection.selectAllFiltered();
+  expect(selection.selected().size).toBe(60);
+  expect(selection.selected().has("other-folder")).toBe(false);
+  const page = rosterSelection(matched, new Set(), "A", "warm", 1);
+  page.toggleAll();
+  expect(page.selected().size).toBe(10);
+});
+
+test("import entry points keep permission checks and collapsed labels", () => {
+  const sidebar = app.slice(app.indexOf('className="newrow"'), app.indexOf('className="sidenav"'));
+  const empty = app.slice(app.indexOf('className="empty-actions"'), app.indexOf('className="empty-actions"') + 450);
+  for (const entry of [sidebar, empty]) {
+    expect(entry).toContain("onClick={openBulk}");
+    expect(entry).toContain("disabled={!canEditCloud}");
+  }
+  expect(sidebar).toContain('aria-label={t("Import profiles")}');
+  expect(sidebar).toContain('<span className="navlabel">{t("Import profiles")}</span>');
+});
+
+function rosterSelection(filtered: { id: string }[], selected = new Set<string>(), group = "all", q = "", page = 0) {
+  const source = app.slice(app.indexOf("  const allVisibleSelected ="), app.indexOf("  const moveSelected ="));
+  const controls = new Function("visibleProfiles", "filtered", "selected", "group", "q", "setSelected", "t", `${source}
+    return { toggleAll, selectAllFiltered, allFilteredSelected, selectedOutsideFilter, selectionScope };`)(
+    filtered.slice(page * 50, (page + 1) * 50), filtered, selected, group, q,
+    (next: Set<string> | ((current: Set<string>) => Set<string>)) => {
+      selected = typeof next === "function" ? next(selected) : next;
+    },
+    (s: string) => s,
+  );
+  return { ...controls, selected: () => selected };
+}
+
+test("page selection stays page-only and scope selection reaches all 1600 profiles", () => {
+  const profiles = Array.from({ length: 1600 }, (_, i) => ({ id: `profile-${i}` }));
+  const page = rosterSelection(profiles);
+  page.toggleAll();
+  expect([...page.selected()]).toEqual(profiles.slice(0, 50).map((p) => p.id));
+  const scope = rosterSelection(profiles, page.selected());
+  expect(scope.allFilteredSelected).toBe(false);
+  scope.selectAllFiltered();
+  expect([...scope.selected()]).toEqual(profiles.map((p) => p.id));
+  expect(rosterSelection(profiles, scope.selected(), "all", "", 12).allFilteredSelected).toBe(true);
+});
+
+test("folder and search scope selection replaces unrelated hidden selections", () => {
+  const profiles = Array.from({ length: 1600 }, (_, i) => ({ id: `folder-${i}` }));
+  const scope = rosterSelection(profiles, new Set(["other-folder"]), "Imported");
+  expect(scope.selectedOutsideFilter).toBe(1);
+  expect(scope.selectionScope).toContain("Imported");
+  scope.selectAllFiltered();
+  expect([...scope.selected()]).toEqual(profiles.map((p) => p.id));
+  expect(scope.selected().has("other-folder")).toBe(false);
+
+  const matches = profiles.filter((_, i) => i % 2 === 0);
+  const search = rosterSelection(matches, scope.selected(), "Imported", "search");
+  expect(search.selectedOutsideFilter).toBe(800);
+  expect(search.allFilteredSelected).toBe(false);
+  search.selectAllFiltered();
+  expect([...search.selected()]).toEqual(matches.map((p) => p.id));
+  expect(rosterSelection([], new Set()).allFilteredSelected).toBe(false);
+});
+
+test("selection controls expose scope selection and clearing without changing export permissions", () => {
+  expect(app).not.toContain("allVisibleSelected && !allFilteredSelected");
+  expect(app).toContain("disabled={deleting || allFilteredSelected}");
+  expect(app).toContain("onClick={selectAllFiltered}");
+  expect(app).toContain('aria-label={t("Clear selection")} onClick={() => setSelected(new Set())}');
+  expect(app).toContain('q ? t("matching profiles") : t("profiles")');
+  expect(app).toContain('group === "all" ? "" :');
+  expect(app).toContain("const ids = [...selected];");
+  expect(app).toContain("await exportProfiles(ids, format, (progress) => setExportProgress(progress));");
+});
+
+test("export shows live progress, blocks duplicate exports, and always clears busy state", async () => {
+  const source = app
+    .slice(app.indexOf("const exportSelected = async"), app.indexOf("// ---- Transient success banner"))
+    .replace("(format: ExportFormat)", "(format)"); // strip the one TS annotation for plain-JS evaluation
+  expect(source).toContain("exportProfiles(ids, format, (progress) => setExportProgress(progress))");
+  const makeExportSelected = new Function(
+    "selected", "exportProgress", "exportProfiles", "setExportOpen", "setActionErr", "setExportProgress", "flash",
+    `${source}\nreturn (format) => exportSelected(format);`,
+  );
+  const ids = new Set(["a", "b", "c"]);
+  const progress: unknown[] = [];
+  let opened = false;
+  let err: string | null = "stale";
+  const flashes: string[] = [];
+  type ExportFn = (ids: string[], format: string, onProgress?: (p: { completed: number; total: number }) => void) => Promise<void>;
+  const run = (busy: unknown, impl: ExportFn): ((format: string) => Promise<void>) =>
+    makeExportSelected(ids, busy, impl, () => { opened = false; }, (e: string | null) => { err = e; }, (p: unknown) => { progress.push(p); }, (m: string) => { flashes.push(m); }) as (format: string) => Promise<void>;
+
+  await run(null, async (_ids, _format, onProgress) => {
+    onProgress?.({ completed: 3, total: 3 });
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  })("txt");
+  expect(progress).toEqual([{ completed: 0, total: 3 }, { completed: 3, total: 3 }, null]); // seeded → live → cleared
+  expect(opened).toBe(false); // the format menu closes before the request starts
+  expect(err).toBeNull(); // a stale action error is cleared, not left visible
+  expect(flashes).toEqual(["Exported 3 profiles as TXT"]);
+
+  progress.length = 0;
+  let called = 0;
+  await run({ completed: 0, total: 3 }, async () => { called++; })("txt"); // already exporting
+  expect(called).toBe(0); // a second export never starts while one is in flight
+
+  await run(null, async () => { throw new Error("Export interrupted"); })("txt");
+  expect(progress.at(-1)).toBeNull(); // busy state clears on failure too
+  expect(err).toBe("Error: Export interrupted");
+  expect(flashes).toEqual(["Exported 3 profiles as TXT"]); // no success banner for the failure
+});
+
+test("export progress banner renders counts, the build phase, and disables competing actions", () => {
+  expect(app).toContain('const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);');
+  expect(app).toContain('exportProgress.completed >= exportProgress.total');
+  expect(app).toContain('"Building export file…"');
+  expect(app).toContain("`Preparing export: ${exportProgress.completed.toLocaleString()} / ${exportProgress.total.toLocaleString()} profiles`");
+  expect(app).toContain('disabled={!selected.size || !!exportProgress}'); // export menu + file-update dialog
+  expect(app).toContain("{exportOpen && selected.size > 0 && !exportProgress && (");
+});
+
+test("header controls stay reachable and dismissable", () => {
+  expect(app).toContain("function useDismiss<T extends HTMLElement>(open: boolean, close: () => void)");
+  expect(app).toContain('document.addEventListener("mousedown", onDown);');
+  expect(app).toContain('if (event.key === "Escape") onClose.current();');
+  expect(app).toContain('aria-label={t("Refresh profiles")}');
+  expect(app).toContain('aria-label="Automation node freshness"');
+  expect(app).toContain('aria-label={t("Open Account and Settings")}');
+});
+
+test("the dashboard typeface is bundled, never fetched at runtime", () => {
+  // GhosterAnti is local-first and must render correctly with no network, so the
+  // face ships with the app. A CDN @import or an https font URL is a regression.
+  expect(styles).toContain('src: url("./fonts/inter-latin.woff2") format("woff2")');
+  expect(styles).toContain('src: url("./fonts/inter-latin-ext.woff2") format("woff2")');
+  expect(styles).not.toContain("fonts.googleapis.com");
+  expect(styles).not.toContain("fonts.gstatic.com");
+  expect(styles).not.toMatch(/@import\s+url\(/);
+
+  for (const file of ["inter-latin.woff2", "inter-latin-ext.woff2"]) {
+    const bytes = readFileSync(join(import.meta.dir, "web", "fonts", file));
+    expect(bytes.length).toBeGreaterThan(1000);
+    expect(bytes.subarray(0, 4).toString("latin1")).toBe("wOF2"); // real woff2, not an error page
+  }
+
+  // One variable file per subset covers every weight the UI asks for.
+  expect(styles).toContain("font-weight: 100 900;");
+  expect(styles).toContain("font-display: swap;");
+  // Splitting by unicode-range keeps a latin-only roster off the larger subset.
+  expect(styles.match(/unicode-range:/g)?.length).toBe(2);
+
+  // SIL OFL requires the license to travel with the font.
+  const license = readFileSync(join(import.meta.dir, "web", "fonts", "Inter-LICENSE.txt"), "utf8");
+  expect(license).toContain("SIL OPEN FONT LICENSE");
+  expect(notice).toContain("Inter typeface");
+});
+
+test("New profile and Edit are instant dialogs; Scripts, Settings and Extensions are pages", () => {
+  expect(app).toContain('useState<"profiles" | "scripts" | "settings" | "extensions" | "proxies" | "trash">("profiles")');
+  expect(app).toContain("const [showCreate, setShowCreate] = useState(false);");
+  expect(app).toContain('aria-labelledby="create-profile-title"');
+  expect(app).toContain('aria-labelledby="edit-profile-title"');
+  expect(app).toContain('const closeCreate = () => {\n    resetCreateProxyCheck();\n    setShowCreate(false);');
+  expect(app).toContain("PAGE_TITLES[view]");
+  // Edit opens on the click — the detail fetch fills the dialog in when it
+  // lands, and a stale response for an abandoned dialog is discarded.
+  expect(app).toContain("editFetchId.current = id;");
+  expect(app).toContain("if (editFetchId.current !== id) return;");
+  expect(app).toContain('<p className="hint" role="status">{t("Loading profile…")}</p>');
+  expect(app).toContain("disabled={editSaving || editLoading || timezoneBusy}");
+});
+
+test("running profiles are editable, live-synced in Cloud mode", () => {
+  // A Cloud profile open on THIS device is edited through the local cache; the
+  // running session's checkpoint/close sync carries the change to Cloud.
+  expect(app).toContain("const [editLive, setEditLive] = useState(false);");
+  expect(app).toContain("setEditLive(p.liveEdit === true);");
+  expect(app).toContain("isCloudMode && !editLive && editExpectedVersion === null");
+  expect(app).toContain("isCloudMode && !editLive ? editExpectedVersion ?? undefined : undefined");
+  expect(app).toContain("Changes save to this device now and sync to Cloud when it closes.");
+  expect(app).toContain("Changes save now and apply the next time it launches.");
+});
+
+test("the sidebar collapses to an icon rail and remembers it", () => {
+  expect(app).toContain('const SIDEBAR_KEY = "ghosteranti.shell.sidebarCollapsed";');
+  expect(app).toContain("function readSidebarCollapsed(): boolean {");
+  expect(app).toContain('writeSetting(SIDEBAR_KEY, collapsed ? "0" : "1")');
+  expect(app).toContain('aria-expanded={!sidebarCollapsed}');
+  expect(app).toContain('data-tip={sidebarCollapsed ? t("Expand sidebar") : t("Collapse sidebar")}');
+  // Labels must be elements, not bare text, or they cannot be hidden on the rail.
+  expect(app).toContain('<Icon name="plus" /><span className="navlabel">{t("New Profile")}</span>');
+  expect(app).toContain('<Icon name="profiles" /><span className="navlabel">{t("All profiles")}</span>');
+  expect(styles).toContain(".sidebar.collapsed");
+  expect(styles).toContain(".rail-toggle");
+  // Every rail item needs a hover label once its text is gone.
+  expect(app).toContain('data-tip={t("All profiles")}');
+  expect(app).toContain('data-tip={t("Settings")}');
+});
+
+test("short sidebars keep folder space and let navigation scroll without clipping rail tooltips", () => {
+  const navigation = styles.match(/\n\.sidenav \{([^}]+)\}/)?.[1] ?? "";
+  expect(navigation).toContain("min-height: 0");
+  expect(navigation).toContain("overflow-y: auto");
+  expect(styles.includes(".sidebar.collapsed .sidenav { overflow: visible; }")).toBe(true);
+  expect(styles.includes(".sidesection:has(.folders) { min-height: 140px; }")).toBe(true);
+  const compact = styles.slice(styles.indexOf("@media (max-height: 720px)"), styles.indexOf("@media (max-width: 920px)"));
+  expect(compact).toContain(".sidecredit { display: none; }");
+  expect(compact).toContain(".sidebar .navitem { padding-top: 6px; padding-bottom: 6px; }");
+  expect(compact).not.toMatch(/\.sidefoot\s*\{[^}]*display:\s*none/);
+});
+
+test("roster columns declare their own width and never collapse", () => {
+  // One registry drives the header cells and the table's min-width, so a column
+  // cannot be squeezed below a readable size.
+  expect(app).toContain('{ key: "name", label: "Name", sort: true, width: 220 }');
+  expect(app).toContain("const CHECKBOX_COLUMN_WIDTH = 44;");
+  expect(app).toContain("const tableMinWidth = CHECKBOX_COLUMN_WIDTH + shownColumns.reduce((total, column) => total + column.width, 0);");
+  expect(app).toContain('style={{ minWidth: tableMinWidth }}');
+  // Every column declares a width, so a wide window's extra space spreads
+  // proportionally across all of them — no single column hoards it.
+  expect(app).toContain("const style = { width: column.width } as CSSProperties;");
+  // The Action column shows no header text — its buttons explain themselves.
+  expect(app).toContain('const label = column.key === "action" ? ""');
+  // Widths live in the registry only — a stray CSS width would silently win.
+  expect(styles).not.toMatch(/th\.col-\w+, td\.col-\w+ \{ width:/);
+  expect(styles).toContain("table-layout: fixed");
+  expect(styles).toContain(".tablewrap { flex: 1; min-height: 0; overflow: auto; }");
+});
+
+test("the roster keeps only the columns that matter and stays compact", () => {
+  // Health, Created and Last opened were removed on request; what is left is
+  // identity, grouping, connectivity — and the one button every row needs.
+  for (const key of ["health", "created", "opened"]) {
+    expect(app).not.toContain(`key: "${key}"`);
+  }
+  expect(app).toContain('{ key: "proxy", label: "Proxy", sort: true, width: 160 }');
+  expect(app).toContain('{ key: "action", label: "Action", sort: false, width: 230 }');
+  expect(app).not.toContain("healthFilter");
+});
+
+test("every row action sits beside Open in the Action cell — nothing hides on hover", () => {
+  expect(app).toContain('<span className="rowactions">');
+  expect(app).toContain('aria-label={`Open ${p.name}`}');
+  expect(app).toContain('aria-label={`Close ${p.name}`}');
+  expect(app).toContain('aria-label={`Edit ${p.name}`}');
+  expect(app).toContain('aria-label={t("Copy current 2FA code")}');
+  // The hover-revealed overlay is gone: it overlapped the profile name.
+  expect(app).not.toContain("rowquick");
+  expect(styles).not.toContain(".rowquick");
+  expect(styles).toContain(".rowactions { display: inline-flex; align-items: center; justify-content: flex-end;");
+});
+
+test("the Action column stays reachable while the roster scrolls sideways", () => {
+  expect(styles).toContain("position: sticky; right: 0;");
+  // A sticky cell has no row behind it, so every row state repaints its own.
+  expect(styles).toContain(".profile-table tbody tr.selected td.col-action { background: var(--accent-soft); }");
+  expect(styles).toContain(".profile-table thead th.col-action { z-index: 3; background: var(--surface-sunken); }");
+  // Hover labels must paint above the next row's sticky Action cell.
+  expect(styles).toContain(".profile-table tbody tr:hover td.col-action { background: var(--surface-sunken); z-index: 2; }");
+  // The edge shadow only appears once there is content underneath it.
+  expect(app).toContain("onScroll={(event) => setTableScrolled(event.currentTarget.scrollLeft > 0)}");
+  expect(styles).toContain(".tablewrap.scrolled td.col-action::before");
+});
+
+test("small windows keep navigation and dialogs keep typed input", () => {
+  // Below the rail breakpoint the sidebar becomes the icon rail instead of
+  // disappearing — a resizable desktop app must never lose its navigation.
+  expect(app).toContain('const RAIL_MEDIA = "(max-width: 760px)";');
+  expect(app).toContain("sidebarCollapsed || railForced");
+  expect(styles).not.toContain(".sidebar { display: none; }");
+  // On a big monitor the WHOLE shell caps and centers as one frame — sidebar,
+  // header and roster together — a six-column app cannot fill 2500px gracefully.
+  expect(styles).toContain("max-width: 1704px; margin: 0 auto;");
+  expect(styles).toContain("width: min(1440px, 100% - 32px);");
+  // Escape closes the open dialog; a stray backdrop click never discards a form.
+  expect(app).toContain('if (event.key !== "Escape") return;');
+  expect(app).not.toContain('className="modal-backdrop" onClick={closeCreate}');
+  expect(app).not.toContain('className="modal-backdrop" onClick={closeEdit}');
+  expect(app).not.toContain('className="modal-backdrop" onClick={closeBulk}');
+});
+
+test("import offers one source at a time and counts what was pasted", () => {
+  // Two full-height inputs stacked left it ambiguous which one Import would read.
+  expect(app).toContain('const [bulkSource, setBulkSource] = useState<"file" | "paste">("file");');
+  expect(app).toContain('aria-label={t("Import source")}');
+  // Switching sources clears the other, so a stale value cannot be submitted.
+  expect(app).toContain('onClick={() => { setBulkSource("file"); setBulkText(""); }}');
+  expect(app).toContain('onClick={() => { setBulkSource("paste"); setBulkFiles([]); }}');
+  // Every AdsPower record opens with its own id= line, so this count is exact.
+  expect(app).toContain("function countPastedRecords(text: string): number {");
+  expect(app).toContain('return (text.match(/^id=/gm) ?? []).length;');
+  expect(app).toContain('t("1 record detected — each one starts with its own id= line.")');
+  expect(app).toContain('t("{count} records detected — each one starts with its own id= line.", { count: pastedRecordCount })');
+  // Chosen files are individually removable rather than a comma-joined string.
+  expect(app).toContain('aria-label={`Remove ${file.name}`}');
+  expect(app).toContain(">{t(\"Clear all\")}</button>");
+  expect(styles).toContain(".filechip");
+  expect(styles).toContain(".segmented");
+});
+
+test("no legacy arrow glyphs survive in place of icons", () => {
+  // These predate the icon set; a stray one means a control was missed.
+  for (const glyph of ["⤓", "⤒", "↩", "🧩", "📄", "▸", "▾"]) {
+    expect(app).not.toContain(glyph);
+  }
+});
+
+test("the second accent marks identity, and the credit matches the website", () => {
+  // Two accents only work if each means something: the live build's brand blue
+  // (#3366e6) marks actions, peach marks identity. A peach button or a blue
+  // custom NO. would break that split.
+  expect(styles).toContain("--accent: #3366e6;");
+  expect(styles).toContain("--accent-2: #ff9e7a;");
+  expect(styles).toContain("td.col-no .no-text.custom { color: var(--accent-2-ink); }");
+  expect(styles).toContain("linear-gradient(150deg, var(--accent), var(--accent-2))");
+  expect(styles).not.toMatch(/\.btn\.primary \{[^}]*--accent-2/);
+  // The accent is the logo's blue, and no trace of the old violet survives.
+  expect(logo).toContain('stroke="#2457D6"');
+  expect(styles).not.toContain("#6d4aff");
+  expect(styles).not.toContain("#8b6dff");
+
+  // The footer credits the project itself: no third-party agency link survives.
+  expect(app).not.toContain("Developed by");
+  expect(app).not.toContain("xreacher.com");
+  expect(styles).not.toContain(".watermark");
+  // The footer wordmark is painted as a clipped gradient, not flat text.
+  expect(app).toContain('<p className="footer-mark" aria-hidden="true">GhosterAnti</p>');
+  expect(styles).toContain("-webkit-background-clip: text; background-clip: text; color: transparent;");
+  // It is a credit, not a control: it must not survive into the icon rail.
+  expect(styles).toContain(".sidebar.collapsed .sidecredit { display: none; }");
+});
+
+test("the project links match the site footer and this repository", () => {
+  // The GitHub URL is this repo's own origin — the two cannot drift apart.
+  expect(app).toContain('href: "https://github.com/GhosterAI/GhosterAnti"');
+  expect(app).toContain('href: "https://github.com/GhosterAI/GhosterAnti/issues"');
+  // Outbound links from a desktop shell must not hand the opener over.
+  const links = app.slice(app.indexOf("const PROJECT_LINKS"), app.indexOf("] as const;", app.indexOf("const PROJECT_LINKS")));
+  expect(links).toContain("github.com");
+  expect(links).not.toContain("t.me");
+  expect(app).toContain('aria-label={t("GhosterAnti on {name}", { name: link.label })}');
+  expect(styles).toContain(".projectlink");
+});
+
+test("Extensions is a page, consistent with the rest of the shell", () => {
+  // It was the last modal among pages, and opening it from Settings stacked a
+  // dialog over a page.
+  expect(app).toContain('setView("extensions")');
+  expect(app).not.toContain("showExts");
+  expect(app).toContain('view === "extensions" ? (');
+  expect(app).toContain('className={`navitem${view === "extensions" ? " active" : ""}`}');
+  expect(app).toContain('extensions: "Extensions",');
+});
+
+test("the dark theme is a token swap, and native controls follow it", () => {
+  expect(styles).toContain(':root[data-theme="dark"] {');
+  // Without color-scheme the browser keeps painting checkboxes and scrollbars light.
+  expect(styles).toContain("color-scheme: dark;");
+  expect(styles).toContain("color-scheme: light;");
+  // Nothing may hardcode a light surface, or it survives into the dark theme —
+  // this is exactly how the modal header stayed white.
+  const rules = styles.slice(styles.indexOf("\n}", styles.indexOf(":root {")));
+  expect(rules).not.toContain("linear-gradient(180deg, #ffffff");
+  expect(rules).not.toMatch(/background: #fff/);
+  // Two near-black brand tiles would vanish on a dark row.
+  expect(styles).toContain(':root[data-theme="dark"] .platform-pill .glyph.pm-x');
+  // Light is the out-of-the-box default; Dark and follow-the-OS System are
+  // opt-in from Settings. A host-only cookie survives the desktop app's changing port.
+  expect(app).toContain('import { THEME_KEY, readThemeChoice, themeCookie, type ThemeChoice } from "./theme.ts";');
+  expect(app).toContain("return readThemeChoice(cookies, stored);");
+  expect(app).toContain("document.cookie = themeCookie(choice);");
+  // The app resolves "system" itself rather than duplicating the palette.
+  expect(app).toContain('window.matchMedia("(prefers-color-scheme: dark)")');
+  expect(app).toContain("document.documentElement.dataset.theme =");
+  expect(app).toContain('media.addEventListener("change", apply)');
+});
+
+test("the sidebar offers extension management in both modes and a support link", () => {
+  // The extension registry is local in both modes; Cloud profiles carry their
+  // assignments and load matching local uploads at launch.
+  expect(app).toContain('<Icon name="puzzle" /><span className="navlabel">{t("Manage extensions")}</span>');
+  const nav = app.slice(app.indexOf('className="sidenav"'), app.indexOf("</nav>"));
+  expect(nav).not.toMatch(/\{isCloudMode\s*&&\s*\(?\s*<button[^>]*setView\("extensions"\)/);
+  const extensions = nav.slice(nav.lastIndexOf("<button", nav.indexOf('data-tip={t("Manage extensions")}')), nav.indexOf("</button>", nav.indexOf('data-tip={t("Manage extensions")}')));
+  expect(extensions).not.toContain("isCloudMode");
+  // Small support entry that opens the issue tracker.
+  expect(app).toContain('href="https://github.com/GhosterAI/GhosterAnti/issues"');
+  expect(app).toContain('<Icon name="help" /><span className="navlabel">{t("Support")}</span>');
+  expect(styles).toContain("a.navitem");
+});
+
+test("editable Cloud selections expose exports and Edit from file", () => {
+  const toolbar = app.slice(app.indexOf('className="toolbar active"'), app.indexOf("className={`tablewrap"));
+  expect(toolbar).toContain("(!isCloudMode || selectedEditable) && <>");
+  // Export and file edits use Cloud; mobile conversion remains Local-only.
+  expect(toolbar).not.toContain("{!isCloudMode && <>");
+  expect(toolbar).toContain("!isCloudMode && selectedMobileCount > 0");
+  expect(toolbar).toContain("onClick={openUpdate}");
+  expect(toolbar).not.toMatch(/\{!isCloudMode && \(\s*<button[^>]*onClick=\{openUpdate\}/);
+  for (const format of ["csv", "txt", "xlsx"]) expect(toolbar).toContain(`exportSelected("${format}")`);
+});
+
+test("file update results retain partial counts and per-profile failures before refreshing", () => {
+  const submit = app.slice(app.indexOf("const submitUpdate ="), app.indexOf("// ---- Group create"));
+  expect(submit).toContain('if (typeof r.updated !== "number") return;');
+  expect(submit).toContain("r.errors.map(");
+  expect(submit).toContain("${item.id}: ${item.error}");
+  expect(submit).toContain("setUpdateResult(m);\n      await load();");
+  const modal = app.slice(app.indexOf("{showUpdate && ("));
+  expect(modal).toContain("{updateErr &&");
+  expect(modal).toContain("{updateResult &&");
+  expect(modal).toMatch(/\{!isCloudMode && <li>[^\n]*<code>custom_no<\/code>/);
+});
+
+test("the existing Extensions page installs from a Web Store URL and keeps archive upload", () => {
+  expect(app).toContain("Install from Chrome Web Store");
+  expect(app).toContain('aria-label="Chrome Web Store URL or extension ID"');
+  expect(app).toContain("installWebStoreExtension(source)");
+  expect(app).toContain("The in-browser Store button does not work in CloakBrowser");
+  expect(app).toContain("Edit &gt; Extensions");
+  expect(app).toContain("Upload ZIP/CRX");
+  expect(app).toContain('accept=".zip,.crx,application/zip,application/x-chrome-extension"');
+  expect(app).not.toContain("Chrome Web Store installs are not supported in GhosterAnti");
+  expect(app.match(/setView\("extensions"\)/g)).toHaveLength(1);
+});
+
+test("extensions can be assigned to Cloud profiles and groups without losing missing-device IDs", () => {
+  expect(app).toContain("const [editInitialExts, setEditInitialExts] = useState<string[]>([]);");
+  expect(app).toContain("!sameExtensionSelection(editExts, editInitialExts)");
+  expect(app).toContain("Not installed on this device");
+  expect(app).toContain("new Set([...editInitialExts, ...editExts])");
+  expect(app).toContain("new Set([...storedGroupDefaultExts, ...groupDefaultExts])");
+  expect(app).toContain("Cloud assignments remain and will show as not installed here.");
+  expect(app).toContain("{editEngine === \"chromium\" && editExtensionChoices.length > 0 && (");
+  expect(app).toContain("Group defaults");
+  expect(app).toContain("fetchGroupExtensionDefaults()");
+  expect(app).toContain("setGroupExtensionDefaults(groupDefaultName, groupDefaultExts)");
+  expect(app).toContain("replaces extension assignments on");
+  expect(app).toContain("New and moved profiles inherit this selection");
+});
+
+test("Settings carries the Remote MCP connector card in Cloud mode", () => {
+  expect(app).toContain('className="settings-card remote-mcp-settings"');
+  expect(app).toContain('t("MCP server URL")');
+  expect(app).toContain('t("Remote MCP access key")');
+  // Leaving the account (sign out, forget session) always revokes and forgets
+  // the connector so a stale key cannot outlive the session that made it.
+  expect(app).toContain("prepareRemoteMcpForAccountExit");
+  expect(app).toContain("deleteDesktopRemoteMcpCredential");
+  expect(styles).toContain(".remote-mcp-value");
+});
+
+test("the update banner shows release highlights and native install progress", () => {
+  expect(app).toContain("<UpdateHighlights version={desktopUpdate.version} highlights={desktopUpdate.highlights} />");
+  expect(app).toContain("function DesktopUpdateProgressView(");
+  expect(app).toContain('invoke("update_now", { onProgress })');
+  expect(styles).toContain(".update-progress progress");
+});
+
+test("a profile with a session Cloud refused offers restoring it before opening", () => {
+  expect(app).toContain("p.parkedSession && p.permission === \"edit\" ? (");
+  expect(app).toContain("Restore session");
+  // Restoring replaces the Cloud logins, so it must never happen unprompted.
+  const restore = app.slice(app.indexOf("const restoreSession ="), app.indexOf("const openCookie ="));
+  expect(restore).toContain("if (!confirm(");
+  expect(restore).toContain("act(profile.id, restoreParkedSession)");
+});
+
+test("Firefox shows its screen: editable at creation, read-only when editing", () => {
+  const settings = app.slice(app.indexOf("function FingerprintSettings("), app.indexOf("function FingerprintSettings(") + 3600);
+  expect(settings).not.toMatch(/\{engine === "chromium" && \(\s*<label className="fld">\s*<span>Screen/);
+  expect(settings).toContain("screenReadOnly ? (");
+  expect(app).toContain('screenReadOnly={editEngine === "firefox"}');
+  expect(app).toContain("screen: form.screen,");
+});

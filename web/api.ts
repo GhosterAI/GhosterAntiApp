@@ -1,0 +1,1047 @@
+/** Typed client for the dashboard's /ui/api/* endpoints. */
+
+import type {
+  PublishScriptInput,
+  PublishedScript,
+  PublishedScriptSummary,
+  ScriptLanguage,
+  ScriptRecord,
+  ScriptSummary,
+} from "../contracts/cloud-v1.ts";
+import type { ScriptRun } from "../scripts.ts";
+import type { PythonRuntimeStatus } from "../python-runtime.ts";
+import type { FolderInfo } from "../folders.ts";
+import {
+  CLOUD_DIAGNOSTIC_TYPES,
+  type CloudDiagnosticEvent,
+} from "../cloud-diagnostics.ts";
+
+export type { CloudDiagnosticEvent } from "../cloud-diagnostics.ts";
+
+export type HealthStatus = "suspended" | "alive" | "no_data";
+
+export interface UiProfile {
+  id: string;
+  name: string;
+  /** Browser family. Legacy profiles without a value are Chromium. */
+  engine: "chromium" | "firefox";
+  /** "ghosteranti" is the opt-in Chromium 155 beta; absent is CloakBrowser. */
+  chromiumRuntime?: "ghosteranti";
+  group: string;
+  /** Canonical account platform domain, or "" (none). */
+  platform: string;
+  /** Free-form custom tags. */
+  tags: string[];
+  proxy: string | null;
+  proxyError?: string;
+  timezone: string;
+  cookieCount: number;
+  seeded: boolean;
+  screen: string;
+  mobilePersona?: boolean;
+  has2fa: boolean;
+  /** Store serial (SQLite rowid). Absent in Cloud mode, where the roster is remote. */
+  serial?: number | null;
+  /** Creation time, ms. 0 or absent when unknown. */
+  createdAt?: number;
+  /** Most recent launch, ms. 0 or absent when never opened here. */
+  lastOpenAt?: number;
+  /** Operator-chosen "custom NO."; "" when the serial is used instead. */
+  customNo?: string;
+  running: boolean;
+  debugPort?: number;
+  startedAt?: number;
+  /** Remote (hub) mode only: who currently has it open elsewhere, if anyone. */
+  lockedBy?: string | null;
+  permission?: "view" | "edit";
+  version?: number;
+  hasSession?: boolean;
+  /** Cloud mode: a session Cloud refused that is still recoverable from this device. */
+  parkedSession?: { savedAt: number; reason: string | null };
+  healthStatus?: HealthStatus;
+  healthObservedAt?: number | null;
+  /**
+   * Whether the last launch's measured fingerprint still matches the one an
+   * import claimed. Null when nothing was imported to check against — that is
+   * "unknown", not "verified".
+   */
+  fpVerdict?: FingerprintVerdict | null;
+  /** ISO-8601 instant of the last measurement; "" if never launched. */
+  fpCapturedAt?: string;
+}
+
+export interface FingerprintDifference {
+  field: string;
+  expected: string;
+  observed: string;
+}
+
+export interface FingerprintVerdict {
+  verdict: "match" | "mismatch";
+  differences: FingerprintDifference[];
+}
+
+export interface HealthSource {
+  sourceId: string;
+  lastSnapshotAt: number;
+  stale: boolean;
+}
+
+export interface UiRoster {
+  profiles: UiProfile[];
+  healthSources: HealthSource[];
+  groups: string[];
+  folders?: FolderInfo[];
+}
+
+export interface DiagnoseReport {
+  generatedAt: number;
+  analysis: { verdicts: string[] };
+}
+
+export interface HealthResult { ok: boolean; version: string; root: string; logDir?: string; }
+
+export interface AppModeConfig {
+  version: 1;
+  mode: "unconfigured" | "local" | "cloud";
+  cloudUrl?: string;
+  localAnalytics: boolean;
+  restartRequired?: boolean;
+  legacyRemote?: boolean;
+  /** Set when this host runs every Chromium profile on one runtime, so there is no version to choose. */
+  chromiumRuntime?: "ghosteranti";
+  /** Set when this computer can run Chromium 155: the New profile dialog then starts on it. */
+  defaultChromiumRuntime?: "ghosteranti";
+  /** The engine of new profiles on this computer: Chromium on Windows, Firefox on macOS and Linux. Absent in legacy Remote mode. */
+  defaultEngine?: "chromium" | "firefox";
+}
+
+export async function fetchAppMode(): Promise<AppModeConfig> {
+  const path = "/ui/api/app-mode";
+  const response = await fetch(path);
+  const body = await apiJson(response, path);
+  if (body.mode !== "unconfigured" && body.mode !== "local" && body.mode !== "cloud") {
+    throw new Error(body.error || "GhosterAnti returned an invalid application mode");
+  }
+  return body as AppModeConfig;
+}
+
+/** Shell UI language (BCP47 tag), persisted server-side: localStorage is
+ *  origin-scoped and the desktop shell serves the UI from a random loopback
+ *  port each launch. */
+export async function fetchShellLanguage(): Promise<string | null> {
+  const path = "/ui/api/shell-language";
+  const response = await fetch(path);
+  const body = await apiJson(response, path);
+  return typeof body.language === "string" && body.language.length > 0 ? body.language : null;
+}
+
+export async function saveShellLanguage(language: string): Promise<void> {
+  const path = "/ui/api/shell-language";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ language }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not save language preference");
+}
+
+export async function selectAppMode(mode: "local" | "cloud"): Promise<any> {
+  const path = "/ui/api/app-mode";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not save GhosterAnti mode");
+  return body;
+}
+
+export async function fetchCloudEvents(): Promise<CloudDiagnosticEvent[]> {
+  const path = "/ui/api/cloud-events";
+  const response = await fetch(path);
+  const body = await apiJson(response, path);
+  if (!response.ok || !Array.isArray(body.events)) {
+    throw new Error("Cloud diagnostics are unavailable");
+  }
+  const knownTypes = new Set<string>(CLOUD_DIAGNOSTIC_TYPES);
+  return body.events.map((event: unknown) => {
+    if (!event || typeof event !== "object") throw new Error("Cloud diagnostics returned invalid data");
+    const keys = Object.keys(event as object).sort();
+    const timestamp = (event as any).timestamp;
+    const type = (event as any).type;
+    if (
+      keys.join(",") !== "timestamp,type" ||
+      !Number.isFinite(timestamp) ||
+      !Number.isFinite(new Date(timestamp).getTime()) ||
+      !knownTypes.has(type)
+    ) {
+      throw new Error("Cloud diagnostics returned invalid data");
+    }
+    return { timestamp, type } as CloudDiagnosticEvent;
+  });
+}
+
+export interface CloudLegalState {
+  current: { terms: string; privacy: string; acceptableUse: string };
+  accepted: ({ terms: string; privacy: string; acceptableUse: string; acceptedAt: number }) | null;
+}
+
+export interface CloudAuthState {
+  authenticated: boolean;
+  expiresAt?: number;
+  user?: { id: string; email?: string };
+  workspace?: { id: string; name: string; ownerAccountId: string; role: "owner" | "admin" | "member" };
+  legal?: CloudLegalState;
+}
+
+export function cloudSessionContextReady(state: CloudAuthState): boolean {
+  return state.authenticated && !!state.workspace && !!state.legal;
+}
+
+export function cloudWorkspaceReady(state: CloudAuthState | null): boolean {
+  const legal = state?.legal;
+  return state?.authenticated === true && !!legal?.accepted &&
+    legal.accepted.terms === legal.current.terms &&
+    legal.accepted.privacy === legal.current.privacy &&
+    legal.accepted.acceptableUse === legal.current.acceptableUse;
+}
+
+export async function fetchCloudAuth(): Promise<CloudAuthState> {
+  const path = "/ui/api/cloud-auth";
+  const response = await fetch(path);
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Cloud authentication is unavailable");
+  return {
+    authenticated: body.authenticated === true,
+    expiresAt: body.expiresAt,
+    user: body.user,
+    workspace: body.workspace,
+    legal: body.legal,
+  };
+}
+
+export type CloudRestoreStage = "auth_refresh" | "cloud_status" | "lifecycle_resume";
+export type CloudRestoreCategory = "network" | "service" | "authentication";
+export type CloudRestoreCode =
+  | "network_unavailable"
+  | "service_unavailable"
+  | "authentication_invalid"
+  | "authentication_required"
+  | "email_not_verified"
+  | "device_revoked"
+  | "membership_revoked"
+  | "response_invalid";
+
+export class CloudSessionRestoreError extends Error {
+  constructor(
+    message: string,
+    readonly stage: CloudRestoreStage,
+    readonly retryable: boolean,
+    readonly category: CloudRestoreCategory,
+    readonly code: CloudRestoreCode,
+  ) {
+    super(message);
+    this.name = "CloudSessionRestoreError";
+  }
+}
+
+const CLOUD_RESTORE_STAGES = new Set<CloudRestoreStage>(["auth_refresh", "cloud_status", "lifecycle_resume"]);
+const CLOUD_RESTORE_CATEGORIES = new Set<CloudRestoreCategory>(["network", "service", "authentication"]);
+const CLOUD_RESTORE_CODES = new Set<CloudRestoreCode>([
+  "network_unavailable",
+  "service_unavailable",
+  "authentication_invalid",
+  "authentication_required",
+  "email_not_verified",
+  "device_revoked",
+  "membership_revoked",
+  "response_invalid",
+]);
+
+async function cloudAuthAction(action: string, input: Record<string, string | boolean>): Promise<any> {
+  const path = `/ui/api/cloud-auth/${action}`;
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) {
+    if (
+      action === "restore"
+      && typeof body.error === "string"
+      && CLOUD_RESTORE_STAGES.has(body.stage)
+      && typeof body.retryable === "boolean"
+      && CLOUD_RESTORE_CATEGORIES.has(body.category)
+      && CLOUD_RESTORE_CODES.has(body.code)
+    ) {
+      throw new CloudSessionRestoreError(body.error, body.stage, body.retryable, body.category, body.code);
+    }
+    throw new Error(body.error || "Cloud authentication failed");
+  }
+  return body;
+}
+
+export const signUpCloud = (email: string, password: string) =>
+  cloudAuthAction("signup", { email, password });
+export const resendCloudSignUp = (email: string) => cloudAuthAction("resend-signup", { email });
+export const requestCloudPasswordReset = (email: string) => cloudAuthAction("forgot-password", { email });
+export const signInCloud = (email: string, password: string, queueKey?: string) =>
+  cloudAuthAction("signin", { email, password, ...(queueKey ? { queueKey } : {}) });
+export const restoreCloudSession = (
+  refreshToken: string,
+  deviceCredential: string,
+  queueKey: string,
+  resumeLifecycle = false,
+) => cloudAuthAction("restore", {
+  refreshToken,
+  deviceCredential,
+  queueKey,
+  ...(resumeLifecycle ? { resumeLifecycle: true } : {}),
+});
+export const forgetCloudSession = () => cloudAuthAction("forget", {});
+export const signOutCloud = () => cloudAuthAction("signout", {});
+export const acceptCloudLegal = () => cloudAuthAction("accept-legal", {});
+export const acceptCloudInvitation = (code: string) => cloudAuthAction("accept-invitation", { code });
+
+export type CloudConnectorState = "active" | "revoked" | "missing" | "disabled";
+
+export interface CloudConnectorResult {
+  ok: true;
+  state: CloudConnectorState;
+  connectorId?: string;
+  deviceId?: string;
+  url?: string;
+  token?: string;
+}
+
+async function cloudConnectorAction(
+  action: "create" | "status" | "revoke",
+  connectorId?: string,
+): Promise<CloudConnectorResult> {
+  const path = "/ui/api/cloud-connector";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...(connectorId ? { connectorId } : {}) }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Remote MCP settings are unavailable");
+  return body as CloudConnectorResult;
+}
+
+export const createCloudConnector = () => cloudConnectorAction("create");
+export const fetchCloudConnector = (connectorId: string) => cloudConnectorAction("status", connectorId);
+export const revokeCloudConnector = (connectorId: string) => cloudConnectorAction("revoke", connectorId);
+
+export interface CloudTeamState {
+  folders: Array<FolderInfo & {
+    archivedAt: number | null;
+    permission: "view" | "edit";
+    extensionDefaults: string[];
+  }>;
+  members: Array<{
+    accountId: string; email: string; role: "owner" | "admin" | "member"; joinedAt: number;
+    grants: Array<{ folderName: string; accountId: string; permission: "view" | "edit" }>;
+    profileGrants?: Array<{ profileId: string; accountId: string; permission: "view" | "edit" }>;
+  }>;
+  invitations: Array<{
+    id: string; email: string; role: "admin" | "member"; expiresAt: number;
+    acceptedAt: number | null; revokedAt: number | null; createdAt: number;
+  }>;
+}
+
+export async function fetchCloudTeam(): Promise<CloudTeamState> {
+  const path = "/ui/api/cloud-workspace";
+  const response = await fetch(path);
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Cloud team is unavailable");
+  return { folders: body.folders, members: body.members, invitations: body.invitations };
+}
+
+export async function cloudWorkspaceAction(action: string, input: Record<string, string | null>): Promise<any> {
+  const path = "/ui/api/cloud-workspace";
+  const response = await fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...input }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Cloud workspace action failed");
+  return body;
+}
+
+export async function fetchLogs(): Promise<{ file: string; content: string }> {
+  const path = "/ui/api/logs";
+  const response = await fetch(path);
+  const body = await apiJson(response, path);
+  if (body.ok !== true) throw new Error(body.error || "logs are unavailable");
+  return { file: String(body.file), content: String(body.content ?? "") };
+}
+
+export async function fetchHealth(): Promise<HealthResult> {
+  const path = "/ui/api/health";
+  const response = await fetch(path);
+  const body = await apiJson(response, path);
+  if (body.ok !== true) throw new Error(body.error || "GhosterAnti health check failed");
+  return { ok: true, version: String(body.version ?? "unknown"), root: String(body.root ?? ""), ...(typeof body.logDir === "string" ? { logDir: body.logDir } : {}) };
+}
+
+/** Never leak an HTML fallback into a raw JSON.parse SyntaxError. A dashboard
+ * bundle and its local server can briefly differ after an update/restart. */
+async function apiJson(response: Response, path: string): Promise<any> {
+  const text = await response.text();
+  try {
+    return text.trim() ? JSON.parse(text) : {};
+  } catch {
+    const contentType = response.headers.get("content-type") || "unknown content type";
+    const guidance = response.status >= 500
+      ? "The local server failed before it could return JSON; check ghosteranti.log, restart GhosterAnti, then reload this page."
+      : "The dashboard and local server may be on different versions; stop GhosterAnti, update it, restart it, then reload this page.";
+    throw new Error(
+      `GhosterAnti API ${path} returned non-JSON (${response.status}, ${contentType}). ` +
+      guidance,
+    );
+  }
+}
+
+async function post(path: string): Promise<any> {
+  const r = await fetch(path, { method: "POST" });
+  return apiJson(r, path);
+}
+
+export async function fetchProfiles(): Promise<UiRoster> {
+  const path = "/ui/api/profiles";
+  const r = await fetch(path);
+  const body = await apiJson(r, path);
+  if (!Array.isArray(body.profiles)) throw new Error(body.error || "GhosterAnti API returned no profile roster");
+  return {
+    profiles: body.profiles.map((profile: UiProfile) => {
+      const engine = profile.engine === "firefox" ? "firefox" : "chromium";
+      if (engine === "firefox") {
+        const { debugPort: _debugPort, ...firefoxProfile } = profile;
+        return { ...firefoxProfile, engine };
+      }
+      return { ...profile, engine };
+    }),
+    healthSources: Array.isArray(body.healthSources) ? body.healthSources : [],
+    groups: Array.isArray(body.groups) ? body.groups.filter((name: unknown) => typeof name === "string") : [],
+    ...(Array.isArray(body.folders) ? { folders: body.folders } : {}),
+  };
+}
+
+/** Runs `run` one call at a time. `load` resolves after a run that started
+ *  after the call (callers waiting meanwhile share one follow-up run), so an
+ *  action still sees its own result; `poll` skips while a run is in flight. */
+export function serialLoader(run: () => Promise<void>): { load: () => Promise<void>; poll: () => void } {
+  let active: { running: Promise<void>; next: Promise<void> | null } | null = null;
+  const load = (): Promise<void> => {
+    if (active) return active.next ??= active.running.then(load, load);
+    const running = run().finally(() => { active = null; });
+    active = { running, next: null };
+    return running;
+  };
+  return { load, poll: () => { if (!active) void load().catch(() => {}); } };
+}
+
+export interface ProfileCookieInput {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+}
+
+export async function addProfileCookie(id: string, cookie: ProfileCookieInput): Promise<any> {
+  const path = `/ui/api/profiles/${encodeURIComponent(id)}/cookies`;
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cookie),
+  });
+  return apiJson(response, path);
+}
+
+export const openProfile = (id: string, force = false) =>
+  post(`/ui/api/profiles/${encodeURIComponent(id)}/open${force ? "?force=1" : ""}`);
+export const closeProfile = (id: string) => post(`/ui/api/profiles/${encodeURIComponent(id)}/close`);
+export const raiseProfile = (id: string) => post(`/ui/api/profiles/${encodeURIComponent(id)}/raise`);
+export const restoreParkedSession = (id: string) =>
+  post(`/ui/api/profiles/${encodeURIComponent(id)}/restore-session`);
+export const importInbox = () => post("/ui/api/import");
+
+// ---- Extensions registry ----------------------------------------------------
+export interface Extension { id: string; name: string; }
+export async function fetchExtensions(): Promise<Extension[]> {
+  const path = "/ui/api/extensions";
+  const r = await fetch(path);
+  const b = await apiJson(r, path);
+  return b.ok ? b.extensions : [];
+}
+export async function installWebStoreExtension(source: string): Promise<any> {
+  const path = "/ui/api/extensions/web-store";
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source }),
+  });
+  return apiJson(r, path);
+}
+export async function uploadExtensions(files: FileList | File[]): Promise<any> {
+  const form = new FormData();
+  for (const f of Array.from(files)) form.append("files", f);
+  const path = "/ui/api/extensions/upload";
+  const r = await fetch(path, { method: "POST", body: form });
+  return apiJson(r, path);
+}
+export async function removeExtension(id: string): Promise<any> {
+  const r = await fetch("/ui/api/extensions/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+  return apiJson(r, "/ui/api/extensions/delete");
+}
+
+/** Bulk add/remove one extension across the selected profiles. */
+export async function assignExtensionBulk(ids: string[], extensionId: string, op: "add" | "remove"): Promise<any> {
+  const r = await fetch("/ui/api/profiles/extensions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids, extensionId, op }),
+  });
+  return apiJson(r, "/ui/api/profiles/extensions");
+}
+
+export interface GroupExtensionDefaults {
+  name: string;
+  extensions: string[];
+  permission: "view" | "edit";
+}
+
+export async function fetchGroupExtensionDefaults(): Promise<GroupExtensionDefaults[]> {
+  const path = "/ui/api/groups/extensions";
+  const response = await fetch(path);
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true || !Array.isArray(body.groups)) {
+    throw new Error(body.error || "group extension defaults are unavailable");
+  }
+  return body.groups;
+}
+
+export async function setGroupExtensionDefaults(group: string, extensions: string[]): Promise<any> {
+  const path = "/ui/api/groups/extensions";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ group, extensions }),
+  });
+  return apiJson(response, path);
+}
+
+export async function uploadExports(
+  files: FileList | File[],
+  assign?: { group?: string; platform?: string },
+): Promise<any> {
+  const form = new FormData();
+  for (const f of Array.from(files)) form.append("files", f);
+  if (assign?.group) form.append("group", assign.group);
+  if (assign?.platform) form.append("platform", assign.platform);
+  const path = "/ui/api/import/upload";
+  const r = await fetch(path, { method: "POST", body: form });
+  return apiJson(r, path);
+}
+
+export async function moveProfiles(ids: string[], group: string): Promise<any> {
+  const r = await fetch("/ui/api/profiles/move", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids, group }),
+  });
+  return apiJson(r, "/ui/api/profiles/move");
+}
+
+export async function deleteProfiles(ids: string[]): Promise<any> {
+  const r = await fetch("/ui/api/profiles/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
+  return apiJson(r, "/ui/api/profiles/delete");
+}
+
+export interface ProxyCheckInput {
+  type?: string;
+  host: string;
+  port: string;
+  user?: string;
+  pass?: string;
+}
+
+export type ProxyCheckStatus = "working" | "unstable" | "failed" | "unavailable";
+export type ProxyCheckReason =
+  | "authentication_failed"
+  | "timeout"
+  | "dns_failed"
+  | "unreachable"
+  | "connection_failed"
+  | "intermittent"
+  | "proxy_bypassed"
+  | "check_unavailable";
+
+export interface ProxyCheckResult {
+  status: ProxyCheckStatus;
+  attempts: number;
+  successes: number;
+  reason?: ProxyCheckReason;
+  ip?: string;
+  country?: string;
+  region?: string;
+  city?: string;
+  rotating?: boolean;
+}
+
+const PROXY_CHECK_STATUSES = new Set<ProxyCheckStatus>(["working", "unstable", "failed", "unavailable"]);
+const PROXY_CHECK_REASONS = new Set<ProxyCheckReason>([
+  "authentication_failed",
+  "timeout",
+  "dns_failed",
+  "unreachable",
+  "connection_failed",
+  "intermittent",
+  "proxy_bypassed",
+  "check_unavailable",
+]);
+
+function proxyCheckResult(body: any): ProxyCheckResult {
+  if (
+    !PROXY_CHECK_STATUSES.has(body?.status)
+    || !Number.isInteger(body?.attempts)
+    || body.attempts < 1
+    || !Number.isInteger(body?.successes)
+    || body.successes < 0
+    || body.successes > body.attempts
+    || (body.reason !== undefined && !PROXY_CHECK_REASONS.has(body.reason))
+    || ["ip", "country", "region", "city"].some((field) => body[field] !== undefined && typeof body[field] !== "string")
+    || (body.rotating !== undefined && typeof body.rotating !== "boolean")
+  ) {
+    throw new Error("Proxy check returned invalid data");
+  }
+  return {
+    status: body.status,
+    attempts: body.attempts,
+    successes: body.successes,
+    ...(body.reason ? { reason: body.reason } : {}),
+    ...(body.ip ? { ip: body.ip } : {}),
+    ...(body.country ? { country: body.country } : {}),
+    ...(body.region ? { region: body.region } : {}),
+    ...(body.city ? { city: body.city } : {}),
+    ...(body.rotating !== undefined ? { rotating: body.rotating } : {}),
+  };
+}
+
+export class ProxyCheckError extends Error {
+  constructor(readonly kind: "invalid" | "unavailable") {
+    super("Proxy check failed");
+    this.name = "ProxyCheckError";
+  }
+}
+
+export async function checkProxy(proxy: ProxyCheckInput): Promise<ProxyCheckResult> {
+  const path = "/ui/api/proxy/check";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ proxy }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) {
+    throw new ProxyCheckError(response.status === 400 ? "invalid" : "unavailable");
+  }
+  return proxyCheckResult(body);
+}
+
+export interface NewProfileInput {
+  name?: string;
+  /** Browser family selected for a new Local profile. */
+  engine?: "chromium" | "firefox";
+  /** Chromium runtime of a new Chromium profile: Chromium 155 or CloakBrowser. */
+  chromiumRuntime?: "ghosteranti" | "cloakbrowser";
+  group?: string;
+  platform?: string;
+  proxy?: ProxyCheckInput | null;
+  screen?: string;
+  /** Fingerprint OS override: "windows" | "macos" | "linux". Omitted → host OS. */
+  platformOs?: string;
+  /** Operator-chosen serial shown in the roster and the browser window title. */
+  customNo?: string;
+  username?: string;
+  password?: string;
+  email?: string;
+  emailPassword?: string;
+  twofa?: string;
+}
+
+export async function createProfile(input: NewProfileInput): Promise<any> {
+  const r = await fetch("/ui/api/profiles", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  return apiJson(r, "/ui/api/profiles");
+}
+
+export async function fetchDiagnose(): Promise<DiagnoseReport | null> {
+  const path = "/ui/api/diagnose/latest";
+  const r = await fetch(path);
+  return (await apiJson(r, path)).report;
+}
+
+// ---- Edit one profile (full detail, incl. secrets — loopback-only) ----------
+export interface EditProfile {
+  id: string;
+  name: string;
+  engine: "chromium" | "firefox";
+  chromiumRuntime?: "ghosteranti";
+  /** Hardware the profile is set to report on every computer. Absent values are chosen by the engine. */
+  hardware?: { gpu?: string; cores?: number };
+  group: string;
+  platform: string;
+  proxyType: string;
+  /** Full "host:port[:user:pass]". */
+  proxy: string;
+  proxyError?: string;
+  username: string;
+  password: string;
+  email: string;
+  emailPassword: string;
+  twofa: string;
+  /** "1920*1080". */
+  resolution: string;
+  /** Fingerprint OS: "windows" | "macos" | "linux", or "" for automatic. */
+  platformOs: string;
+  /** Ids of extensions assigned to this profile. */
+  extensions: string[];
+  /** Comma-separated custom tags. */
+  tags: string;
+  /** Operator-chosen "custom NO."; "" falls back to the store serial. Local mode only. */
+  customNo?: string;
+  /** Stored timezone; blank uses the browser default. */
+  timezone: string;
+  cookieCount: number;
+  seeded: boolean;
+  mobilePersona: boolean;
+  desktopConversion?: {
+    platform: "windows" | "macos";
+    resolution: string;
+    screenChanged: boolean;
+  };
+  /** Present only for Cloud profiles and required for optimistic saves. */
+  expectedVersion?: number;
+  /** Cloud profile open on THIS device: edits apply to the local cached copy
+      and sync to Cloud with the running session (no expectedVersion needed). */
+  liveEdit?: boolean;
+}
+
+// ---- 2FA authenticator: current TOTP code (never the secret) ----------------
+export interface TotpResult { code: string | null; secondsRemaining?: number; period?: number; }
+export async function fetchTotp(id: string): Promise<TotpResult> {
+  const path = `/ui/api/profiles/${encodeURIComponent(id)}/totp`;
+  const r = await fetch(path);
+  const body = await apiJson(r, path);
+  if (!body.ok) throw new Error(body.error || "2FA failed");
+  return { code: body.code, secondsRemaining: body.secondsRemaining, period: body.period };
+}
+
+export async function fetchProfileEdit(id: string): Promise<EditProfile> {
+  const path = `/ui/api/profiles/${encodeURIComponent(id)}`;
+  const r = await fetch(path);
+  const body = await apiJson(r, path);
+  if (!body.ok) throw new Error(body.error || "load failed");
+  return body.profile;
+}
+
+export async function updateProfile(id: string, set: Record<string, unknown>, expectedVersion?: number): Promise<any> {
+  const r = await fetch(`/ui/api/profiles/${encodeURIComponent(id)}/update`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ set, ...(expectedVersion === undefined ? {} : { expectedVersion }) }),
+  });
+  const body = await apiJson(r, `/ui/api/profiles/${encodeURIComponent(id)}/update`);
+  return { ...body, status: r.status };
+}
+
+export async function refreshProfileTimezone(id: string): Promise<{ timezone: string }> {
+  const path = `/ui/api/profiles/${encodeURIComponent(id)}/timezone`;
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true || typeof body.timezone !== "string") {
+    throw new Error(body.error || "timezone lookup failed");
+  }
+  return { timezone: body.timezone };
+}
+
+export async function convertMobileProfile(id: string): Promise<any> {
+  return post(`/ui/api/profiles/${encodeURIComponent(id)}/convert-mobile`);
+}
+
+export type ExportFormat = "csv" | "txt" | "xlsx";
+export interface ExportProgress { completed: number; total: number; }
+
+// ---- Export selected → download a CSV / .txt / Excel workbook ----------------
+export async function exportProfiles(
+  ids: string[], format: ExportFormat, onProgress?: (progress: ExportProgress) => void,
+): Promise<void> {
+  const path = "/ui/api/profiles/export";
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids, format, stream: true }),
+  });
+  if (!r.ok) {
+    const body = await apiJson(r, path);
+    throw new Error(body.error || "export failed");
+  }
+  let blob: Blob | undefined;
+  if (r.headers.get("content-type")?.includes("application/x-ndjson")) {
+    const reader = r.body!.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        let end: number;
+        while ((end = pending.indexOf("\n")) !== -1) {
+          const record = JSON.parse(pending.slice(0, end));
+          pending = pending.slice(end + 1);
+          if (record.type === "error") throw new Error(record.error);
+          if (record.type === "progress") onProgress?.({ completed: record.completed, total: record.total });
+          if (record.type === "file") {
+            blob = new Blob([Uint8Array.from(atob(record.data), (char) => char.charCodeAt(0))], { type: record.mime });
+          }
+        }
+      }
+      if (!blob || pending.trim()) throw new Error("Export interrupted before the file was complete. Please try again.");
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  } else {
+    blob = await r.blob();
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `ghosteranti-export.${format}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ---- File-based bulk update (re-upload an edited export) ---------------------
+export async function updateFromFile(files: FileList | File[]): Promise<any> {
+  const form = new FormData();
+  for (const f of Array.from(files)) form.append("files", f);
+  const path = "/ui/api/profiles/update-file";
+  const r = await fetch(path, { method: "POST", body: form });
+  return apiJson(r, path);
+}
+
+// ---- Group create / rename / delete -----------------------------------------
+export async function createGroup(name: string, parentName?: string | null): Promise<any> {
+  const r = await fetch("/ui/api/groups/create", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, parentName }),
+  });
+  return apiJson(r, "/ui/api/groups/create");
+}
+
+export async function renameGroup(from: string, to: string): Promise<any> {
+  const r = await fetch("/ui/api/groups/rename", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from, to }),
+  });
+  return apiJson(r, "/ui/api/groups/rename");
+}
+
+export async function moveGroup(name: string, parentName: string | null): Promise<any> {
+  const path = "/ui/api/groups/move";
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, parentName }),
+  });
+  return apiJson(r, path);
+}
+
+export async function deleteGroup(name: string): Promise<any> {
+  const r = await fetch("/ui/api/groups/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  return apiJson(r, "/ui/api/groups/delete");
+}
+
+// ---- Local scripts ------------------------------------------------------------
+export type { ScriptLanguage, ScriptRecord, ScriptRun, ScriptSummary };
+
+type ScriptInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+
+export function scriptsDesktopAvailable(): boolean {
+  return typeof window !== "undefined" &&
+    typeof (window as any).__TAURI_INTERNALS__?.invoke === "function";
+}
+
+async function scriptRequest(path: string, init: RequestInit = {}): Promise<any> {
+  const invoke = (window as any).__TAURI_INTERNALS__?.invoke as ScriptInvoke | undefined;
+  if (!invoke) throw new Error("Scripts require the desktop app.");
+  const capability = await invoke("script_capability");
+  if (typeof capability !== "string" || !capability) throw new Error("Scripts are unavailable in this desktop app.");
+  const headers = new Headers(init.headers);
+  headers.set("Authorization", `Bearer ${capability}`);
+  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const response = await fetch(path, { ...init, headers });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Scripts request failed");
+  return body;
+}
+
+export interface ScriptLibraryInfo {
+  scripts: ScriptSummary[];
+  canPublish: boolean;
+  publicationDefaults?: { authorName: string };
+}
+
+export async function fetchScriptLibraryInfo(): Promise<ScriptLibraryInfo> {
+  const body = await scriptRequest("/ui/api/scripts");
+  if (!Array.isArray(body.scripts)) {
+    throw new Error("Scripts returned invalid data");
+  }
+  if (body.publicationDefaults !== undefined && (
+    !body.publicationDefaults || typeof body.publicationDefaults.authorName !== "string"
+  )) {
+    throw new Error("Scripts returned invalid publication defaults");
+  }
+  return {
+    scripts: body.scripts as ScriptSummary[],
+    canPublish: body.canPublish === true,
+    ...(body.publicationDefaults ? { publicationDefaults: body.publicationDefaults } : {}),
+  };
+}
+
+export async function fetchScripts(): Promise<ScriptSummary[]> {
+  return (await fetchScriptLibraryInfo()).scripts;
+}
+
+export async function fetchScript(id: string): Promise<ScriptRecord> {
+  const body = await scriptRequest(`/ui/api/scripts/${encodeURIComponent(id)}`);
+  if (!body.script || typeof body.script !== "object") throw new Error("Script returned invalid data");
+  return body.script as ScriptRecord;
+}
+
+export async function createScript(input: Pick<ScriptRecord, "name" | "description" | "language" | "source">): Promise<ScriptRecord> {
+  return (await scriptRequest("/ui/api/scripts", { method: "POST", body: JSON.stringify(input) })).script as ScriptRecord;
+}
+
+export async function updateScript(id: string, input: Pick<ScriptRecord, "name" | "description" | "language" | "source" | "revision">): Promise<ScriptRecord> {
+  const { name, description, language, source, revision: expectedRevision } = input;
+  return (await scriptRequest(`/ui/api/scripts/${encodeURIComponent(id)}`, {
+    method: "PATCH", body: JSON.stringify({ name, description, language, source, expectedRevision }),
+  })).script as ScriptRecord;
+}
+
+export async function deleteScript(id: string, expectedRevision: number): Promise<void> {
+  await scriptRequest(`/ui/api/scripts/${encodeURIComponent(id)}`, {
+    method: "DELETE", body: JSON.stringify({ expectedRevision }),
+  });
+}
+
+export async function fetchPublishedScripts(input: {
+  q?: string;
+  language?: ScriptLanguage;
+  offset?: number;
+} = {}): Promise<{ scripts: PublishedScriptSummary[]; nextOffset: number | null }> {
+  const query = new URLSearchParams();
+  if (input.q) query.set("q", input.q);
+  if (input.language) query.set("language", input.language);
+  if (input.offset) query.set("offset", String(input.offset));
+  const suffix = query.size ? `?${query}` : "";
+  const body = await scriptRequest(`/ui/api/scripts/library${suffix}`);
+  if (!Array.isArray(body.scripts) || (body.nextOffset !== null && !Number.isFinite(body.nextOffset))) {
+    throw new Error("Public library returned invalid data");
+  }
+  return { scripts: body.scripts as PublishedScriptSummary[], nextOffset: body.nextOffset };
+}
+
+export async function fetchPublishedScript(id: string): Promise<PublishedScript> {
+  const body = await scriptRequest(`/ui/api/scripts/library/${encodeURIComponent(id)}`);
+  if (!body.script || typeof body.script !== "object" || typeof body.script.source !== "string") {
+    throw new Error("Public script returned invalid data");
+  }
+  return body.script as PublishedScript;
+}
+
+export async function importPublishedScript(id: string): Promise<ScriptRecord> {
+  const body = await scriptRequest(`/ui/api/scripts/library/${encodeURIComponent(id)}/import`, { method: "POST", body: "{}" });
+  if (!body.script || typeof body.script !== "object") throw new Error("Imported script returned invalid data");
+  return body.script as ScriptRecord;
+}
+
+export async function publishScript(id: string, input: PublishScriptInput): Promise<PublishedScript> {
+  const body = await scriptRequest(`/ui/api/scripts/${encodeURIComponent(id)}/publication`, {
+    method: "PUT", body: JSON.stringify(input),
+  });
+  if (!body.script || typeof body.script !== "object") throw new Error("Published script returned invalid data");
+  return body.script as PublishedScript;
+}
+
+export async function unpublishScript(id: string): Promise<void> {
+  await scriptRequest(`/ui/api/scripts/${encodeURIComponent(id)}/publication`, { method: "DELETE", body: "{}" });
+}
+
+export async function fetchScriptRun(): Promise<ScriptRun | null> {
+  const body = await scriptRequest("/ui/api/scripts/run");
+  return body.run === null ? null : body.run as ScriptRun;
+}
+
+export async function startScriptRun(input: { scriptId: string; profileIds: string[]; inputs: object; useCredentials: boolean; concurrency?: number }): Promise<ScriptRun> {
+  return (await scriptRequest("/ui/api/scripts/run", { method: "POST", body: JSON.stringify(input) })).run as ScriptRun;
+}
+
+export async function stopScriptRun(): Promise<ScriptRun> {
+  return (await scriptRequest("/ui/api/scripts/stop", { method: "POST", body: "{}" })).run as ScriptRun;
+}
+
+function pythonRuntimeStatus(body: any): PythonRuntimeStatus | null {
+  if (body.python === null) return null;
+  if (!body.python || typeof body.python.state !== "string" || !Number.isFinite(body.python.totalBytes)) {
+    throw new Error("Python runtime returned invalid data");
+  }
+  return body.python as PythonRuntimeStatus;
+}
+
+/** The downloaded Python runtime of Python scripts; null when this app does not download one. */
+export async function fetchPythonRuntime(): Promise<PythonRuntimeStatus | null> {
+  return pythonRuntimeStatus(await scriptRequest("/ui/api/scripts/python-runtime"));
+}
+
+export async function downloadPythonRuntime(): Promise<PythonRuntimeStatus | null> {
+  return pythonRuntimeStatus(await scriptRequest("/ui/api/scripts/python-runtime", { method: "POST", body: "{}" }));
+}
+
+export async function fetchScriptLog(runId: string, offset: number): Promise<{ text: string; nextOffset: number }> {
+  const body = await scriptRequest(`/ui/api/scripts/log?runId=${encodeURIComponent(runId)}&offset=${offset}`);
+  if (typeof body.text !== "string" || !Number.isFinite(body.nextOffset)) throw new Error("Script log returned invalid data");
+  return { text: body.text, nextOffset: body.nextOffset };
+}

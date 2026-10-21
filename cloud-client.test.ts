@@ -1,0 +1,429 @@
+import { expect, test } from "bun:test";
+import { CloudApiError, CloudClient, CloudRequestError, type CloudFetch } from "./cloud-client.ts";
+import type { PortableProfileV1 } from "./contracts/cloud-v1.ts";
+
+const payload: PortableProfileV1 = {
+  schemaVersion: 1,
+  profile: {
+    id: "profile/1",
+    accId: "",
+    name: "Profile",
+    group: "",
+    platform: "x.com",
+    username: "user",
+    password: "pass",
+    email: "",
+    emailPassword: "",
+    twofa: "",
+    proxy: null,
+    extensionAssignments: [],
+    tags: [],
+    ua: "ua",
+    timezone: "UTC",
+    screenWidth: 1920,
+    screenHeight: 1080,
+    fingerprintSeed: 1,
+  },
+  session: { cookies: [] },
+};
+
+function client(fetchFn: CloudFetch, timeout = 1_000) {
+  return new CloudClient({
+    baseUrl: "https://cloud.ghosteranti.test/",
+    accessToken: () => "access-token",
+    deviceCredential: () => "device-token",
+    fetchFn,
+    requestTimeoutMs: timeout,
+  });
+}
+
+test("Cloud client rejects insecure non-loopback service URLs", () => {
+  expect(() => new CloudClient({
+    baseUrl: "http://cloud.example",
+    accessToken: () => "token",
+  })).toThrow("GhosterAnti Cloud URL must use HTTPS");
+});
+
+test("Cloud client sends bearer and device credentials to versioned endpoints", async () => {
+  let url = "";
+  let request: RequestInit | undefined;
+  const cloud = client(async (nextUrl, init) => {
+    url = String(nextUrl);
+    request = init;
+    return Response.json({
+      ok: true,
+      registrationId: "registration-1",
+      baseVersion: 4,
+      payload,
+      activeOpens: [],
+    });
+  });
+
+  await cloud.openProfile("profile/1", { deviceId: "device-1" });
+  expect(url).toBe("https://cloud.ghosteranti.test/v1/profiles/profile%2F1/open");
+  const headers = new Headers(request?.headers);
+  expect(headers.get("authorization")).toBe("Bearer access-token");
+  expect(headers.get("x-ghosteranti-device")).toBe("device-token");
+  expect(headers.get("content-type")).toBe("application/json");
+  expect(request?.method).toBe("POST");
+  expect(JSON.parse(String(request?.body))).toEqual({ deviceId: "device-1" });
+});
+
+test("Cloud client encodes folder and account path segments", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const cloud = client(async (url, init) => {
+    calls.push({ url: String(url), init });
+    return Response.json(init?.method === "PUT"
+      ? { ok: true, grant: { folderName: "Sales / US", accountId: "account/1", permission: "view" } }
+      : { ok: true, folder: { name: "Sales", archivedAt: null, permission: "edit" } });
+  });
+  await cloud.renameFolder("Sales / US", "Sales");
+  await cloud.setFolderGrant("Sales / US", "account/1", "view");
+  expect(calls.map((call) => call.url)).toEqual([
+    "https://cloud.ghosteranti.test/v1/workspace/folders/Sales%20%2F%20US",
+    "https://cloud.ghosteranti.test/v1/workspace/folders/Sales%20%2F%20US/grants/account%2F1",
+  ]);
+  expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({ name: "Sales" });
+  expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({ permission: "view" });
+});
+
+test("Cloud client sends explicit folder parents and encoded profile grants", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const cloud = client(async (url, init) => {
+    calls.push({ url: String(url), init });
+    return Response.json({ ok: true });
+  });
+  await cloud.createFolder("Fitness", "Facebook");
+  await cloud.createFolder("Literal/Root");
+  await cloud.moveFolder("Facebook/Fitness", null);
+  await cloud.setProfileGrant("profile/1", "account/1", "edit");
+  await cloud.removeProfileGrant("profile/1", "account/1");
+  expect(calls.map(({ url, init }) => [url.replace("https://cloud.ghosteranti.test/v1", ""), init?.method, init?.body ? JSON.parse(String(init.body)) : null])).toEqual([
+    ["/workspace/folders", "POST", { name: "Fitness", parentName: "Facebook" }],
+    ["/workspace/folders", "POST", { name: "Literal/Root" }],
+    ["/workspace/folders/Facebook%2FFitness/move", "POST", { parentName: null }],
+    ["/profiles/profile%2F1/grants/account%2F1", "PUT", { permission: "edit" }],
+    ["/profiles/profile%2F1/grants/account%2F1", "DELETE", null],
+  ]);
+});
+
+test("Cloud client uses invitation and move request shapes", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const cloud = client(async (url, init) => {
+    calls.push({ url: String(url), init });
+    return Response.json({ ok: true });
+  });
+  await cloud.createInvitation("person@example.com", "member");
+  await cloud.acceptInvitation("pasted-code");
+  await cloud.moveProfile("profile/1", { destination: "Sales", expectedVersion: 4 });
+  expect(calls.map((call) => [call.url, call.init?.method, JSON.parse(String(call.init?.body))])).toEqual([
+    ["https://cloud.ghosteranti.test/v1/workspace/invitations", "POST", { email: "person@example.com", role: "member" }],
+    ["https://cloud.ghosteranti.test/v1/invitations/accept", "POST", { code: "pasted-code" }],
+    ["https://cloud.ghosteranti.test/v1/profiles/profile%2F1/move", "POST", { destination: "Sales", expectedVersion: 4 }],
+  ]);
+});
+
+test("Cloud client manages device-scoped MCP connectors", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const cloud = client(async (url, init) => {
+    calls.push({ url: String(url), init });
+    return Response.json(String(url).endsWith("/mcp/connectors") && init?.method === "POST"
+      ? { ok: true, connector: {}, token: "returned-once" }
+      : String(url).endsWith("/mcp/connectors")
+        ? { ok: true, connectors: [] }
+        : { ok: true });
+  });
+  await cloud.createMcpConnector("Linux Claude");
+  await cloud.listMcpConnectors();
+  await cloud.revokeMcpConnector("connector/1");
+  expect(cloud.remoteMcpUrl("device/1")).toBe("https://cloud.ghosteranti.test/v1/mcp/devices/device%2F1");
+  expect(calls.map((call) => [call.url, call.init?.method ?? "GET"])).toEqual([
+    ["https://cloud.ghosteranti.test/v1/mcp/connectors", "POST"],
+    ["https://cloud.ghosteranti.test/v1/mcp/connectors", "GET"],
+    ["https://cloud.ghosteranti.test/v1/mcp/connectors/connector%2F1", "DELETE"],
+  ]);
+  expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ label: "Linux Claude" });
+});
+
+test("Cloud client updates folder extension defaults and invalidates its roster cache", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const rosterRequests: Array<string | null> = [];
+  const cloud = client(async (url, init) => {
+    calls.push({ url: String(url), init });
+    if (String(url).endsWith("/workspace/folders/Sales%20%2F%20US/extensions")) {
+      return Response.json({
+        ok: true,
+        folder: { name: "Sales / US", archivedAt: null, permission: "edit", extensionDefaults: ["e1"] },
+        updatedCount: 2,
+      });
+    }
+    rosterRequests.push(new Headers(init?.headers).get("if-none-match"));
+    return Response.json({ ok: true, profiles: [] }, { headers: { etag: '"roster-1"' } });
+  });
+
+  await cloud.listProfiles();
+  expect(await cloud.setFolderExtensionDefaults("Sales / US", ["e1"])).toMatchObject({ updatedCount: 2 });
+  await cloud.listProfiles();
+
+  expect(calls[1]!.url).toBe("https://cloud.ghosteranti.test/v1/workspace/folders/Sales%20%2F%20US/extensions");
+  expect(calls[1]!.init?.method).toBe("PUT");
+  expect(JSON.parse(String(calls[1]!.init?.body))).toEqual({ extensionDefaults: ["e1"] });
+  expect(rosterRequests).toEqual([null, null]);
+});
+
+test("Cloud client rejects calls without an in-memory access token", async () => {
+  const cloud = new CloudClient({
+    baseUrl: "https://cloud.ghosteranti.test",
+    accessToken: () => undefined,
+    fetchFn: async () => { throw new Error("must not fetch"); },
+  });
+  await expect(cloud.status()).rejects.toMatchObject({
+    name: "CloudApiError",
+    code: "authentication_required",
+    status: 401,
+  });
+});
+
+test("Cloud client exposes structured revocation errors", async () => {
+  const cloud = client(async () => Response.json({
+    ok: false,
+    error: { code: "device_revoked", message: "This device was revoked" },
+  }, { status: 403 }));
+  try {
+    await cloud.heartbeat("registration-1");
+    throw new Error("expected heartbeat to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(CloudApiError);
+    expect(error).toMatchObject({ code: "device_revoked", status: 403 });
+  }
+});
+
+test("Cloud close returns a terminal version conflict without retrying", async () => {
+  let calls = 0;
+  const cloud = client(async () => {
+    calls++;
+    return Response.json({
+      ok: false,
+      error: { code: "version_conflict", message: "stale", currentVersion: 8 },
+    }, { status: 409 });
+  });
+  expect(await cloud.closeOpen("registration-1", { expectedVersion: 7, payload })).toEqual({
+    ok: false,
+    error: { code: "version_conflict", message: "stale", currentVersion: 8 },
+  });
+  expect(calls).toBe(1);
+});
+
+test("Cloud close rejects malformed conflicts without a current version", async () => {
+  const cloud = client(async () => Response.json({
+    ok: false,
+    error: { code: "version_conflict", message: "stale" },
+  }, { status: 409 }));
+  await expect(cloud.closeOpen("registration-1", { expectedVersion: 7, payload }))
+    .rejects.toThrow("missing currentVersion");
+});
+
+test("Cloud client shares one roster download between callers until a write", async () => {
+  let rosterRequests = 0;
+  const waiting: Array<() => void> = [];
+  const cloud = client(async (url) => {
+    if (String(url).endsWith("/profiles/import")) return Response.json({ ok: true, imported: 0, ids: [] }, { status: 201 });
+    rosterRequests++;
+    await new Promise<void>((resolve) => { waiting.push(resolve); });
+    return Response.json({ ok: true, profiles: [] }, { headers: { etag: `"roster-${rosterRequests}"` } });
+  });
+
+  const first = cloud.listProfiles();
+  const second = cloud.listProfiles();
+  await Bun.sleep(0);
+  expect(rosterRequests).toBe(1);
+  waiting.shift()!();
+  expect(await second).toEqual(await first);
+
+  const before = cloud.listProfiles();
+  await Bun.sleep(0);
+  await cloud.importProfiles({ destination: "Sales", profiles: [] });
+  // A roster started before the write cannot answer for the state after it.
+  const after = cloud.listProfiles();
+  await Bun.sleep(0);
+  expect(rosterRequests).toBe(3);
+  for (const release of waiting.splice(0)) release();
+  await Promise.all([before, after]);
+});
+
+test("Cloud client imports one profile batch and invalidates its roster cache", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const rosterRequests: Array<string | null> = [];
+  const cloud = client(async (url, init) => {
+    calls.push({ url: String(url), init });
+    if (String(url).endsWith("/profiles/import")) {
+      return Response.json({ ok: true, imported: 2, ids: ["profile1", "profile2"] }, { status: 201 });
+    }
+    rosterRequests.push(new Headers(init?.headers).get("if-none-match"));
+    return Response.json({ ok: true, profiles: [] }, { headers: { etag: `"roster-${rosterRequests.length}"` } });
+  });
+  const first = structuredClone(payload);
+  first.profile.id = "profile1";
+  const second = structuredClone(payload);
+  second.profile.id = "profile2";
+
+  await cloud.listProfiles();
+  expect(await cloud.importProfiles({ destination: "Sales", profiles: [first, second] })).toEqual({
+    ok: true,
+    imported: 2,
+    ids: ["profile1", "profile2"],
+  });
+  await cloud.listProfiles();
+
+  expect(calls[1]!.url).toBe("https://cloud.ghosteranti.test/v1/profiles/import");
+  expect(calls[1]!.init?.method).toBe("POST");
+  expect(JSON.parse(String(calls[1]!.init?.body))).toEqual({ destination: "Sales", profiles: [first, second] });
+  expect(rosterRequests).toEqual([null, null]);
+});
+
+test("Cloud client replaces proxies and invalidates its roster only after apply", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const rosterRequests: Array<string | null> = [];
+  const cloud = client(async (url, init) => {
+    calls.push({ url: String(url), init });
+    if (String(url).endsWith("/profiles/proxy-replacements")) {
+      const request = JSON.parse(String(init?.body));
+      return Response.json({
+        ok: true,
+        dryRun: request.dryRun,
+        counts: {
+          received: 1,
+          matched: 1,
+          ready: request.dryRun ? 1 : 0,
+          updated: request.dryRun ? 0 : 1,
+          unchanged: 0,
+          missing: 0,
+          skipped: 0,
+        },
+        results: request.dryRun
+          ? [{ index: 0, status: "ready", profileId: "profile1", currentVersion: 1 }]
+          : [{ index: 0, status: "updated", profileId: "profile1", previousVersion: 1, version: 2 }],
+        missingUsernames: [],
+      });
+    }
+    rosterRequests.push(new Headers(init?.headers).get("if-none-match"));
+    return Response.json({ ok: true, profiles: [] }, { headers: { etag: '"roster-1"' } });
+  });
+  const replacement = {
+    profileId: "profile1",
+    expectedVersion: 1,
+    proxy: { type: "socks5" as const, host: "proxy.test", port: "1080", user: "user", pass: "secret" },
+  };
+
+  await cloud.listProfiles();
+  await cloud.replaceProfileProxies({ dryRun: true, replacements: [replacement] });
+  await cloud.listProfiles();
+  await cloud.replaceProfileProxies({ dryRun: false, replacements: [replacement] });
+  await cloud.listProfiles();
+
+  const replacementCalls = calls.filter((call) => call.url.endsWith("/profiles/proxy-replacements"));
+  expect(replacementCalls.map((call) => [call.init?.method, JSON.parse(String(call.init?.body))])).toEqual([
+    ["POST", { dryRun: true, replacements: [replacement] }],
+    ["POST", { dryRun: false, replacements: [replacement] }],
+  ]);
+  expect(rosterRequests).toEqual([null, '"roster-1"', null]);
+});
+
+test("Cloud proxy inventory bypasses roster caching and propagates cancellation", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const controller = new AbortController();
+  const cloud = client(async (url, init) => {
+    init?.signal?.throwIfAborted();
+    calls.push({ url: String(url), init });
+    return Response.json({ ok: true, profiles: [] }, { headers: { etag: '"roster-1"' } });
+  });
+  await cloud.listProfiles();
+  expect(await cloud.listProfileProxies(controller.signal)).toEqual({ ok: true, profiles: [] });
+  await cloud.listProfileProxies(controller.signal);
+  expect(calls.slice(1).map((c) => c.url)).toEqual(Array(2).fill("https://cloud.ghosteranti.test/v1/profiles/proxies"));
+  for (const call of calls.slice(1)) {
+    expect(call.init?.cache).toBe("no-store");
+    expect(new Headers(call.init?.headers).get("if-none-match")).toBeNull();
+    expect(call.init?.signal).toBeDefined();
+  }
+  controller.abort();
+  await expect(cloud.listProfileProxies(controller.signal)).rejects.toThrow();
+});
+
+test("Cloud profile roster reuses its per-client ETag cache", async () => {
+  const requests: Array<string | null> = [];
+  const roster = { ok: true as const, profiles: [] };
+  let calls = 0;
+  const cloud = client(async (_url, init) => {
+    requests.push(new Headers(init?.headers).get("if-none-match"));
+    calls++;
+    if (calls === 1) return Response.json(roster, { headers: { etag: '"roster-1"' } });
+    return new Response(null, { status: 304, headers: { etag: '"roster-1"' } });
+  });
+
+  expect(await cloud.listProfiles()).toEqual(roster);
+  expect(await cloud.listProfiles()).toEqual(roster);
+  expect(requests).toEqual([null, '"roster-1"']);
+});
+
+test("Cloud client preserves HTTP status for non-JSON failures", async () => {
+  const cloud = client(async () => new Response("<html>failure</html>", {
+    status: 502,
+    headers: { "content-type": "text/html" },
+  }));
+  await expect(cloud.listProfiles()).rejects.toMatchObject({
+    name: "CloudApiError",
+    code: "internal_error",
+    status: 502,
+    message: "GhosterAnti Cloud /profiles returned non-JSON (502, text/html)",
+  });
+});
+
+test("Cloud client classifies fetch failures without losing their cause", async () => {
+  const failure = new TypeError("fetch failed");
+  const cloud = client(async () => { throw failure; });
+  try {
+    await cloud.status();
+    throw new Error("expected status to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(CloudRequestError);
+    expect(error).toMatchObject({ failure: { kind: "transport", retryable: true }, cause: failure });
+  }
+});
+
+function trickle(chunks: string[], gapMs: number, stallAfter = Infinity): ReadableStream<Uint8Array> {
+  let sent = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      if (sent >= stallAfter) return new Promise<void>(() => {});
+      await Bun.sleep(gapMs);
+      if (sent === chunks.length) return controller.close();
+      controller.enqueue(new TextEncoder().encode(chunks[sent++]!));
+    },
+  });
+}
+
+test("Cloud client finishes a roster that keeps arriving past the timeout", async () => {
+  const body = JSON.stringify({ ok: true, profiles: [] }).padEnd(400, " ");
+  const chunks = body.match(/.{1,20}/gs)!;
+  const cloud = client(async () => new Response(trickle(chunks, 5)), 50);
+  const started = performance.now();
+  expect(await cloud.listProfiles()).toEqual({ ok: true, profiles: [] });
+  expect(performance.now() - started).toBeGreaterThan(50);
+});
+
+test("Cloud client times out a response body that stops arriving", async () => {
+  const cloud = client(async () => new Response(trickle(['{"ok":true,', '"profiles":[]}'], 1, 1)), 30);
+  await expect(cloud.listProfiles()).rejects.toMatchObject({
+    message: expect.stringContaining("timed out after 30ms"),
+    failure: { kind: "timeout", retryable: true },
+  });
+});
+
+test("Cloud client bounds fetch implementations that ignore abort", async () => {
+  const cloud = client(() => new Promise<Response>(() => {}), 5);
+  await expect(cloud.status()).rejects.toMatchObject({
+    message: expect.stringContaining("timed out after 5ms"),
+    failure: { kind: "timeout", retryable: true },
+  });
+});

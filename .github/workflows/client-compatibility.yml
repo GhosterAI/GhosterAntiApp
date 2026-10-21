@@ -1,0 +1,346 @@
+name: Windows MCP client compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Client CI run containing ghosteranti-windows-candidate
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: windows-client-compatibility-${{ inputs.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  clients:
+    name: Claude Code, Codex, OpenClaw, and Hermes
+    runs-on: windows-latest
+    steps:
+      - name: Validate installer run
+        id: installer_run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTALLER_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:INSTALLER_RUN_ID -notmatch '^[1-9][0-9]*$') {
+            throw "installer run ID must be a positive integer"
+          }
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:INSTALLER_RUN_ID" | ConvertFrom-Json
+          if (
+            $run.name -cne "Client CI" -or
+            $run.path -cne ".github/workflows/ci.yml" -or
+            $run.status -cne "completed" -or
+            $run.conclusion -cne "success" -or
+            $run.event -cne "workflow_dispatch" -or
+            $run.head_branch -cne "main"
+          ) {
+            throw "installer run must be a successful manually dispatched Client CI run from main"
+          }
+          if (
+            $run.repository.full_name -cne $env:GITHUB_REPOSITORY -or
+            $run.head_repository.full_name -cne $env:GITHUB_REPOSITORY
+          ) {
+            throw "installer run repository identity did not match"
+          }
+          $source = [string]$run.head_sha
+          if ($source -notmatch '^[a-f0-9]{40}$') { throw "installer run source SHA is invalid" }
+          "source=$source" | Add-Content $env:GITHUB_OUTPUT
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.installer_run.outputs.source }}
+      - name: Verify exact source checkout
+        shell: pwsh
+        env:
+          EXPECTED_SOURCE: ${{ steps.installer_run.outputs.source }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $actualSource = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualSource -cne $env:EXPECTED_SOURCE) {
+            throw "checked-out source did not match the installer run"
+          }
+          $status = @(& git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) {
+            throw "checked-out source tree is not exact and clean"
+          }
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-candidate
+          path: artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+      - name: Verify candidate provenance and files
+        shell: pwsh
+        env:
+          EXPECTED_SOURCE: ${{ steps.installer_run.outputs.source }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $artifact = Join-Path $env:GITHUB_WORKSPACE "artifact"
+          $version = [string](Get-Content ".\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json).version
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "candidate source version is missing" }
+          $fullName = "GhosterAnti_${version}_x64-offline-setup.exe"
+          $slimName = "GhosterAnti_${version}_x64-setup.exe"
+          $payloadNames = @($fullName, $slimName, "browser.json", "SHA256SUMS.txt", "size-report.json")
+          $requiredNames = @($payloadNames + "artifact-manifest.json") | Sort-Object
+          $entries = @(Get-ChildItem -LiteralPath $artifact -Force)
+          $actualNames = @($entries | ForEach-Object Name | Sort-Object)
+          if (
+            $entries.Count -ne 6 -or
+            @($entries | Where-Object {
+              $_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+            }).Count -ne 0 -or
+            ($actualNames -join "`n") -cne ($requiredNames -join "`n")
+          ) {
+            throw "candidate artifact must contain exactly its six regular files"
+          }
+          $manifest = Get-Content (Join-Path $artifact "artifact-manifest.json") -Raw | ConvertFrom-Json
+          $productKey = [string]$manifest.productKey
+          if ($manifest.schema -ne 1 -or $manifest.role -cne "candidate" -or
+              $manifest.source -cne $env:EXPECTED_SOURCE -or $manifest.version -cne $version -or
+              $productKey -notmatch '^[a-f0-9]{64}$') {
+            throw "candidate artifact provenance is invalid"
+          }
+          $arguments = @(
+            $artifact,
+            "--role", "candidate",
+            "--source", $env:EXPECTED_SOURCE,
+            "--version", $version,
+            "--product-key", $productKey
+          )
+          foreach ($name in $payloadNames) { $arguments += @("--file", $name) }
+          & bun scripts/windows-artifact-manifest.ts verify @arguments
+          if ($LASTEXITCODE -ne 0) { throw "candidate artifact manifest verification failed" }
+          "GHOSTERANTI_CANDIDATE_VERSION=$version" | Add-Content $env:GITHUB_ENV
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+      - name: Install isolated GhosterAnti
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "ghosteranti-client-compatibility"
+          $testHome = Join-Path $root "home"
+          $appData = Join-Path $testHome "AppData\Roaming"
+          $localAppData = Join-Path $testHome "AppData\Local"
+          $npmPrefix = Join-Path $root "npm"
+          $installRoot = Join-Path $root "GhosterAnti"
+          foreach ($path in @($testHome, $appData, $localAppData, $npmPrefix)) {
+            New-Item -ItemType Directory -Force $path | Out-Null
+          }
+          @(
+            "HOME=$testHome"
+            "USERPROFILE=$testHome"
+            "APPDATA=$appData"
+            "LOCALAPPDATA=$localAppData"
+            "NPM_CONFIG_PREFIX=$npmPrefix"
+            "GHOSTERANTI_INSTALL_ROOT=$installRoot"
+          ) | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          $npmPrefix | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+          if ([string]::IsNullOrWhiteSpace($env:GHOSTERANTI_CANDIDATE_VERSION)) {
+            throw "verified GhosterAnti candidate version is missing"
+          }
+          $installerName = "GhosterAnti_$($env:GHOSTERANTI_CANDIDATE_VERSION)_x64-offline-setup.exe"
+          $installer = Get-Item (Join-Path $env:GITHUB_WORKSPACE "artifact\$installerName")
+          $checksumFile = Join-Path $env:GITHUB_WORKSPACE "artifact\SHA256SUMS.txt"
+          $checksumPattern = '^([a-f0-9]{64})  ' + [regex]::Escape($installerName) + '$'
+          $checksumLines = @([IO.File]::ReadAllLines($checksumFile) | Where-Object { $_ -match $checksumPattern })
+          if ($checksumLines.Count -ne 1) { throw "GhosterAnti full installer checksum is missing or ambiguous" }
+          $expectedChecksum = [regex]::Match($checksumLines[0], $checksumPattern).Groups[1].Value
+          $actual = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $expectedChecksum) { throw "GhosterAnti full installer checksum did not match" }
+          $stream = [IO.File]::OpenRead($installer.FullName)
+          try {
+            if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+              throw "GhosterAnti full installer is not a Windows PE file"
+            }
+          } finally {
+            $stream.Dispose()
+          }
+          if ((Get-AuthenticodeSignature $installer.FullName).Status -ne "NotSigned") {
+            throw "GhosterAnti compatibility artifact was expected to be unsigned"
+          }
+
+          $install = Start-Process -Wait -PassThru $installer.FullName -ArgumentList @(
+            "/S",
+            "/D=$installRoot"
+          )
+          if ($install.ExitCode -ne 0) { throw "GhosterAnti installer exited with code $($install.ExitCode)" }
+          $helper = Join-Path $installRoot "ghosteranti-mcp.exe"
+          if (-not (Test-Path $helper -PathType Leaf)) { throw "GhosterAnti helper was not installed" }
+          $aliasData = Join-Path $appData "com.ghosteranti.desktop"
+          New-Item -ItemType Directory -Force $aliasData | Out-Null
+          @{ version = 1; mode = "local"; localAnalytics = $false } |
+            ConvertTo-Json -Compress |
+            Set-Content (Join-Path $aliasData "config.json")
+      - name: Verify npm MCP clients
+        shell: pwsh
+        run: |
+          npm.cmd install --global --no-audit --no-fund `
+            "@anthropic-ai/claude-code@2.1.245" `
+            "@openai/codex@0.149.1" `
+            "openclaw@2026.7.1-2"
+          if ($LASTEXITCODE -ne 0) { throw "pinned MCP client installation failed" }
+
+          $helper = Join-Path $env:GHOSTERANTI_INSTALL_ROOT "ghosteranti-mcp.exe"
+          $setup = (& $helper setup --client auto --yes | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0 -or -not $setup.ok) { throw "GhosterAnti automatic client setup failed" }
+          foreach ($client in @("claude", "codex", "openclaw")) {
+            $status = $setup.result.clients | Where-Object client -eq $client
+            if ($status.status -ne "configured") {
+              throw "GhosterAnti did not configure ${client}: $($status.status)/$($status.reason)"
+            }
+          }
+
+          function Assert-ClientRegistration([string]$command, [string[]]$arguments) {
+            $output = (& $command @arguments 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0 -or $output -notmatch "ghosteranti") {
+              throw "MCP client did not recognize the GhosterAnti registration"
+            }
+          }
+          $claude = (Get-Command claude -ErrorAction Stop).Source
+          $codex = (Get-Command codex -ErrorAction Stop).Source
+          $openclaw = (Get-Command openclaw -ErrorAction Stop).Source
+          Assert-ClientRegistration $claude @("mcp", "get", "ghosteranti")
+          Assert-ClientRegistration $claude @("mcp", "list")
+          Assert-ClientRegistration $codex @("mcp", "list")
+          Assert-ClientRegistration $openclaw @("mcp", "list", "--json")
+          Assert-ClientRegistration $openclaw @("mcp", "doctor", "ghosteranti", "--probe", "--json")
+      - name: Verify Hermes MCP client
+        shell: pwsh
+        run: |
+          $commit = "fcbd1076a93841fa88855acce810e342a5b78101"
+          $expectedHash = "74225bf244253bfa5bc2b1d16fa3bb8618e199a53d1c0344b37ab9930696d3ba"
+          $installer = Join-Path $env:RUNNER_TEMP "hermes-install.ps1"
+          Invoke-WebRequest `
+            "https://raw.githubusercontent.com/NousResearch/hermes-agent/$commit/scripts/install.ps1" `
+            -OutFile $installer
+          $actualHash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw "Hermes installer checksum did not match" }
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw "Hermes git configuration failed" }
+          & $installer -SkipSetup -Branch "v2026.8.19" -Commit $commit
+          if ($LASTEXITCODE -ne 0) { throw "pinned Hermes installation failed" }
+
+          $hermesBin = Join-Path $env:LOCALAPPDATA "hermes\hermes-agent\bin"
+          $env:PATH = "$hermesBin;$env:PATH"
+          $hermes = (Get-Command hermes -ErrorAction Stop).Source
+          $helper = Join-Path $env:GHOSTERANTI_INSTALL_ROOT "ghosteranti-mcp.exe"
+          $setup = (& $helper setup --client hermes --yes | ConvertFrom-Json)
+          if (
+            $LASTEXITCODE -ne 0 -or
+            -not $setup.ok -or
+            $setup.result.clients[0].status -ne "configured"
+          ) {
+            throw "GhosterAnti did not configure Hermes"
+          }
+          $list = (& $hermes mcp list 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $list -notmatch "ghosteranti") {
+            throw "Hermes did not recognize the GhosterAnti registration"
+          }
+          $null = & $hermes mcp test ghosteranti 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "Hermes could not start the GhosterAnti MCP server" }
+      - name: Verify Remote MCP host and helper launcher
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Stop"
+          $helper = Join-Path $env:GHOSTERANTI_INSTALL_ROOT "ghosteranti-mcp.exe"
+
+          # Ending the launcher must end the MCP helper that it started in the sidecar program.
+          $start = [Diagnostics.ProcessStartInfo]::new($helper)
+          $start.ArgumentList.Add("serve")
+          $start.UseShellExecute = $false
+          $start.CreateNoWindow = $true
+          $start.RedirectStandardInput = $true
+          $start.RedirectStandardOutput = $true
+          $launcher = [Diagnostics.Process]::Start($start)
+          $launcher.StandardInput.WriteLine('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}')
+          $line = $launcher.StandardOutput.ReadLineAsync()
+          if (-not $line.Wait(120000) -or ($line.Result | ConvertFrom-Json).id -ne 1) { throw "the MCP helper did not answer initialize" }
+          $child = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($launcher.Id)" |
+            Where-Object { $_.Name -eq "ghosteranti-sidecar.exe" -and $_.CommandLine -match '\s__mcp\s+serve\s*$' })
+          if ($child.Count -ne 1) { throw "the launcher did not start the MCP helper in the sidecar program" }
+          $hosts = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($child[0].ProcessId)" |
+            Where-Object { $_.Name -eq "node.exe" } | ForEach-Object { [int]$_.ProcessId })
+          if ($hosts.Count -ne 1) { throw "the MCP helper did not start its Node host" }
+          Stop-Process -Id $launcher.Id -Force
+          $survivors = @()
+          for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            $survivors = @(@([int]$child[0].ProcessId) + $hosts | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+            if ($survivors.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 250
+          }
+          if ($survivors.Count -ne 0) { throw "the MCP helper or its Node host survived the launcher" }
+
+          # Remote MCP: the tunnel must start the installed MCP host and pass messages both ways.
+          # A local server takes the place of GhosterAnti Cloud.
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw "bun install failed" }
+          $check = Join-Path $env:GITHUB_WORKSPACE "remote-mcp-check.ts"
+          @'
+          import { WebSocketServer } from "ws";
+          import { MCP_TUNNEL_PROTOCOL } from "./contracts/cloud-v1.ts";
+          import { McpTunnelRuntime } from "./mcp-tunnel.ts";
+          const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+          await new Promise((resolve) => server.once("listening", resolve));
+          const tools = new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("the tunnel returned no tool list")), 120_000);
+            server.on("connection", (socket, request) => {
+              if (request.url !== "/v1/mcp/tunnel" || request.headers["x-ghosteranti-device"] !== "ci-device") return socket.close();
+              const send = (frame) => socket.send(JSON.stringify({ protocol: MCP_TUNNEL_PROTOCOL, sessionId: "ci", ...frame }));
+              socket.on("message", (data) => {
+                const frame = JSON.parse(data.toString());
+                if (frame.type !== "message") return reject(new Error("the tunnel sent " + JSON.stringify(frame)));
+                if (frame.payload.id === 1) {
+                  send({ type: "message", payload: { jsonrpc: "2.0", method: "notifications/initialized" } });
+                  send({ type: "message", payload: { jsonrpc: "2.0", id: 2, method: "tools/list" } });
+                }
+                if (frame.payload.id === 2) { clearTimeout(timer); resolve(frame.payload.result.tools.map((tool) => tool.name)); }
+              });
+              send({ type: "open" });
+              send({ type: "message", payload: { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "ci", version: "1" } } } });
+            });
+          });
+          const tunnel = new McpTunnelRuntime({
+            baseUrl: "http://127.0.0.1:" + server.address().port,
+            accessToken: () => "ci-token", deviceId: () => "ci-device-id", deviceCredential: () => "ci-device",
+            helperPath: process.env.HELPER,
+          });
+          tunnel.start();
+          const names = await tools;
+          await tunnel.stop();
+          server.close();
+          if (!names.includes("ghosteranti_profiles_list") || !names.includes("ghosteranti_browser_open")) throw new Error("the tool list is not complete");
+          console.log("Remote MCP tunnel listed " + names.length + " tools");
+          '@ | Set-Content -LiteralPath $check -Encoding utf8
+          $helpers = { @(Get-CimInstance Win32_Process -Filter "Name = 'ghosteranti-sidecar.exe'" |
+            Where-Object { $_.CommandLine -match '\s__mcp\s' } | ForEach-Object { [int]$_.ProcessId }) }
+          $before = & $helpers
+          $env:HELPER = $helper
+          bun $check
+          if ($LASTEXITCODE -ne 0) { throw "the Remote MCP tunnel could not use the installed MCP host" }
+          # A closed tunnel session must leave no MCP helper behind.
+          if (@(& $helpers | Where-Object { $before -notcontains $_ }).Count -ne 0) {
+            throw "the Remote MCP host survived its closed session"
+          }
+      - name: Stop isolated GhosterAnti
+        if: always()
+        shell: pwsh
+        run: |
+          $descriptor = Join-Path $env:APPDATA "com.ghosteranti.desktop\agent-runtime.json"
+          if (Test-Path $descriptor -PathType Leaf) {
+            $runtime = Get-Content $descriptor | ConvertFrom-Json
+            Stop-Process -Id $runtime.desktopPid -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $runtime.sidecarPid -Force -ErrorAction SilentlyContinue
+          }

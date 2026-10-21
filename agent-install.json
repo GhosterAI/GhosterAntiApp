@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "product": "GhosterAnti",
+  "platforms": ["windows-x64"],
+  "wingetId": "GhosterAnti.GhosterAnti",
+  "releaseManifest": "https://github.com/GhosterAI/GhosterAnti/releases/download/v{version}/ghosteranti-agent-bootstrap.json",
+  "bootstrapScript": "scripts/install-agent.ps1",
+  "installedHelper": "%LOCALAPPDATA%\\GhosterAnti\\ghosteranti-mcp.exe",
+  "mcp": {
+    "transport": "stdio",
+    "command": "%LOCALAPPDATA%\\GhosterAnti\\playwright\\node\\node.exe",
+    "args": ["%LOCALAPPDATA%\\GhosterAnti\\playwright\\agent\\mcp-host.mjs"]
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "name": "ghosteranti",
+  "version": "0.1.0-beta.65",
+  "description": "Local-first browser profile manager with optional cloud synchronization",
+  "module": "cli.ts",
+  "type": "module",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "bun cli.ts start",
+    "serve": "bun cli.ts serve",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "docs:public": "bun scripts/generate-public-docs.mjs",
+    "docs:public:check": "bun scripts/generate-public-docs.mjs --check",
+    "desktop:prepare": "bun scripts/prepare-windows-bundle.ts",
+    "desktop:build:nsis": "bun run desktop:prepare && tauri build --bundles nsis --no-sign",
+    "desktop:prepare:macos": "bun scripts/prepare-macos-bundle.ts",
+    "desktop:build:macos": "bun run desktop:prepare:macos && tauri build --target aarch64-apple-darwin --bundles app,dmg",
+    "desktop:prepare:linux": "bun scripts/prepare-linux-bundle.ts",
+    "desktop:build:linux": "bun run desktop:prepare:linux && tauri build --bundles deb",
+    "desktop:check": "cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc",
+    "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "i18n:locales": "bun scripts/generate-locale-registry.mjs",
+    "i18n:locales:check": "bun scripts/generate-locale-registry.mjs --check"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@types/bun": "latest",
+    "@types/cross-spawn": "6.0.6",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "8.18.1"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@playwright/mcp": "0.0.56",
+    "@tauri-apps/api": "2.11.1",
+    "camoufox-js": "0.12.0",
+    "cross-spawn": "7.0.6",
+    "csv-parse": "^7.0.2",
+    "playwright": "1.58.0-alpha-2026-01-16",
+    "playwright-core": "1.58.2",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "ws": "8.21.0"
+  },
+  "patchedDependencies": {
+    "playwright-core@1.58.2": "patches/playwright-core@1.58.2.patch",
+    "header-generator@2.1.88": "patches/header-generator@2.1.88.patch",
+    "fingerprint-generator@2.1.88": "patches/fingerprint-generator@2.1.88.patch"
+  }
+}

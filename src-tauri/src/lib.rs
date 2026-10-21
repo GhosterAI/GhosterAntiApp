@@ -1,0 +1,693 @@
+mod browser;
+mod credentials;
+mod releases;
+mod runtime_descriptor;
+mod shutdown;
+mod sidecar;
+mod update_attempt;
+
+use credentials::{credential_delete, credential_get, credential_set, CredentialOrigin};
+use rand::random;
+use std::{
+    error::Error,
+    ffi::{OsStr, OsString},
+    fs, io,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicI32, Ordering},
+        Arc,
+    },
+};
+use tauri::{
+    ipc::CapabilityBuilder,
+    webview::{NewWindowResponse, PageLoadEvent},
+    Manager, WebviewUrl, WebviewWindowBuilder,
+};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_shell::ShellExt;
+
+const IMPORT_RESTRICTION: &str = "Windows DPAPI protects persisted browser secrets, so this import works only for the same Windows machine and account. Persisted persona fields are preserved, but runtime or browser differences can change the account-visible fingerprint.";
+
+const ALLOWED_EXTERNAL_URLS: [&str; 6] = [
+    "https://github.com/GhosterAI/GhosterAnti",
+    "https://github.com/GhosterAI/GhosterAnti/issues",
+    "https://ghosteranti.com/terms/",
+    "https://ghosteranti.com/privacy/",
+    "https://ghosteranti.com/acceptable-use/",
+    "https://nobleproxy.com/t/ghosteranti",
+];
+
+const WINDOWS_ACCEPTANCE_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
+
+fn windows_acceptance_browser_args(enabled: bool, debug_port: Option<&str>) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let debug_port = debug_port.unwrap_or("0").parse::<u16>().ok()?;
+    Some(format!(
+        "{WINDOWS_ACCEPTANCE_BROWSER_ARGS} --remote-debugging-port={debug_port}"
+    ))
+}
+
+fn allowed_external_url(url: &str) -> bool {
+    ALLOWED_EXTERNAL_URLS.contains(&url) || proxy_offer_url(url)
+}
+
+/// The proxy offer link can name the button that was clicked, a quantity and the app language.
+fn proxy_offer_url(url: &str) -> bool {
+    let Some(query) = url.strip_prefix("https://nobleproxy.com/t/ghosteranti?") else {
+        return false;
+    };
+    query.split('&').all(|pair| {
+        pair.split_once('=').is_some_and(|(key, value)| {
+            matches!(key, "src" | "qty" | "lang")
+                && (1..=32).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    })
+}
+
+#[allow(deprecated)]
+fn open_external_url(app: &tauri::AppHandle, url: &str) {
+    let _ = app.shell().open(url, None);
+}
+
+#[derive(Default)]
+struct RevealRequested(AtomicBool);
+
+fn boxed(error: impl Into<String>) -> Box<dyn Error> {
+    io::Error::other(error.into()).into()
+}
+
+struct StartupCleanup<F: FnOnce()> {
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce()> StartupCleanup<F> {
+    fn new(cleanup: F) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+
+    fn disarm(&mut self) {
+        let _ = self.cleanup.take();
+    }
+}
+
+impl<F: FnOnce()> Drop for StartupCleanup<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+fn background_requested<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    args.into_iter()
+        .any(|arg| arg.as_ref() == OsStr::new("--background"))
+}
+
+fn packaged_node_package_version(root: &Path, package: &str) -> Result<String, Box<dyn Error>> {
+    let manifest = package
+        .split('/')
+        .fold(root.join("node_modules"), |path, segment| {
+            path.join(segment)
+        })
+        .join("package.json");
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).map_err(|error| {
+            boxed(format!(
+                "packaged agent dependency is unavailable: {package}: {error}"
+            ))
+        })?)?;
+    value
+        .get("version")
+        .and_then(|version| version.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            boxed(format!(
+                "packaged agent dependency has no version: {package}"
+            ))
+        })
+}
+
+fn configured_local_mode(data_dir: &Path) -> bool {
+    fs::read(data_dir.join("config.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|config| {
+            config.get("version").and_then(|version| version.as_u64()) == Some(1)
+                && config.get("mode").and_then(|mode| mode.as_str()) == Some("local")
+        })
+}
+
+fn cli_compatible_windows_path(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    text.strip_prefix(r"\\?\UNC\")
+        .map(|path| PathBuf::from(format!(r"\\{path}")))
+        .or_else(|| text.strip_prefix(r"\\?\").map(PathBuf::from))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+#[derive(Debug, PartialEq)]
+struct CloakpitImportRequest {
+    source: Option<PathBuf>,
+    profile_root: Option<PathBuf>,
+}
+
+fn parse_cloakpit_import_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<Option<CloakpitImportRequest>, String> {
+    let args: Vec<OsString> = args.into_iter().collect();
+    let marker = OsString::from("--import-cloakpit");
+    let Some(index) = args.iter().position(|arg| arg == &marker) else {
+        return Ok(None);
+    };
+    if args[..index].iter().any(|arg| !arg.is_empty()) {
+        return Err("--import-cloakpit cannot be combined with other arguments".to_owned());
+    }
+    let mut source = None;
+    let mut profile_root = None;
+    let mut cursor = index + 1;
+    while cursor < args.len() {
+        if args[cursor] == "--cloakpit-profile-root" {
+            cursor += 1;
+            let value = args
+                .get(cursor)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "--cloakpit-profile-root requires a directory".to_owned())?;
+            if profile_root.replace(PathBuf::from(value)).is_some() {
+                return Err("--cloakpit-profile-root was provided more than once".to_owned());
+            }
+        } else if args[cursor].to_string_lossy().starts_with("--") {
+            return Err(format!(
+                "unknown import option: {}",
+                args[cursor].to_string_lossy()
+            ));
+        } else if source.replace(PathBuf::from(&args[cursor])).is_some() {
+            return Err("only one Cloakpit source directory can be imported".to_owned());
+        }
+        cursor += 1;
+    }
+    Ok(Some(CloakpitImportRequest {
+        source,
+        profile_root,
+    }))
+}
+
+fn present_import_result(app: &tauri::AppHandle, ok: bool, message: &str) {
+    app.dialog()
+        .message(message)
+        .title(if ok {
+            "Cloakpit import complete"
+        } else {
+            "Cloakpit import failed"
+        })
+        .kind(if ok {
+            MessageDialogKind::Info
+        } else {
+            MessageDialogKind::Error
+        })
+        .buttons(MessageDialogButtons::Ok)
+        .blocking_show();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        allowed_external_url, background_requested, cli_compatible_windows_path,
+        configured_local_mode, parse_cloakpit_import_args, windows_acceptance_browser_args,
+        CloakpitImportRequest, StartupCleanup,
+    };
+    use std::{
+        cell::Cell,
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    #[test]
+    fn startup_cleanup_runs_only_while_armed() {
+        let cleaned = Cell::new(0);
+        {
+            let _guard = StartupCleanup::new(|| cleaned.set(cleaned.get() + 1));
+        }
+        assert_eq!(cleaned.get(), 1);
+
+        {
+            let mut guard = StartupCleanup::new(|| cleaned.set(cleaned.get() + 1));
+            guard.disarm();
+        }
+        assert_eq!(cleaned.get(), 1);
+    }
+
+    #[test]
+    fn recognizes_only_the_explicit_background_switch() {
+        assert!(background_requested(["ghosteranti.exe", "--background"]));
+        assert!(!background_requested([
+            "ghosteranti.exe",
+            "--background-worker"
+        ]));
+        assert!(!background_requested(["ghosteranti.exe"]));
+    }
+
+    #[test]
+    fn recognizes_configured_local_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!configured_local_mode(dir.path()));
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{"version":1,"mode":"local","localAnalytics":false}"#,
+        )
+        .unwrap();
+        assert!(configured_local_mode(dir.path()));
+        fs::write(dir.path().join("config.json"), br#"{"mode":"local"}"#).unwrap();
+        assert!(!configured_local_mode(dir.path()));
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{"version":1,"mode":"cloud"}"#,
+        )
+        .unwrap();
+        assert!(!configured_local_mode(dir.path()));
+    }
+
+    #[test]
+    fn allows_only_explicit_external_pages() {
+        for url in [
+            "https://github.com/GhosterAI/GhosterAnti",
+            "https://github.com/GhosterAI/GhosterAnti/issues",
+            "https://ghosteranti.com/terms/",
+            "https://ghosteranti.com/privacy/",
+            "https://ghosteranti.com/acceptable-use/",
+            "https://nobleproxy.com/t/ghosteranti",
+            "https://nobleproxy.com/t/ghosteranti?src=sidebar-cart",
+            "https://nobleproxy.com/t/ghosteranti?src=proxies-no-proxy&qty=12",
+            "https://nobleproxy.com/t/ghosteranti?src=profile-dialog&lang=zh-CN",
+            "https://nobleproxy.com/t/ghosteranti?src=import-no-proxy&qty=3&lang=ru-RU",
+        ] {
+            assert!(allowed_external_url(url));
+        }
+        for url in [
+            "http://ghosteranti.com/terms/",
+            "https://cloud.ghosteranti.com/terms/",
+            "https://ghosteranti.com/terms/extra",
+            "https://ghosteranti.com/terms/?continue=https://example.com",
+            "https://example.com/terms/",
+            "http://nobleproxy.com/t/ghosteranti",
+            "https://nobleproxy.com/t/ghosteranti/",
+            "https://nobleproxy.com/t/ghosteranti?source=app",
+            "https://nobleproxy.com/t/ghosteranti?",
+            "https://nobleproxy.com/t/ghosteranti?src=",
+            "https://nobleproxy.com/t/ghosteranti?src=sidebar-cart&next=https://example.com",
+            "https://nobleproxy.com/t/ghosteranti?src=a%2Fb",
+            "https://nobleproxy.com/t/ghosteranti?src=sidebar-cart#fragment",
+            "https://nobleproxy.com/t/ghosteranti/?src=sidebar-cart",
+            "https://nobleproxy.com/t/other?src=sidebar-cart",
+            "https://nobleproxy.com/t/another-campaign",
+            "https://example.com/t/ghosteranti",
+        ] {
+            assert!(!allowed_external_url(url));
+        }
+    }
+
+    #[test]
+    fn enables_webview_debugging_only_for_acceptance() {
+        assert_eq!(windows_acceptance_browser_args(false, Some("50401")), None);
+        assert_eq!(
+            windows_acceptance_browser_args(true, None),
+            Some("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=0".to_owned()),
+        );
+        assert_eq!(
+            windows_acceptance_browser_args(true, Some("50401")),
+            Some("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=50401".to_owned()),
+        );
+    }
+
+    #[test]
+    fn removes_windows_namespace_prefix_before_cli_use() {
+        assert_eq!(
+            cli_compatible_windows_path(Path::new(r"\\?\C:\Users\GhosterAnti\playwright")),
+            PathBuf::from(r"C:\Users\GhosterAnti\playwright"),
+        );
+        assert_eq!(
+            cli_compatible_windows_path(Path::new(r"\\?\UNC\server\share\playwright")),
+            PathBuf::from(r"\\server\share\playwright"),
+        );
+    }
+
+    #[test]
+    fn parses_installed_cloakpit_import_arguments() {
+        let args = [
+            "--import-cloakpit",
+            r"C:\Cloakpit",
+            "--cloakpit-profile-root",
+            r"D:\Legacy\profiles",
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            parse_cloakpit_import_args(args).unwrap(),
+            Some(CloakpitImportRequest {
+                source: Some(PathBuf::from(r"C:\Cloakpit")),
+                profile_root: Some(PathBuf::from(r"D:\Legacy\profiles")),
+            }),
+        );
+        assert_eq!(
+            parse_cloakpit_import_args([OsString::from("--import-cloakpit")]).unwrap(),
+            Some(CloakpitImportRequest {
+                source: None,
+                profile_root: None
+            }),
+        );
+        assert!(parse_cloakpit_import_args(
+            ["--import-cloakpit", "one", "two"].map(OsString::from)
+        )
+        .is_err());
+        assert_eq!(
+            parse_cloakpit_import_args(Vec::<OsString>::new()).unwrap(),
+            None
+        );
+    }
+}
+
+pub fn run() {
+    // WebKitGTK's DMA-BUF renderer shows an empty window with several graphics drivers
+    // (NVIDIA in particular). The dashboard needs no GPU path.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+    let background = background_requested(std::env::args_os());
+    let update_relaunch = update_attempt::parse_relaunch_argument(std::env::args_os().skip(1));
+    let import_request = parse_cloakpit_import_args(std::env::args_os().skip(1));
+    let app = tauri::Builder::default()
+        .manage(RevealRequested::default())
+        .manage(releases::UpdateCoordinator::default())
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if background_requested(argv) {
+                return;
+            }
+            app.state::<RevealRequested>()
+                .0
+                .store(true, Ordering::Release);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![
+            credential_get,
+            credential_set,
+            credential_delete,
+            runtime_descriptor::agent_runtime_ready,
+            runtime_descriptor::script_capability,
+            shutdown::restart_after_mode_change,
+            releases::check_for_updates,
+            releases::last_update_result,
+            releases::update_now,
+        ])
+        .setup(move |app| {
+            let data_dir = app.path().app_data_dir()?;
+            match import_request {
+                Err(error) => {
+                    present_import_result(
+                        app.handle(),
+                        false,
+                        &format!("{error}. {IMPORT_RESTRICTION}"),
+                    );
+                    app.handle().exit(1);
+                    return Ok(());
+                }
+                Ok(Some(request)) => {
+                    let result = tauri::async_runtime::block_on(sidecar::run_import(
+                        app.handle(),
+                        &data_dir,
+                        request.source.as_deref(),
+                        request.profile_root.as_deref(),
+                    ));
+                    match result {
+                        Ok(record) => {
+                            present_import_result(app.handle(), record.ok, &record.message);
+                            app.handle().exit(if record.ok { 0 } else { 1 });
+                        }
+                        Err(error) => {
+                            present_import_result(
+                                app.handle(),
+                                false,
+                                &format!("{error}. {IMPORT_RESTRICTION}"),
+                            );
+                            app.handle().exit(1);
+                        }
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {}
+            }
+            fs::create_dir_all(data_dir.join("profiles"))?;
+            fs::create_dir_all(data_dir.join("inbox"))?;
+            #[cfg(not(windows))]
+            credentials::set_secret_dir(&data_dir);
+
+            let resource_dir = app.path().resource_dir()?;
+            let mut firefox = browser::verify_firefox_resource(&resource_dir).map_err(boxed)?;
+            firefox.executable = cli_compatible_windows_path(&firefox.executable);
+            let playwright_runtime = cli_compatible_windows_path(
+                &resource_dir
+                    .join("playwright")
+                    .canonicalize()
+                    .map_err(|error| {
+                        boxed(format!(
+                            "packaged Playwright runtime is unavailable: {error}"
+                        ))
+                    })?,
+            );
+            let playwright_manifest = playwright_runtime
+                .join("node_modules")
+                .join("playwright-core")
+                .join("package.json");
+            let node_executable = playwright_runtime.join("node").join(if cfg!(windows) {
+                "node.exe"
+            } else {
+                "node"
+            });
+            let worker_script = playwright_runtime.join("worker.mjs");
+            let firefox_worker_script = playwright_runtime.join("firefox-worker.mjs");
+            let playwright_worker_script = playwright_runtime.join("playwright-worker.mjs");
+            let agent_root = playwright_runtime.join("agent");
+            if !playwright_manifest.is_file()
+                || !node_executable.is_file()
+                || !worker_script.is_file()
+                || !firefox_worker_script.is_file()
+                || !playwright_worker_script.is_file()
+                || !agent_root.join("mcp-host.mjs").is_file()
+                || !agent_root.join("playwright-proxy.mjs").is_file()
+                || !agent_root.join("playwright-runner.mjs").is_file()
+                || !agent_root.join("runtime-client.mjs").is_file()
+            {
+                return Err(boxed("packaged Playwright and MCP runtime is incomplete"));
+            }
+            for (package, expected) in [
+                ("playwright-core", "1.58.2"),
+                ("@modelcontextprotocol/sdk", "1.30.0"),
+                ("@playwright/mcp", "0.0.56"),
+                ("playwright", "1.58.0-alpha-2026-01-16"),
+            ] {
+                if packaged_node_package_version(&playwright_runtime, package)? != expected {
+                    return Err(boxed(format!(
+                        "packaged agent dependency version mismatch: {package}"
+                    )));
+                }
+            }
+            if !cfg!(dev) {
+                let helper = std::env::current_exe()?
+                    .parent()
+                    .ok_or_else(|| boxed("GhosterAnti installation directory is unavailable"))?
+                    .join(if cfg!(windows) {
+                        "ghosteranti-mcp.exe"
+                    } else {
+                        "ghosteranti-mcp"
+                    });
+                if !helper.is_file() {
+                    return Err(boxed("installed GhosterAnti agent helper is unavailable"));
+                }
+            }
+            let nonce = hex::encode(random::<[u8; 32]>());
+            let agent_nonce = hex::encode(random::<[u8; 32]>());
+            let handle = app.handle().clone();
+            let (sidecar, port) = tauri::async_runtime::block_on(sidecar::launch_and_verify(
+                &handle,
+                &data_dir,
+                &firefox,
+                &playwright_runtime,
+                &nonce,
+                &agent_nonce,
+                background,
+            ))
+            .map_err(boxed)?;
+            let cleanup_sidecar = sidecar.clone();
+            let mut startup_cleanup = StartupCleanup::new(move || {
+                let _ = cleanup_sidecar.kill_owned();
+            });
+
+            let runtime_descriptor = runtime_descriptor::RuntimeDescriptorState::new(
+                &data_dir,
+                nonce,
+                agent_nonce,
+                port,
+                sidecar.pid(),
+            )
+            .map_err(boxed)?;
+            app.manage(runtime_descriptor);
+
+            let origin = format!("http://127.0.0.1:{port}");
+            app.manage(CredentialOrigin(origin.clone()));
+            app.manage(sidecar.clone());
+            if let Err(error) = app.add_capability(
+                CapabilityBuilder::new(format!("loopback-{port}"))
+                    .local(false)
+                    .window("main")
+                    .remote(format!("{origin}/*"))
+                    .permission("allow-credential-bridge")
+                    .permission("allow-runtime-ready")
+                    .permission("allow-script-capability")
+                    .permission("allow-update-bridge"),
+            ) {
+                return Err(error.into());
+            }
+
+            let allowed_port = port;
+            let shell_handle = handle.clone();
+            let navigation_shell_handle = handle.clone();
+            let url = format!("{origin}/")
+                .parse()
+                .map_err(|error| boxed(format!("invalid sidecar URL: {error}")))?;
+            let readiness_data_dir = data_dir.clone();
+            let webview_builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
+                .title("GhosterAnti")
+                .visible(!background)
+                .inner_size(1280.0, 800.0)
+                .min_inner_size(960.0, 640.0)
+                .on_page_load(move |window, payload| {
+                    if !matches!(payload.event(), PageLoadEvent::Finished) {
+                        return;
+                    }
+                    let reveal_requested = window
+                        .app_handle()
+                        .state::<RevealRequested>()
+                        .0
+                        .load(Ordering::Acquire);
+                    if background
+                        && !reveal_requested
+                        && (window.hide().is_err() || window.is_visible().unwrap_or(true))
+                    {
+                        window.app_handle().exit(1);
+                        return;
+                    }
+                    let runtime = window
+                        .app_handle()
+                        .state::<runtime_descriptor::RuntimeDescriptorState>();
+                    runtime.activate();
+                    if configured_local_mode(&readiness_data_dir)
+                        && runtime.publish("local").is_err()
+                    {
+                        window.app_handle().exit(1);
+                    }
+                });
+            #[cfg(windows)]
+            let webview_builder = if let Some(args) = windows_acceptance_browser_args(
+                matches!(
+                    std::env::var("GHOSTERANTI_ACCEPTANCE_WEBVIEW_DEBUG").as_deref(),
+                    Ok("1")
+                ),
+                std::env::var("GHOSTERANTI_ACCEPTANCE_WEBVIEW_DEBUG_PORT")
+                    .ok()
+                    .as_deref(),
+            ) {
+                webview_builder.additional_browser_args(&args)
+            } else {
+                webview_builder
+            };
+            let window = match webview_builder
+                .on_navigation(move |url| {
+                    // WKWebView asks this rule before it asks for a new window, and a refusal
+                    // here ends the click. So on macOS the allowed outside links open from here.
+                    if cfg!(target_os = "macos") && allowed_external_url(url.as_str()) {
+                        open_external_url(&navigation_shell_handle, url.as_str());
+                        return false;
+                    }
+                    (url.scheme() == "http"
+                        && url.host_str() == Some("127.0.0.1")
+                        && url.port() == Some(allowed_port))
+                        || ((url.scheme() == "https" || url.scheme() == "http")
+                            && url.host_str() == Some("tauri.localhost"))
+                        || (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
+                })
+                .on_new_window(move |url, _| {
+                    if allowed_external_url(url.as_str()) {
+                        open_external_url(&shell_handle, url.as_str());
+                    }
+                    NewWindowResponse::Deny
+                })
+                .build()
+            {
+                Ok(window) => window,
+                Err(error) => return Err(error.into()),
+            };
+
+            shutdown::install_close_handler(app.handle().clone(), window.clone(), sidecar, origin);
+            if app.state::<RevealRequested>().0.load(Ordering::Acquire) {
+                let _ = window.show();
+                let _ = window.set_focus();
+            } else if background {
+                window.hide()?;
+            }
+            if let Err(error) = update_attempt::reconcile_after_startup(&data_dir, &update_relaunch)
+            {
+                eprintln!("GhosterAnti could not reconcile the previous update result: {error}");
+            }
+            startup_cleanup.disarm();
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("GhosterAnti desktop failed");
+
+    let requested_exit_code = Arc::new(AtomicI32::new(0));
+    let exit_code = Arc::clone(&requested_exit_code);
+    app.run_return(move |app, event| match event {
+        tauri::RunEvent::ExitRequested {
+            code: Some(code), ..
+        } => exit_code.store(code, Ordering::Release),
+        tauri::RunEvent::Exit => {
+            if let Some(runtime) = app.try_state::<runtime_descriptor::RuntimeDescriptorState>() {
+                let _ = runtime.remove_owned();
+            }
+            if let Some(sidecar) = app.try_state::<sidecar::SidecarSupervisor>() {
+                // Cmd+Q, the Dock's Quit and a Linux desktop session end the app without
+                // a close request, so save sessions and close browsers here before the
+                // sidecar stops.
+                #[cfg(not(windows))]
+                let _ = tauri::async_runtime::block_on(shutdown::graceful_sidecar_cleanup(
+                    sidecar.inner(),
+                ));
+                let _ = sidecar.kill_owned();
+            }
+        }
+        _ => {}
+    });
+
+    let exit_code = requested_exit_code.load(Ordering::Acquire);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}

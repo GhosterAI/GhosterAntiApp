@@ -1,0 +1,116 @@
+name: Linux release assets
+
+# Adds the Linux build to a GitHub Release that the Windows pipeline already published.
+# The Windows and macOS assets and their update feeds are never changed.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag, for example v0.1.0-beta.63
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/linux-desktop.yml
+    with:
+      ref: ${{ inputs.tag }}
+
+  publish:
+    name: Publish Linux assets
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The update signing key lives in this environment, which is limited to main.
+    environment: windows-release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-linux-x64
+          path: assets
+      - name: Verify the release and the built files
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" == "v$VERSION" ]] || { echo "tag $TAG does not match built version $VERSION"; exit 1; }
+          gh release view "$TAG" --json isDraft,assets > release.json
+          jq -e '.isDraft == false' release.json
+          # A published asset is never replaced.
+          jq -e '[.assets[].name | select(test("linux"))] | length == 0' release.json
+          cd assets
+          ls -la
+          test "$(ls | sort | tr '\n' ' ')" = "GhosterAnti_${VERSION}_x86_64-linux.tar.gz SHA256SUMS-linux.txt "
+          sha256sum --check --strict SHA256SUMS-linux.txt
+      - name: Sign the update archive and write the Linux update feed
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          archive="assets/GhosterAnti_${VERSION}_x86_64-linux.tar.gz"
+          bunx tauri signer sign "$archive" > /dev/null
+          unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          pubkey="$(jq -er .plugins.updater.pubkey src-tauri/tauri.conf.json)"
+          check=(cargo run --quiet --locked --manifest-path scripts/updater-signature-check/Cargo.toml --)
+          "${check[@]}" "$archive" "$archive.sig" "$pubkey"
+          # A changed archive must fail the same check.
+          cp "$archive" corrupt.tar.gz
+          printf 'x' | dd of=corrupt.tar.gz bs=1 seek=4096 conv=notrunc status=none
+          if "${check[@]}" corrupt.tar.gz "$archive.sig" "$pubkey"; then
+            echo "a changed archive passed the signature check"
+            exit 1
+          fi
+          rm corrupt.tar.gz
+          jq -n --arg version "$VERSION" --arg signature "$(cat "$archive.sig")" \
+            --arg url "https://github.com/$GH_REPO/releases/download/$TAG/GhosterAnti_${VERSION}_x86_64-linux.tar.gz" \
+            '{version: $version, platforms: {"linux-x86_64": {url: $url, signature: $signature}}}' > assets/latest-linux.json
+      - name: Upload the Linux assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            "assets/GhosterAnti_${VERSION}_x86_64-linux.tar.gz" \
+            "assets/GhosterAnti_${VERSION}_x86_64-linux.tar.gz.sig" \
+            "assets/SHA256SUMS-linux.txt"
+          # The feed goes last: an installed app must never read it before the archive exists.
+          gh release upload "$TAG" "assets/latest-linux.json"
+      - name: Verify the public downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir public
+          cd public
+          for name in "GhosterAnti_${VERSION}_x86_64-linux.tar.gz" SHA256SUMS-linux.txt; do
+            curl --fail --silent --show-error --location --retry 3 -o "$name" "https://github.com/$GH_REPO/releases/download/$TAG/$name"
+          done
+          cmp SHA256SUMS-linux.txt ../assets/SHA256SUMS-linux.txt
+          sha256sum --check --strict SHA256SUMS-linux.txt
+          for name in "GhosterAnti_${VERSION}_x86_64-linux.tar.gz.sig" latest-linux.json; do
+            curl --fail --silent --show-error --location --retry 3 "https://github.com/$GH_REPO/releases/download/$TAG/$name" | cmp - "../assets/$name"
+          done

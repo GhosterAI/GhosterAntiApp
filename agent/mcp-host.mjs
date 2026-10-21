@@ -1,0 +1,510 @@
+import { dirname, join } from "node:path";
+import process from "node:process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { discoverRuntime } from "./runtime-client.mjs";
+import { PlaywrightToolProxy } from "./playwright-proxy.mjs";
+
+const VERSION = process.env.GHOSTERANTI_APP_VERSION || "0.1.0-beta.32";
+const EMPTY_SCHEMA = { type: "object", properties: {}, additionalProperties: false };
+const FIREFOX_FILTERED_TOOLS = new Set(["browser_close", "browser_install", "browser_pdf_save"]);
+
+function firefoxTools(tools) {
+  return tools.filter((tool) => !FIREFOX_FILTERED_TOOLS.has(tool.name) && !/pdf/i.test(tool.name));
+}
+
+function safeBrowserResult(value) {
+  if (value?.engine !== "firefox") return value;
+  const {
+    profileId, running, state, engine, capabilities, headless, alreadyOpen,
+    ownedByConnection, attachedExisting, selected, closed, sync, deleted, detached,
+  } = value;
+  return {
+    ...(profileId !== undefined ? { profileId } : {}),
+    ...(running !== undefined ? { running } : {}),
+    ...(state !== undefined ? { state } : {}),
+    engine,
+    ...(capabilities !== undefined ? { capabilities } : {}),
+    ...(headless !== undefined ? { headless } : {}),
+    ...(alreadyOpen !== undefined ? { alreadyOpen } : {}),
+    ...(ownedByConnection !== undefined ? { ownedByConnection } : {}),
+    ...(attachedExisting !== undefined ? { attachedExisting } : {}),
+    ...(selected !== undefined ? { selected } : {}),
+    ...(closed !== undefined ? { closed } : {}),
+    ...(sync !== undefined ? { sync } : {}),
+    ...(deleted !== undefined ? { deleted } : {}),
+    ...(detached !== undefined ? { detached } : {}),
+  };
+}
+const PROFILE_ID = { type: "string", minLength: 1 };
+const PROXY_REPLACEMENT_ROW = {
+  type: "object",
+  properties: {
+    profileId: PROFILE_ID,
+    username: { type: "string", minLength: 1, maxLength: 255 },
+    expectedVersion: { type: "integer", minimum: 1 },
+    proxy: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: ["http", "https", "socks5"] },
+        host: { type: "string" },
+        port: { type: "string" },
+        user: { type: "string" },
+        pass: { type: "string" },
+      },
+      required: ["type", "host", "port", "user", "pass"],
+      additionalProperties: false,
+    },
+  },
+  required: ["proxy"],
+  oneOf: [
+    { required: ["profileId"], not: { required: ["username"] } },
+    { required: ["username"], not: { required: ["profileId"] } },
+  ],
+  additionalProperties: false,
+};
+
+function diagnose(message) {
+  if (process.env.GHOSTERANTI_MCP_DIAGNOSTICS === "1") {
+    process.stderr.write(`[ghosteranti-mcp-host] ${message}\n`);
+  }
+}
+
+function toolAnnotations(title, { readOnly = false, destructive = false, openWorld = false } = {}) {
+  return {
+    title,
+    readOnlyHint: readOnly,
+    destructiveHint: destructive,
+    openWorldHint: openWorld,
+  };
+}
+
+const ALIAS_TOOLS = [
+  {
+    name: "ghosteranti_profiles_list",
+    description: "List GhosterAnti profiles and their current browser state. Cloud profiles include expectedVersion and permission for editing.",
+    annotations: toolAnnotations("List GhosterAnti profiles"),
+    inputSchema: EMPTY_SCHEMA,
+  },
+  {
+    name: "ghosteranti_profiles_replace_proxies",
+    description: "Dry-run or apply bulk proxy replacements to closed GhosterAnti Cloud profiles. Apply always preflights first.",
+    annotations: toolAnnotations("Replace GhosterAnti profile proxies", { destructive: true }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        dryRun: { type: "boolean", default: true },
+        replacements: {
+          type: "array",
+          minItems: 1,
+          items: PROXY_REPLACEMENT_ROW,
+        },
+        csv: { type: "string", minLength: 1 },
+      },
+      oneOf: [
+        { required: ["replacements"], not: { required: ["csv"] } },
+        { required: ["csv"], not: { required: ["replacements"] } },
+      ],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ghosteranti_profile_create",
+    description: "Create a persistent GhosterAnti profile, or an explicit temporary profile. Without engine, Windows creates an GhosterAnti Chromium profile, and macOS and Linux create an GhosterAnti Firefox profile.",
+    annotations: toolAnnotations("Create an GhosterAnti profile"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        group: { type: "string" },
+        platform: { type: "string" },
+        engine: { type: "string", enum: ["chromium", "firefox"] },
+        chromiumRuntime: {
+          type: "string",
+          enum: ["ghosteranti", "cloakbrowser"],
+          description: "Chromium profiles only. ghosteranti (Chromium 155) is the default where this computer can run it. CloakBrowser profiles on one computer can be linked to each other.",
+        },
+        screen: { type: "string" },
+        proxy: {
+          anyOf: [
+            { type: "null" },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", enum: ["http", "https", "socks5"] },
+                host: { type: "string" },
+                port: { type: "string" },
+                user: { type: "string" },
+                pass: { type: "string" },
+              },
+              additionalProperties: false,
+            },
+          ],
+        },
+        temporary: { type: "boolean", default: false },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ghosteranti_profile_update",
+    description: "Edit a closed GhosterAnti Cloud profile by ID using expectedVersion from ghosteranti_profiles_list. Only supplied fields change; empty strings clear fields. Sessions and cookies are preserved. Returns confirmation, not credentials.",
+    annotations: toolAnnotations("Edit an GhosterAnti Cloud profile", { destructive: true }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        profileId: PROFILE_ID,
+        expectedVersion: { type: "integer", minimum: 0 },
+        set: {
+          type: "object",
+          properties: {
+            name: { type: "string" },
+            group: { type: "string" },
+            platform: { type: "string" },
+            username: { type: "string" },
+            password: { type: "string" },
+            email: { type: "string" },
+            emailPassword: { type: "string" },
+            twofa: { type: "string" },
+            proxy: { type: "string", description: "host:port:user:pass, or an empty string to remove the proxy" },
+            proxyType: { type: "string" },
+            resolution: { type: "string", description: "WIDTH*HEIGHT" },
+            extensions: { type: "array", items: { type: "string" } },
+            tags: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+          },
+          minProperties: 1,
+          additionalProperties: false,
+        },
+      },
+      required: ["profileId", "expectedVersion", "set"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ghosteranti_profile_delete",
+    description: "Delete a closed GhosterAnti profile.",
+    annotations: toolAnnotations("Delete an GhosterAnti profile", { destructive: true }),
+    inputSchema: {
+      type: "object",
+      properties: { profileId: PROFILE_ID },
+      required: ["profileId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ghosteranti_browser_open",
+    description: "Open an GhosterAnti browser and select it for Playwright actions.",
+    annotations: toolAnnotations("Open an GhosterAnti browser", { destructive: true, openWorld: true }),
+    inputSchema: {
+      type: "object",
+      properties: {
+        profileId: PROFILE_ID,
+        headless: { type: "boolean", default: false },
+        startupUrls: {
+          type: "array",
+          items: { type: "string", pattern: "^https?://" },
+        },
+        select: { type: "boolean", default: true },
+      },
+      required: ["profileId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ghosteranti_browser_select",
+    description: "Select an open GhosterAnti browser for subsequent Playwright actions.",
+    annotations: toolAnnotations("Select an GhosterAnti browser", { destructive: true }),
+    inputSchema: {
+      type: "object",
+      properties: { profileId: PROFILE_ID },
+      required: ["profileId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ghosteranti_browser_status",
+    description: "Get the selected browser state, or the state of one profile.",
+    annotations: toolAnnotations("Get GhosterAnti browser status", { destructive: true }),
+    inputSchema: {
+      type: "object",
+      properties: { profileId: PROFILE_ID },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ghosteranti_browser_close",
+    description: "Safely capture and close one GhosterAnti browser.",
+    annotations: toolAnnotations("Close an GhosterAnti browser", { destructive: true }),
+    inputSchema: {
+      type: "object",
+      properties: { profileId: PROFILE_ID },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_close",
+    description: "Safely capture and close the selected GhosterAnti browser.",
+    annotations: toolAnnotations("Close the selected GhosterAnti browser", { destructive: true }),
+    inputSchema: EMPTY_SCHEMA,
+  },
+];
+
+function toolResult(value) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(value) }],
+    structuredContent: value,
+  };
+}
+
+function safeError(error) {
+  const message = error instanceof Error ? error.message : "GhosterAnti operation failed";
+  return message.replace(/wss?:\/\/\S+/gi, "CDP endpoint").slice(0, 500);
+}
+
+function errorResult(error) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: safeError(error) }],
+  };
+}
+
+function profileInput(args) {
+  const { temporary = false, ...input } = args;
+  return { input, temporary };
+}
+
+export async function createGhosterAntiMcp(options = {}) {
+  const playwright = options.playwright ?? new PlaywrightToolProxy(VERSION);
+  await playwright.initialize();
+  const discovered = options.discovered ?? await discoverRuntime(options.runtime);
+  const runtime = discovered.client;
+  const server = new Server(
+    { name: "ghosteranti", version: VERSION },
+    { capabilities: { tools: {} } },
+  );
+  let selectedProfileId;
+  let selectedEngine;
+  let selectedFirefoxTools = [];
+  const ownedProfileIds = new Set();
+  let closing;
+
+  const selectedTools = () => selectedEngine === "firefox" ? selectedFirefoxTools : playwright.listTools();
+
+  const selectBrowser = async (profileId, knownStatus) => {
+    const status = knownStatus ?? await runtime.call("browser.status", { profileId });
+    if (!status.running) throw new Error("open this GhosterAnti profile before selecting it");
+    const wasChromium = selectedEngine === "chromium";
+    selectedProfileId = undefined;
+    selectedEngine = undefined;
+    selectedFirefoxTools = [];
+    if (wasChromium) await playwright.detach();
+    if (status.engine === "firefox") {
+      const result = await runtime.call("firefox.tools.list", { profileId });
+      selectedFirefoxTools = firefoxTools(result.tools ?? []);
+      selectedProfileId = profileId;
+      selectedEngine = "firefox";
+      return safeBrowserResult({ ...status, selected: true });
+    }
+    if (!status.ws) throw new Error("open this GhosterAnti profile before selecting it");
+    await playwright.attach(status.ws);
+    selectedProfileId = profileId;
+    selectedEngine = "chromium";
+    return {
+      profileId,
+      selected: true,
+      running: true,
+      port: status.port,
+      headless: status.headless,
+    };
+  };
+
+  const closeBrowser = async (profileId) => {
+    const target = profileId || selectedProfileId;
+    if (!target) throw new Error("select an open GhosterAnti browser first");
+    const selected = target === selectedProfileId;
+    const engine = selectedEngine;
+    if (selected) await playwright.detach();
+    try {
+      const result = await runtime.call("browser.close", { profileId: target });
+      ownedProfileIds.delete(target);
+      if (selected) {
+        selectedProfileId = undefined;
+        selectedEngine = undefined;
+        selectedFirefoxTools = [];
+      }
+      return safeBrowserResult(result);
+    } catch (error) {
+      if (selected) {
+        const status = await runtime.call("browser.status", { profileId: target }).catch(() => undefined);
+        if (status?.running) {
+          if (engine === "firefox") await selectBrowser(target, status).catch(() => {});
+          else if (status.ws) await playwright.attach(status.ws).catch(() => {});
+        }
+      }
+      throw error;
+    }
+  };
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [...ALIAS_TOOLS, ...selectedTools()],
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const name = request.params.name;
+    const args = request.params.arguments ?? {};
+    try {
+      if (name === "ghosteranti_profiles_list") {
+        return toolResult(await runtime.call("profiles.list"));
+      }
+      if (name === "ghosteranti_profiles_replace_proxies") {
+        return toolResult(await runtime.call("profiles.replaceProxies", args));
+      }
+      if (name === "ghosteranti_profile_create") {
+        return toolResult(await runtime.call("profiles.create", profileInput(args)));
+      }
+      if (name === "ghosteranti_profile_update") {
+        return toolResult(await runtime.call("profiles.update", args));
+      }
+      if (name === "ghosteranti_profile_delete") {
+        return toolResult(await runtime.call("profiles.delete", { profileId: args.profileId }));
+      }
+      if (name === "ghosteranti_browser_open") {
+        const opened = await runtime.call("browser.open", {
+          profileId: args.profileId,
+          ...(args.headless !== undefined ? { headless: args.headless } : {}),
+          ...(args.startupUrls ? { startupUrls: args.startupUrls } : {}),
+        });
+        if (opened.ownedByConnection) ownedProfileIds.add(args.profileId);
+        if (args.select !== false) {
+          try {
+            await selectBrowser(args.profileId, {
+              running: true,
+              ...(opened.engine === "firefox"
+                ? { engine: "firefox", capabilities: opened.capabilities, headless: opened.headless }
+                : { ws: opened.ws, port: opened.port, headless: opened.headless }),
+            });
+          } catch (error) {
+            if (opened.ownedByConnection) {
+              const closed = await runtime.call("browser.close", { profileId: args.profileId })
+                .then(() => true, () => false);
+              if (closed) ownedProfileIds.delete(args.profileId);
+            }
+            throw error;
+          }
+        }
+        return toolResult(safeBrowserResult({
+          profileId: opened.profileId,
+          ...(opened.engine === "firefox"
+            ? { engine: "firefox", capabilities: opened.capabilities }
+            : { port: opened.port }),
+          headless: opened.headless,
+          alreadyOpen: opened.alreadyOpen,
+          selected: args.select !== false,
+        }));
+      }
+      if (name === "ghosteranti_browser_select") {
+        return toolResult(await selectBrowser(args.profileId));
+      }
+      if (name === "ghosteranti_browser_status") {
+        const profileId = args.profileId || selectedProfileId;
+        if (!profileId) throw new Error("select an open GhosterAnti browser first");
+        const status = await runtime.call("browser.status", { profileId });
+        const { ws: _ws, firefoxOwner: _firefoxOwner, ...safeStatus } = safeBrowserResult(status);
+        return toolResult({ ...safeStatus, selected: profileId === selectedProfileId });
+      }
+      if (name === "ghosteranti_browser_close" || name === "browser_close") {
+        return toolResult(await closeBrowser(args.profileId));
+      }
+      if (!selectedProfileId) throw new Error("select an open GhosterAnti browser first");
+      if (!selectedTools().some((tool) => tool.name === name)) {
+        throw new Error(`unknown GhosterAnti tool: ${name}`);
+      }
+      if (selectedEngine === "firefox") {
+        return await runtime.call("firefox.tools.call", {
+          profileId: selectedProfileId,
+          name,
+          arguments: args,
+        });
+      }
+      return await playwright.callTool(name, args);
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  const close = async () => {
+    if (closing) return closing;
+    closing = (async () => {
+      diagnose("close started");
+      await playwright.detach();
+      diagnose("playwright detached");
+      for (const profileId of [...ownedProfileIds]) {
+        diagnose("owned browser close started");
+        const closed = await runtime.call("browser.close", { profileId })
+          .then(() => true, () => false);
+        diagnose(`owned browser close finished closed=${closed}`);
+        if (closed) ownedProfileIds.delete(profileId);
+      }
+      runtime.close();
+      diagnose("runtime closed");
+    })();
+    return closing;
+  };
+  server.onclose = () => { void close(); };
+  return { server, close };
+}
+
+export function sanitizeEnvironment(env = process.env) {
+  const allowed = new Set([
+    "APPDATA", "HOME", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH",
+    "GHOSTERANTI_APP_VERSION", "GHOSTERANTI_DESKTOP_EXE", "GHOSTERANTI_MCP_DIAGNOSTICS",
+    "GHOSTERANTI_RUNTIME_DESCRIPTOR",
+    "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE",
+    // Linux: the app that the host may start needs the desktop session, and the data folder.
+    "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
+  ]);
+  for (const key of Object.keys(env)) {
+    if (!allowed.has(key.toUpperCase())) delete env[key];
+  }
+}
+
+async function main() {
+  sanitizeEnvironment();
+  const desktopExecutable = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    // macOS: Contents/Resources -> Contents/MacOS; Linux: lib/<app> -> bin.
+    ...(process.platform === "darwin" ? ["..", "MacOS", "ghosteranti"]
+      : process.platform === "linux" ? ["..", "..", "bin", "ghosteranti"] : ["GhosterAnti.exe"]),
+  );
+  const host = await createGhosterAntiMcp({ runtime: { desktopExecutable } });
+  let shuttingDown = false;
+  const shutdown = (event = "signal") => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    diagnose(`shutdown requested event=${event}`);
+    void host.close().finally(() => {
+      diagnose("shutdown complete");
+      process.exit(0);
+    });
+  };
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.stdin.once("end", () => shutdown("stdin-end"));
+  process.stdin.once("close", () => shutdown("stdin-close"));
+  await host.server.connect(new StdioServerTransport());
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(`GhosterAnti MCP could not start: ${safeError(error)}`);
+    console.error("Run GhosterAnti setup again or open the app once.");
+    process.exit(1);
+  });
+}

@@ -1,0 +1,719 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { createReadStream } from "node:fs";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer, request as httpRequest } from "node:http";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
+import { buildNewProfile } from "../create.ts";
+import { Launcher } from "../launcher.ts";
+import { completeProfileFingerprint, createFirefoxProfileConfig, syncFirefoxTimezone } from "../firefox-config.ts";
+import { callFirefoxOwner, closeFirefoxOwner, FirefoxOwnerError, reserveFirefoxOwner, startFirefoxOwner } from "../firefox-runtime.ts";
+import { decodePortableProfile, encodePortableProfile } from "../portable-profile.ts";
+import { resolvePlaywrightRuntime } from "../playwright-runtime.ts";
+import { PythonRuntime } from "../python-runtime.ts";
+import { applySourceRuntime, type SourceRuntime } from "../source-runtime.ts";
+import { applySessionToEndpoint, readSessionInSubprocess } from "../session.ts";
+import { ProfileStore } from "../store.ts";
+import type { Profile } from "../types.ts";
+
+const [binaryArg, rootArg, expectedSha256, sourceRuntimeArg] = process.argv.slice(2);
+if (!binaryArg || !rootArg || !/^[a-f0-9]{64}$/.test(expectedSha256 ?? "")
+  || (sourceRuntimeArg !== undefined && !sourceRuntimeArg)) {
+  throw new Error("usage: bun scripts/firefox-launcher-acceptance.ts <aliasmode.exe> <new-directory> <sha256> [source-runtime-root]");
+}
+
+const binary = resolve(binaryArg);
+const root = resolve(rootArg);
+const sourceRuntimeRoot = sourceRuntimeArg ? resolve(sourceRuntimeArg) : undefined;
+const run = promisify(execFile);
+const localDataRoot = join(root, "local-data");
+const cloudDataRoot = join(root, "cloud-data");
+await mkdir(root, { recursive: false });
+const localStore = new ProfileStore(join(root, "local.sqlite"));
+const cloudStore = new ProfileStore(join(root, "cloud.sqlite"));
+let server: ReturnType<typeof createServer> | undefined;
+let proxyServer: ReturnType<typeof createServer> | undefined;
+let localLauncher: Launcher | undefined;
+let cloudLauncher: Launcher | undefined;
+let concurrentLauncher: Launcher | undefined;
+let foreignOwner: ReturnType<typeof Bun.spawn> | undefined;
+const concurrentFirefoxId = "firefoxconcurrent";
+const concurrentFirefoxPeerId = "firefoxconcurrentpeer";
+let concurrentChromiumId: string | undefined;
+const nativeCloseId = "firefoxnativeclose";
+const lastTabCloseId = "firefoxlasttabclose";
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+async function closeNativeFirefoxWindow(browserPid: number): Promise<void> {
+  assert.equal(process.platform, "darwin", "native window close acceptance runs on macOS");
+  const script = `tell application "System Events"
+  set browserProcesses to every application process whose unix id is ${browserPid}
+  if (count of browserProcesses) is not 1 then error "exact browser process is unavailable"
+  tell item 1 of browserProcesses
+    set frontmost to true
+    delay 0.2
+    set browserWindows to every window
+    if (count of browserWindows) is not 1 then error "exact browser window is unavailable"
+    tell item 1 of browserWindows
+      set closeButtons to every button whose subrole is "AXCloseButton"
+      if (count of closeButtons) is not 1 then error "exact browser close button is unavailable"
+      perform action "AXPress" of item 1 of closeButtons
+    end tell
+  end tell
+end tell`;
+  await run("osascript", ["-e", script]);
+}
+
+async function nativeFirefoxKeys(browserPid: number, commands: string): Promise<void> {
+  await run("osascript", ["-e", `tell application "System Events"
+    set browserProcesses to every application process whose unix id is ${browserPid}
+    if (count of browserProcesses) is not 1 then error "exact browser process is unavailable"
+    tell item 1 of browserProcesses
+      set frontmost to true
+      ${commands}
+    end tell
+  end tell`]);
+}
+
+async function waitForNativeFirefoxClose(profileId: string): Promise<void> {
+  const launch = localStore.getLaunch(profileId);
+  assert.ok(launch?.firefoxOwner, "native AXClose profile has a Firefox owner");
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const status = await callFirefoxOwner<{ pageTargets?: unknown }>(launch.firefoxOwner!, "status", {}, { timeoutMs: 800 });
+      if (!Array.isArray(status.pageTargets)) throw new Error("native AXClose owner status has invalid page targets");
+      if (status.pageTargets.length === 0) return;
+    } catch (error) {
+      if (error instanceof FirefoxOwnerError && error.code === "runtime_unavailable") return;
+      throw error;
+    }
+    await Bun.sleep(100);
+  }
+  throw new Error("native AXClose did not close the Firefox window");
+}
+
+async function stopForCleanup(launcher: Launcher | undefined, store: ProfileStore, profileId: string): Promise<boolean> {
+  if (!launcher) return store.getLaunch(profileId) === null;
+  const stopped = await launcher.stop(profileId).catch(() => false);
+  return stopped && store.getLaunch(profileId) === null;
+}
+
+async function ownerScript(
+  launcher: Launcher,
+  profileId: string,
+  scriptPath: string,
+  input: Record<string, unknown>,
+  language: "javascript" | "python" = "javascript",
+): Promise<{ result: unknown; logs: string[] }> {
+  const store = launcher === localLauncher ? localStore : launcher === cloudLauncher ? cloudStore : undefined;
+  assert.ok(store, "Firefox script uses its launcher's ProfileStore");
+  const launch = store.getLaunch(profileId);
+  const profile = store.getProfile(profileId);
+  assert.equal(launch?.engine, "firefox", "Firefox launch is stored as Firefox");
+  assert.ok(launch?.firefoxOwner, "Firefox launch has a Node owner");
+  assert.ok(profile, "Firefox script has a saved profile");
+  const bridge = await callFirefoxOwner<{ endpoint?: unknown }>(launch.firefoxOwner!, "playwright-endpoint", {});
+  assert.equal(typeof bridge.endpoint, "string", "Firefox owner supplies a private Playwright endpoint");
+  const runtime = resolvePlaywrightRuntime();
+  const sourceRoot = resolve(import.meta.dir, "..");
+  // The packaged runtime has no Python: download the pinned runtime the desktop app uses.
+  const executable = language === "python"
+    ? runtime.kind === "packaged" ? await new PythonRuntime(join(root, "runtimes")).ensure() : process.env.PYTHON ?? (process.platform === "win32" ? "python" : "python3")
+    : runtime.nodeExecutable;
+  const runner = runtime.kind === "packaged"
+    ? join(runtime.root, "agent", language === "python" ? "script-runner.py" : "script-runner.mjs")
+    : join(sourceRoot, "agent", language === "python" ? "script-runner.py" : "script-runner.mjs");
+  const resultPath = join(root, `external-result-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+  const child = Bun.spawn([executable, ...(language === "python" ? ["-u", "-X", "utf8"] : []), runner, scriptPath], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  child.stdin.write(`${JSON.stringify({
+    endpoint: bridge.endpoint,
+    engine: "firefox",
+    profile: { id: profile.id, name: profile.name, group: profile.group, platform: profile.platform ?? "" },
+    inputs: { ...input, resultPath },
+    credentials: null,
+  })}\n`);
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  if (exitCode !== 0) throw new Error(`Firefox external ${language} script runner failed: ${stderr || stdout}`);
+  const result = JSON.parse(await readFile(resultPath, "utf8"));
+  return { result, logs: `${stdout}${stderr}`.split(/\r?\n/).filter(Boolean) };
+}
+
+function profile(id: string, config: ReturnType<typeof createFirefoxProfileConfig>): Profile {
+  return {
+    id,
+    engine: "firefox",
+    firefox: config,
+    accId: "launcher-acceptance",
+    name: "Firefox launcher acceptance",
+    group: "acceptance",
+    platform: "",
+    username: "",
+    password: "",
+    email: "",
+    emailPassword: "",
+    twofa: "",
+    proxy: null,
+    extensions: [],
+    tags: [],
+    ua: "",
+    timezone: "",
+    screenWidth: 1440,
+    screenHeight: 900,
+    fingerprintSeed: 101,
+    platformOs: "windows",
+    cookies: [],
+    seeded: false,
+  };
+}
+
+try {
+  if (sourceRuntimeRoot) applySourceRuntime(sourceRuntimeRoot);
+  assert.equal(await sha256File(binary), expectedSha256, "CI passes the approved Firefox executable hash");
+
+  server = createServer((request, response) => {
+    if (request.url === "/headers") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ acceptLanguage: request.headers["accept-language"] }));
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(`<!doctype html><title>GhosterAnti local Firefox fixture</title><main>${request.url}</main>`);
+  });
+  await new Promise<void>((done, fail) => {
+    server!.once("error", fail);
+    server!.listen(0, "127.0.0.1", done);
+  });
+  const fixtureHost = "ghosteranti-fixture.test";
+  const fixturePort = (server.address() as { port: number }).port;
+  const origin = `http://${fixtureHost}:${fixturePort}`;
+  const proxyUser = "acceptance-user";
+  const proxyPassword = "acceptance-password";
+  const expectedProxyAuthorization = `Basic ${Buffer.from(`${proxyUser}:${proxyPassword}`).toString("base64")}`;
+  let proxyRequests = 0;
+  let proxyFixtureRequests = 0;
+  let exitIpLookups = 0;
+  let proxyFailure: string | undefined;
+  // A documentation address that the proxy reports as its exit, as ip-api.com would.
+  const exitIp = "203.0.113.7";
+  proxyServer = createServer((request, response) => {
+    if (request.headers["proxy-authorization"] !== expectedProxyAuthorization) {
+      proxyFailure = "Firefox did not authenticate through the Launcher proxy relay";
+      response.writeHead(407, { "proxy-authenticate": "Basic realm=GhosterAnti" });
+      response.end();
+      return;
+    }
+    let target: URL;
+    try { target = new URL(request.url ?? ""); }
+    catch {
+      proxyFailure = "Firefox did not send an absolute URL to the Launcher proxy relay";
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    // The Launcher asks for the proxy's exit IP through the proxy before Firefox starts.
+    if (target.hostname === "ip-api.com" && target.pathname === "/json/") {
+      exitIpLookups++;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ status: "success", timezone: "America/New_York", countryCode: "US", query: exitIp }));
+      return;
+    }
+    if (target.hostname !== fixtureHost || target.port !== String(fixturePort)) {
+      proxyFailure = "Launcher proxy relay received a request outside the synthetic fixture";
+      response.writeHead(502);
+      response.end();
+      return;
+    }
+    proxyRequests++;
+    proxyFixtureRequests++;
+    const headers = { ...request.headers, host: target.host };
+    delete headers["proxy-authorization"];
+    const upstream = httpRequest({
+      hostname: "127.0.0.1", port: fixturePort, path: `${target.pathname}${target.search}`,
+      method: request.method, headers,
+    }, (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    });
+    upstream.once("error", () => {
+      proxyFailure = "Launcher proxy relay could not reach the loopback fixture";
+      response.writeHead(502);
+      response.end();
+    });
+    request.pipe(upstream);
+  });
+  await new Promise<void>((done, fail) => {
+    proxyServer!.once("error", fail);
+    proxyServer!.listen(0, "127.0.0.1", done);
+  });
+  const proxyPort = (proxyServer.address() as { port: number }).port;
+  const telegramOrigin = "https://web.telegram.org";
+  const firstTab = `${origin}/first`;
+  const secondTab = `${origin}/second`;
+  const telegramTab = `${telegramOrigin}/k/`;
+  const mutator = join(root, "mutate.mjs");
+  const verifier = join(root, "verify.mjs");
+  const identityProbe = `async () => {
+    const workerUrl = URL.createObjectURL(new Blob([
+      'postMessage({ language: navigator.language, languages: [...navigator.languages], locale: Intl.DateTimeFormat().resolvedOptions().locale, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone })'
+    ], { type: 'text/javascript' }));
+    const worker = new Worker(workerUrl);
+    let workerIdentity;
+    try {
+      workerIdentity = await new Promise((resolve, reject) => { worker.onmessage = (event) => resolve(event.data); worker.onerror = reject; });
+    } finally { worker.terminate(); URL.revokeObjectURL(workerUrl); }
+    const context = document.createElement('canvas').getContext('2d');
+    const fonts = {};
+    for (const name of ['Arial', 'SimSun', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', 'GhosterAnti Missing Font']) {
+      let local = false;
+      try { await new FontFace('probe', 'local("' + name + '")').load(); local = true; } catch {}
+      context.font = '32px "' + name + '", monospace';
+      fonts[name] = { local, width: context.measureText('ABC abc 0123 中文').width };
+    }
+    return {
+      userAgent: navigator.userAgent, platform: navigator.platform,
+      language: navigator.language, languages: [...navigator.languages],
+      locale: Intl.DateTimeFormat().resolvedOptions().locale,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      acceptLanguage: (await (await fetch('/headers')).json()).acceptLanguage,
+      worker: workerIdentity, fonts,
+      touch: navigator.maxTouchPoints,
+      coarsePointer: matchMedia('(pointer: coarse)').matches,
+      finePointer: matchMedia('(pointer: fine)').matches,
+      screen: [screen.width, screen.height, screen.colorDepth],
+    };
+  }`;
+  await writeFile(mutator, `
+import { writeFile } from "node:fs/promises";
+export default async ({ context, inputs, log }) => {
+  const first = context.pages()[0] ?? await context.newPage();
+  await first.goto(inputs.firstTab, { waitUntil: "domcontentloaded" });
+  await context.addCookies([{ name: "launcher-proof", value: "saved", url: inputs.origin, expires: Math.floor(Date.now() / 1000) + 86400 }]);
+  await first.evaluate(async () => {
+    localStorage.setItem("launcher-proof", "saved");
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open("launcher-proof", 1);
+      request.onupgradeneeded = () => request.result.createObjectStore("state");
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction("state", "readwrite");
+        transaction.objectStore("state").put("saved", "session");
+        transaction.oncomplete = () => { database.close(); resolve(); };
+        transaction.onerror = () => reject(transaction.error);
+      };
+    });
+  });
+  const second = await context.newPage();
+  await second.goto(inputs.secondTab, { waitUntil: "domcontentloaded" });
+  await context.route("https://web.telegram.org/**", (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html",
+    body: "<!doctype html><title>GhosterAnti Telegram fixture</title>",
+  }));
+  const telegram = await context.newPage();
+  await telegram.goto(inputs.telegramTab, { waitUntil: "domcontentloaded" });
+  await telegram.evaluate(async () => {
+    localStorage.setItem("dc2_auth_key", "synthetic-auth");
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open("tweb-common", 8);
+      request.onupgradeneeded = () => request.result.createObjectStore("localStorage__encrypted");
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction("localStorage__encrypted", "readwrite");
+        transaction.objectStore("localStorage__encrypted").put("synthetic-auth", "data");
+        transaction.oncomplete = () => { database.close(); resolve(); };
+        transaction.onerror = () => reject(transaction.error);
+      };
+    });
+  });
+  await telegram.close();
+  const result = {
+    identity: await first.evaluate(${identityProbe}),
+    tabs: context.pages().map((page) => page.url()),
+  };
+  await writeFile(inputs.resultPath, JSON.stringify(result) + "\\n");
+  log("Fixture state saved");
+};
+`);
+  await writeFile(verifier, `
+import { writeFile } from "node:fs/promises";
+export default async ({ context, inputs, log }) => {
+  const page = context.pages().find((item) => item.url().startsWith(inputs.origin)) ?? await context.newPage();
+  if (!page.url().startsWith(inputs.origin)) await page.goto(inputs.firstTab, { waitUntil: "domcontentloaded" });
+  await context.route("https://web.telegram.org/**", (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html",
+    body: "<!doctype html><title>GhosterAnti Telegram fixture</title>",
+  }));
+  const telegram = await context.newPage();
+  await telegram.goto(inputs.telegramTab, { waitUntil: "domcontentloaded" });
+  const telegramAuth = await telegram.evaluate(() => new Promise((resolve, reject) => {
+    const request = indexedDB.open("tweb-common", 8);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const database = request.result;
+      const transaction = database.transaction("localStorage__encrypted", "readonly");
+      const operation = transaction.objectStore("localStorage__encrypted").get("data");
+      operation.onsuccess = () => resolve(operation.result);
+      transaction.oncomplete = () => database.close();
+      transaction.onerror = () => reject(transaction.error);
+    };
+  }));
+  await telegram.close();
+  const stored = inputs.verifyGenericIndexedDB ? await page.evaluate(() => new Promise((resolve, reject) => {
+    const request = indexedDB.open("launcher-proof", 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const database = request.result;
+      const transaction = database.transaction("state", "readonly");
+      const operation = transaction.objectStore("state").get("session");
+      operation.onsuccess = () => resolve(operation.result);
+      transaction.oncomplete = () => database.close();
+      transaction.onerror = () => reject(transaction.error);
+    };
+  })) : null;
+  const result = {
+    identity: await page.evaluate(${identityProbe}),
+    localStorage: await page.evaluate(() => localStorage.getItem("launcher-proof")),
+    indexedDB: stored,
+    telegramAuth,
+    cookies: await context.cookies(inputs.origin),
+    tabs: context.pages().map((item) => item.url()),
+  };
+  await writeFile(inputs.resultPath, JSON.stringify(result) + "\\n");
+  log("Fixture state verified");
+};
+`);
+
+  const pythonVerifier = join(root, "verify.py");
+  await writeFile(pythonVerifier, `
+import json
+
+async def run(*, context, inputs, log, **_kwargs):
+    page = next((item for item in context.pages if item.url.startswith(inputs["origin"])), None)
+    if page is None:
+        page = await context.new_page()
+        await page.goto(inputs["firstTab"], wait_until="domcontentloaded")
+    result = {
+        "localStorage": await page.evaluate("localStorage.getItem('launcher-proof')"),
+        "tabs": [item.url for item in context.pages],
+    }
+    with open(inputs["resultPath"], "w", encoding="utf-8") as file:
+        json.dump(result, file)
+    log("Python fixture context verified")
+`);
+
+  const profileId = "firefoxlaunchproof";
+  const generatedConfig = createFirefoxProfileConfig(1440, 900);
+  const savedProfile: Profile = {
+    ...profile(profileId, generatedConfig),
+    timezone: "America/New_York",
+    proxy: { type: "http", host: "127.0.0.1", port: String(proxyPort), user: proxyUser, pass: proxyPassword },
+  };
+  syncFirefoxTimezone(savedProfile);
+  localStore.upsertProfile(savedProfile);
+  const savedConfig = completeProfileFingerprint(savedProfile).firefox;
+  assert.deepEqual(localStore.getProfile(profileId)?.firefox, savedConfig, "completed Firefox identity persists in ProfileStore");
+
+  const firefoxConfigs: Array<Record<string, unknown>> = [];
+  localLauncher = new Launcher({
+    store: localStore,
+    dataRoot: localDataRoot,
+    firefoxBinaryPath: binary,
+    expectedFirefoxBinarySha256: expectedSha256,
+    headless: true,
+    portRange: { start: 18000, end: 18999 },
+    firefoxRuntime: {
+      reserve: reserveFirefoxOwner,
+      start: (input, callbacks) => { firefoxConfigs.push(input.config); return startFirefoxOwner(input, callbacks); },
+      call: callFirefoxOwner,
+      close: closeFirefoxOwner,
+    },
+  });
+  const initial = await localLauncher.start(profileId, [], { autoNavigate: false });
+  const initialLaunch = localStore.getLaunch(profileId)!;
+  const localOwnerGeneration = initialLaunch.firefoxOwner?.generation;
+  assert.ok(localOwnerGeneration, "local Firefox owner has a generation");
+  assert.equal(initialLaunch.binarySha256, expectedSha256, "Launcher stores the approved Firefox executable hash");
+  assert.ok(initialLaunch.firefoxOwner && initialLaunch.firefoxOwner.pid > 0 && initialLaunch.firefoxOwner.browserPid > 0, "Launcher starts a real Node owner and browser");
+  assert.equal(await localLauncher.certifiedActive(profileId), true, "Launcher certifies the owned Firefox process");
+  const mutationRun = await ownerScript(localLauncher, profileId, mutator, { origin, firstTab, secondTab, telegramTab });
+  assert.ok(mutationRun.logs.includes("Fixture state saved"), "external JavaScript runner returns fixture logs");
+  const mutated = mutationRun.result as { identity: any; tabs: string[] };
+  // Compared across the Windows, macOS and Linux jobs: the same identity on each host.
+  console.log(`firefox-launcher-acceptance:fonts ${JSON.stringify(mutated.identity.fonts)}`);
+  assert.equal(mutated.identity.language, "en-US", "page uses the saved US locale");
+  assert.equal(mutated.identity.locale, "en-US", "page Intl uses the saved locale");
+  assert.equal(mutated.identity.acceptLanguage.split(",")[0], "en-US", "HTTP uses the saved locale");
+  assert.equal(mutated.identity.worker.language, "en-US", "worker uses the saved locale");
+  assert.equal(mutated.identity.worker.locale, "en-US", "worker Intl uses the saved locale");
+  assert.equal(mutated.identity.timezone, savedProfile.timezone);
+  assert.equal(mutated.identity.worker.timezone, savedProfile.timezone);
+  assert.equal(mutated.identity.fonts["GhosterAnti Missing Font"].local, false);
+  assert.equal(proxyFailure, undefined, "Launcher relays Firefox through the authenticated proxy");
+  assert.ok(exitIpLookups > 0, "Launcher looks up the exit IP through the authenticated proxy");
+  assert.equal(firefoxConfigs[0]?.["webrtc:ipv4"], exitIp, "Firefox shows the proxy exit IP as WebRTC's public address");
+  assert.ok(proxyRequests > 0 && proxyFixtureRequests > 0, "Firefox reaches the loopback fixture through the Launcher proxy relay");
+  assert.ok(mutated.tabs.includes(firstTab) && mutated.tabs.includes(secondTab), "fixture opens two local tabs");
+
+  // Do not save a portable bundle before this stop. Local reopen must use Firefox's
+  // native persistent session, including the latest tabs and origin storage.
+  assert.equal(await localLauncher.stop(profileId), true, "Launcher stops the owned Firefox process");
+  const reopened = await localLauncher.start(profileId, [], { autoNavigate: false });
+  assert.equal(await localLauncher.certifiedActive(profileId), true, "Launcher certifies Firefox after local reopen");
+  const localVerification = await ownerScript(localLauncher, profileId, verifier, { origin, firstTab, telegramTab, verifyGenericIndexedDB: true });
+  assert.ok(localVerification.logs.includes("Fixture state verified"), "external JavaScript runner returns verification logs");
+  const localState = localVerification.result;
+  assert.deepEqual((localState as any).identity, mutated.identity, "local reopen keeps the generated Firefox identity");
+  assert.equal((localState as any).localStorage, "saved", "local reopen keeps Local Storage");
+  assert.equal((localState as any).indexedDB, "saved", "local reopen keeps IndexedDB");
+  assert.equal((localState as any).telegramAuth, "synthetic-auth", "local reopen keeps selected Telegram IndexedDB auth");
+  assert.ok((localState as any).cookies.some((cookie: { name: string; value: string }) => cookie.name === "launcher-proof" && cookie.value === "saved"), "local reopen keeps cookies");
+  assert.ok((localState as any).tabs.includes(firstTab) && (localState as any).tabs.includes(secondTab), "local reopen keeps native tabs without a saved bundle");
+  const pythonRun = await ownerScript(localLauncher, profileId, pythonVerifier, { origin, firstTab }, "python");
+  assert.ok(pythonRun.logs.includes("Python fixture context verified"), "external Python runner returns fixture logs");
+  assert.equal((pythonRun.result as any).localStorage, "saved", "external Python runner uses the owned Firefox context");
+
+  const captured = await readSessionInSubprocess(reopened.ws, {
+    captureSeed: { origins: [origin, telegramOrigin], telegramClient: "k" },
+  });
+  const capturedTelegram = JSON.parse(captured).origins.find((entry: { origin: string }) => entry.origin === telegramOrigin);
+  assert.ok(capturedTelegram?.indexedDB?.some((database: { name: string; stores: Array<{ name: string; records: Array<{ key: string; value: string }> }> }) =>
+    database.name === "tweb-common" && database.stores.some((store) =>
+      store.name === "localStorage__encrypted" && store.records.some((record) => record.key === "data" && record.value === "synthetic-auth")
+    )
+  ), "native worker captures only the selected synthetic Telegram auth record");
+  const portable = encodePortableProfile(localStore.getProfile(profileId)!, captured);
+  const handoff = decodePortableProfile(portable);
+  assert.equal(handoff.profile.engine, "firefox", "portable profile keeps the Firefox engine");
+  assert.deepEqual(handoff.profile.firefox, savedConfig, "portable profile keeps the exact saved Firefox identity");
+
+  assert.equal(await localLauncher.stop(profileId), true, "Launcher stops Firefox before disabled native reopen");
+  const nativeRestoreDisabled = await localLauncher.start(profileId, [], { autoNavigate: false, restoreLastSession: false });
+  const disabledLaunch = localStore.getLaunch(profileId)!;
+  const disabledStatus = await callFirefoxOwner<{ pageTargets: Array<{ url: string }> }>(disabledLaunch.firefoxOwner!, "status", {});
+  assert.equal(nativeRestoreDisabled.nativeSessionRestored, false, "disabled Local reopen does not report native restoration");
+  assert.ok(!disabledStatus.pageTargets.some((target) => target.url === firstTab || target.url === secondTab), "disabled Local reopen does not restore native tabs");
+  assert.equal(await localLauncher.stop(profileId), true, "Launcher stops Firefox after disabled native reopen");
+
+  const runtime = sourceRuntimeRoot
+    ? JSON.parse(await readFile(join(sourceRuntimeRoot, "browser-runtime.json"), "utf8")) as SourceRuntime
+    : null;
+  if (runtime) {
+    console.log("firefox-launcher-acceptance:concurrent-engine-stop");
+    localStore.upsertProfile(profile(concurrentFirefoxId, createFirefoxProfileConfig(1440, 900)));
+    localStore.upsertProfile(profile(concurrentFirefoxPeerId, createFirefoxProfileConfig(1440, 900)));
+    const chromiumProfile = buildNewProfile(
+      { engine: "chromium", chromiumRuntime: "cloakbrowser", name: "Chromium concurrent acceptance", screen: "1440x900" },
+      (id) => localStore.getProfile(id) !== null,
+    );
+    const chromiumId = chromiumProfile.id;
+    concurrentChromiumId = chromiumId;
+    localStore.upsertProfile(chromiumProfile);
+    concurrentLauncher = new Launcher({
+      store: localStore,
+      dataRoot: join(root, "concurrent-data"),
+      binaryPath: runtime.chromium.path,
+      expectedBinarySha256: runtime.chromium.sha256,
+      firefoxBinaryPath: binary,
+      expectedFirefoxBinarySha256: expectedSha256,
+      headless: true,
+      baseArgs: process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage"] : [],
+      portRange: { start: 20000, end: 20999 },
+    });
+    await Promise.all([
+      concurrentLauncher.start(concurrentFirefoxId, [], { autoNavigate: false }),
+      concurrentLauncher.start(concurrentFirefoxPeerId, [], { autoNavigate: false }),
+      concurrentLauncher.start(chromiumId, [], { autoNavigate: false }),
+    ]);
+    foreignOwner = Bun.spawn([
+      runtime.node,
+      "--eval",
+      "setInterval(() => {}, 1000)",
+      "--",
+      "--ghosteranti-firefox-owner=foreign-acceptance-generation",
+    ], { stdout: "ignore", stderr: "ignore" });
+    assert.ok(foreignOwner.pid > 0, "foreign owner-marker fixture starts");
+    await Bun.sleep(100);
+    assert.equal(foreignOwner.exitCode, null, "foreign owner-marker fixture remains alive before Firefox stop");
+
+    assert.equal(await concurrentLauncher.stop(concurrentFirefoxId), true, "Launcher stops one Firefox beside Firefox, Chromium, and a foreign owner marker");
+    assert.equal(localStore.getLaunch(concurrentFirefoxId), null, "stopped concurrent Firefox launch clears");
+    assert.equal(await concurrentLauncher.certifiedActive(concurrentFirefoxPeerId), true, "second Firefox remains certified after peer stop");
+    assert.equal(await concurrentLauncher.certifiedActive(chromiumId), true, "Chromium remains certified after Firefox stop");
+    assert.equal(await concurrentLauncher.stop(concurrentFirefoxPeerId), true, "Launcher stops the second concurrent Firefox");
+    assert.equal(foreignOwner.exitCode, null, "foreign owner-marker fixture remains alive after peer Firefox stops");
+    assert.equal(await concurrentLauncher.stop(chromiumId), true, "Launcher stops the concurrent Chromium");
+    foreignOwner.kill();
+    await foreignOwner.exited;
+    foreignOwner = undefined;
+  }
+
+  if (process.platform === "win32") {
+    // A script that closes every page ends Windows Firefox through its last tab. Firefox would
+    // restore that window as an empty new-tab page, and each later open timed out.
+    console.log("firefox-launcher-acceptance:last-tab-close-reopen");
+    localStore.upsertProfile(profile(lastTabCloseId, createFirefoxProfileConfig(1440, 900)));
+    await localLauncher.start(lastTabCloseId, [], { autoNavigate: false, headless: false });
+    const closer = join(root, "close-every-page.mjs");
+    await writeFile(closer, `
+import { writeFile } from "node:fs/promises";
+export default async ({ context, page, inputs }) => {
+  await page.goto(inputs.url, { waitUntil: "domcontentloaded" });
+  await writeFile(inputs.resultPath, JSON.stringify({ url: page.url() }));
+  for (const item of context.pages()) await item.close();
+};
+`);
+    await ownerScript(localLauncher, lastTabCloseId, closer, { url: `http://127.0.0.1:${fixturePort}/first` });
+    await waitForNativeFirefoxClose(lastTabCloseId);
+    assert.equal(await localLauncher.stop(lastTabCloseId), true, "Launcher confirms cleanup after the last tab closed Firefox");
+    await localLauncher.start(lastTabCloseId, [], { autoNavigate: false, headless: false });
+    assert.equal(await localLauncher.certifiedActive(lastTabCloseId), true, "Firefox reopens after a script closed its last tab");
+    assert.equal(await localLauncher.stop(lastTabCloseId), true, "Launcher stops the reopened Firefox");
+  }
+
+  if (process.platform === "darwin") {
+    localStore.upsertProfile(profile(nativeCloseId, createFirefoxProfileConfig(1440, 900)));
+    const nativeOrigin = `http://127.0.0.1:${fixturePort}`;
+    const nativeNavigator = join(root, "native-tab.mjs");
+    await writeFile(nativeNavigator, `
+import { writeFile } from "node:fs/promises";
+export default async ({ context, inputs }) => {
+  const page = context.pages().find(page => ["about:blank", "about:newtab"].includes(page.url()));
+  if (!page) throw new Error("native empty tab is unavailable");
+  await page.goto(inputs.url, { waitUntil: "domcontentloaded" });
+  await writeFile(inputs.resultPath, JSON.stringify({ url: page.url() }));
+};
+`);
+    for (const close of ["window", "quit", "managed", "reduced", "blank"]) {
+      console.log(`firefox-launcher-acceptance:native-close-reopen:${close}`);
+      await localLauncher.start(nativeCloseId, [], { autoNavigate: false, restoreLastSession: false, headless: false });
+      const nativeLaunch = localStore.getLaunch(nativeCloseId)!;
+      assert.ok(nativeLaunch.firefoxOwner, "native close profile has a Firefox owner");
+      const owner = nativeLaunch.firefoxOwner!;
+      const tabs = close === "blank" ? [] : [`${nativeOrigin}/first`, `${nativeOrigin}/second`, `${nativeOrigin}/first`];
+      const status = () => callFirefoxOwner<{ pageTargets: Array<{ url: string }> }>(owner, "status", {});
+      if (tabs.length) {
+        await callFirefoxOwner(owner, "navigate", { urls: [tabs[0]] });
+        for (const url of tabs.slice(1)) {
+          const count = (await status()).pageTargets.length;
+          await nativeFirefoxKeys(nativeLaunch.pid, 'keystroke "t" using command down');
+          const deadline = Date.now() + 30_000;
+          while ((await status()).pageTargets.length === count && Date.now() < deadline) await Bun.sleep(50);
+          assert.equal((await status()).pageTargets.length, count + 1, "native shortcut opens one tab");
+          await ownerScript(localLauncher, nativeCloseId, nativeNavigator, { url });
+        }
+        const deadline = Date.now() + 30_000;
+        while (JSON.stringify((await status()).pageTargets.map(page => page.url)) !== JSON.stringify(tabs) && Date.now() < deadline) await Bun.sleep(50);
+        assert.deepEqual((await status()).pageTargets.map(page => page.url), tabs, "native tabs finish navigation before close");
+        await callFirefoxOwner(owner, "page", { kind: "scripts", scripts: [
+          `(() => { localStorage.setItem('native-close', '${close}'); document.cookie = 'native-close=${close}; Max-Age=86400; path=/'; })()`,
+        ] });
+      }
+      if (close === "reduced") {
+        await nativeFirefoxKeys(nativeLaunch.pid, 'keystroke "2" using command down\ndelay 0.2\nkeystroke "w" using command down');
+        tabs.splice(1, 1);
+        const deadline = Date.now() + 30_000;
+        while ((await status()).pageTargets.length !== tabs.length && Date.now() < deadline) await Bun.sleep(50);
+        assert.deepEqual((await status()).pageTargets.map(page => page.url), tabs, "closing one tab keeps only the remaining tabs");
+      }
+      await localLauncher.verifyRunningIdentity(nativeCloseId);
+      if (close === "managed") {
+        assert.equal(await localLauncher.captureLocalSession(nativeCloseId), true);
+        assert.equal(await localLauncher.stop(nativeCloseId), true);
+      } else {
+        if (close === "quit") await nativeFirefoxKeys(nativeLaunch.pid, 'keystroke "q" using command down');
+        else await closeNativeFirefoxWindow(nativeLaunch.pid);
+        await waitForNativeFirefoxClose(nativeCloseId);
+        assert.deepEqual(localLauncher.closedFirefoxTabs(nativeCloseId, nativeLaunch), tabs, "native close saves current ordered tabs before managed cleanup");
+        if (close !== "window") assert.equal(await localLauncher.stop(nativeCloseId), true, "Launcher confirms native close cleanup");
+      }
+      assert.deepEqual(localLauncher.closedFirefoxTabs(nativeCloseId, nativeLaunch), tabs, "cleanup does not erase native-close tabs");
+      await localLauncher.start(nativeCloseId, [], { autoNavigate: false, headless: false });
+      const reopenedOwner = localStore.getLaunch(nativeCloseId)!.firefoxOwner!;
+      const reopenedStatus = await callFirefoxOwner<{ pageTargets: Array<{ url: string }> }>(reopenedOwner, "status", {});
+      assert.deepEqual(reopenedStatus.pageTargets.map(page => page.url).filter(url => /^https?:/.test(url)), tabs, "native close then reopen preserves exact URL order and duplicates");
+      if (tabs.length) {
+        const values = await callFirefoxOwner(reopenedOwner, "page", { kind: "scripts", scripts: [
+          "({ storage: localStorage.getItem('native-close'), cookie: document.cookie })",
+        ] }) as Array<{ storage: string; cookie: string }>;
+        assert.equal(values[0]!.storage, close, "native reopen keeps fresh Local Storage");
+        assert.ok(values[0]!.cookie.includes(`native-close=${close}`), "native reopen keeps cookies");
+      }
+      assert.equal(await localLauncher.stop(nativeCloseId), true);
+    }
+  }
+
+  cloudStore.upsertProfile(handoff.profile);
+
+  cloudLauncher = new Launcher({
+    store: cloudStore,
+    dataRoot: cloudDataRoot,
+    firefoxBinaryPath: binary,
+    expectedFirefoxBinarySha256: expectedSha256,
+    headless: true,
+    portRange: { start: 19000, end: 19999 },
+  });
+  const cloud = await cloudLauncher.start(profileId, [], { autoNavigate: false });
+  assert.equal(await cloudLauncher.certifiedActive(profileId), true, "cloud handoff owner is certified");
+  assert.notEqual(cloudStore.getLaunch(profileId)?.firefoxOwner?.generation, localOwnerGeneration, "cloud handoff uses a distinct Firefox owner");
+  await applySessionToEndpoint(cloud.ws, handoff.sessionBundle, []);
+  const cloudVerification = await ownerScript(cloudLauncher, profileId, verifier, { origin, firstTab, telegramTab });
+  assert.ok(cloudVerification.logs.includes("Fixture state verified"), "cloud external JavaScript runner returns logs");
+  const cloudState = cloudVerification.result;
+  assert.deepEqual((cloudState as any).identity, mutated.identity, "cloud handoff keeps the generated Firefox identity");
+  assert.equal((cloudState as any).localStorage, "saved", "cloud handoff applies Local Storage");
+  assert.equal(JSON.parse(captured).origins.find((entry: { origin: string }) => entry.origin === origin)?.indexedDB, undefined, "portable capture excludes unsupported generic IndexedDB");
+  assert.equal((cloudState as any).telegramAuth, "synthetic-auth", "cloud handoff applies selected Telegram IndexedDB auth");
+  assert.ok((cloudState as any).cookies.some((cookie: { name: string; value: string }) => cookie.name === "launcher-proof" && cookie.value === "saved"), "cloud handoff applies cookies");
+  assert.ok((cloudState as any).tabs.includes(firstTab) && (cloudState as any).tabs.includes(secondTab), "cloud handoff applies portable tabs");
+
+  console.log(JSON.stringify({
+    engine: "firefox",
+    binarySha256: expectedSha256,
+    localNativePersistence: true,
+    cloudPortableHandoff: true,
+    identity: mutated.identity,
+    initialPort: initial.port,
+    cloudPort: cloud.port,
+  }));
+} finally {
+  const cleanup = await Promise.all([
+    stopForCleanup(cloudLauncher, cloudStore, "firefoxlaunchproof"),
+    stopForCleanup(concurrentLauncher, localStore, concurrentFirefoxId),
+    stopForCleanup(concurrentLauncher, localStore, concurrentFirefoxPeerId),
+    concurrentChromiumId
+      ? stopForCleanup(concurrentLauncher, localStore, concurrentChromiumId)
+      : Promise.resolve(true),
+    stopForCleanup(localLauncher, localStore, nativeCloseId),
+    stopForCleanup(localLauncher, localStore, lastTabCloseId),
+    stopForCleanup(localLauncher, localStore, "firefoxlaunchproof"),
+  ]);
+  if (foreignOwner) {
+    foreignOwner.kill();
+    await foreignOwner.exited.catch(() => {});
+  }
+  cloudStore.close();
+  localStore.close();
+  await new Promise<void>((done) => proxyServer?.close(() => done()) ?? done());
+  await new Promise<void>((done) => server?.close(() => done()) ?? done());
+  if (!cleanup.every(Boolean)) throw new Error("acceptance cleanup could not confirm browser teardown");
+  await rm(root, { recursive: true, force: true });
+}

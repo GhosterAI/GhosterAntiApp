@@ -1,0 +1,1384 @@
+name: Client CI
+
+# Pushes and pull requests run only the Ubuntu job. The Windows packaging and
+# acceptance pipeline runs on a manual dispatch from main (Actions > Client CI >
+# Run workflow) before a release. release-candidate.yml and
+# client-compatibility.yml take the installer from that dispatched run.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      client_ci_reusable_call:
+        description: Marks this run as a reusable workflow invocation.
+        required: false
+        default: true
+        type: boolean
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+# The aliasmode/aliasmode-firefox build.yml run that built the Windows engine, and the release
+# whose archive the installer bundles. The release carries that run's archives, which hold no
+# fonts of other operating systems; the app downloads those as font packs when a profile needs them.
+env:
+  GHOSTERANTI_FIREFOX_RELEASE: aliasmode-runtime-156.0.1-beta.36-r7
+  GHOSTERANTI_FIREFOX_RELEASE_ARCHIVE_SHA256: 83ccb1a266e0c65cb195f60ed9e647a15ba5781710c3aab6882d602dc8c49f27
+  GHOSTERANTI_FIREFOX_BUILD_RUN_ID: "39422468988"
+  GHOSTERANTI_FIREFOX_BUILD_EVENT: workflow_dispatch
+  GHOSTERANTI_FIREFOX_BUILD_BRANCH: engine/156-render-noise
+  GHOSTERANTI_FIREFOX_BUILD_SHA: 7737dbf1ada5727f392995610a128eb40152bf31
+
+concurrency:
+  group: >-
+    client-ci-${{
+      inputs.client_ci_reusable_call == true && format('call-{0}', github.run_id) ||
+      github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) ||
+      format('{0}-{1}', github.event_name, github.event.pull_request.number || github.ref)
+    }}
+  cancel-in-progress: >-
+    ${{
+      inputs.client_ci_reusable_call != true &&
+      (github.event_name == 'push' || github.event_name == 'pull_request')
+    }}
+
+jobs:
+  ubuntu:
+    name: Ubuntu tests and checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+          components: rustfmt
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run typecheck
+      - run: bun run i18n:locales:check
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+  windows_firefox:
+    name: Pinned GhosterAnti Firefox runtime
+    if: github.event_name == 'workflow_dispatch' || inputs.client_ci_reusable_call == true
+    runs-on: windows-latest
+    outputs:
+      archive_sha256: ${{ steps.verify.outputs.archive_sha256 }}
+      executable_sha256: ${{ steps.verify.outputs.executable_sha256 }}
+    steps:
+      - name: Verify source build provenance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $run = gh api "repos/aliasmode/aliasmode-firefox/actions/runs/$env:GHOSTERANTI_FIREFOX_BUILD_RUN_ID" | ConvertFrom-Json
+          if (
+            $run.name -cne "Build and Release" -or
+            $run.path -cne ".github/workflows/build.yml" -or
+            $run.repository.full_name -cne "aliasmode/aliasmode-firefox" -or
+            $run.head_repository.full_name -cne "aliasmode/aliasmode-firefox" -or
+            $run.status -cne "completed" -or
+            $run.conclusion -cne "success" -or
+            $run.event -cne $env:GHOSTERANTI_FIREFOX_BUILD_EVENT -or
+            $run.head_branch -cne $env:GHOSTERANTI_FIREFOX_BUILD_BRANCH -or
+            $run.head_sha -cne $env:GHOSTERANTI_FIREFOX_BUILD_SHA
+          ) {
+            throw "GhosterAnti Firefox source build provenance is invalid"
+          }
+      - name: Download the released GhosterAnti Firefox archive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "artifacts/firefox" | Out-Null
+          gh release download $env:GHOSTERANTI_FIREFOX_RELEASE --repo aliasmode/aliasmode-firefox --pattern "aliasmode-156.0.1-beta.36-win.x86_64.zip" --dir "artifacts/firefox"
+          $sha = (Get-FileHash -LiteralPath "artifacts/firefox/aliasmode-156.0.1-beta.36-win.x86_64.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -cne $env:GHOSTERANTI_FIREFOX_RELEASE_ARCHIVE_SHA256) { throw "released GhosterAnti Firefox archive SHA-256 mismatch: $sha" }
+      - name: Verify owned GhosterAnti Firefox artifact
+        id: verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Resolve-Path ".\artifacts\firefox"
+          $entries = @(Get-ChildItem -LiteralPath $root -Force)
+          $archiveName = "aliasmode-156.0.1-beta.36-win.x86_64.zip"
+          if (
+            $entries.Count -ne 1 -or
+            $entries[0].PSIsContainer -or
+            (($entries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            $entries[0].Name -cne $archiveName
+          ) {
+            throw "GhosterAnti Firefox artifact must contain exactly the approved archive"
+          }
+          $archive = $entries[0].FullName
+          $archiveSha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($archiveSha -notmatch '^[a-f0-9]{64}$') { throw "GhosterAnti Firefox archive SHA-256 is invalid" }
+          $extracted = Join-Path $env:RUNNER_TEMP "ghosteranti-firefox-runtime"
+          Expand-Archive -LiteralPath $archive -DestinationPath $extracted -Force
+          $executables = @(Get-ChildItem -LiteralPath $extracted -Recurse -File -Filter "aliasmode.exe")
+          if ($executables.Count -ne 1) { throw "GhosterAnti Firefox archive must contain exactly one aliasmode.exe" }
+          $executable = $executables[0].FullName
+          $executableSha = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($executableSha -notmatch '^[a-f0-9]{64}$') { throw "GhosterAnti Firefox executable SHA-256 is invalid" }
+          $stdoutPath = Join-Path $env:RUNNER_TEMP "firefox-version-stdout.txt"
+          $stderrPath = Join-Path $env:RUNNER_TEMP "firefox-version-stderr.txt"
+          $process = Start-Process -FilePath $executable -ArgumentList "--version" -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+          $version = [IO.File]::ReadAllText($stdoutPath)
+          if ($process.ExitCode -ne 0 -or $version -notmatch '156\.0\.1') {
+            Write-Host "Firefox version probe exited $($process.ExitCode): $version"
+            Write-Host ([IO.File]::ReadAllText($stderrPath))
+            throw "owned GhosterAnti Firefox did not report Firefox 156.0.1"
+          }
+          "archive_sha256=$archiveSha" | Add-Content $env:GITHUB_OUTPUT
+          "executable_sha256=$executableSha" | Add-Content $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-firefox-windows-x64
+          path: artifacts/firefox
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  windows_cache:
+    name: Windows cache and provenance
+    needs: windows_firefox
+    runs-on: windows-latest
+    outputs:
+      baseline_bun_sha: ${{ steps.provenance.outputs.baseline_bun_sha }}
+      firefox_archive_sha256: ${{ steps.provenance.outputs.firefox_archive_sha256 }}
+      firefox_executable_sha256: ${{ steps.provenance.outputs.firefox_executable_sha256 }}
+      cache_hit: ${{ steps.cache_status.outputs.cache_hit }}
+      product_key: ${{ steps.provenance.outputs.product_key }}
+      source: ${{ steps.provenance.outputs.source }}
+      version: ${{ steps.provenance.outputs.version }}
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - name: Compute Windows product provenance
+        id: provenance
+        shell: pwsh
+        env:
+          FIREFOX_ARCHIVE_SHA256: ${{ needs.windows_firefox.outputs.archive_sha256 }}
+          FIREFOX_EXECUTABLE_SHA256: ${{ needs.windows_firefox.outputs.executable_sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $baselineUrl = "https://github.com/oven-sh/bun/releases/download/bun-v1.2.21/bun-windows-x64-baseline.zip"
+          $expectedBaselineSha = "23f2df1f40d963e5b6104e1a565df992aab8968da5004f460617073843b8b8be"
+          $baselineZip = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline.zip"
+          Invoke-WebRequest $baselineUrl -OutFile $baselineZip
+          $baselineSha = (Get-FileHash -LiteralPath $baselineZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($baselineSha -ne $expectedBaselineSha) {
+            throw "official baseline Bun archive SHA-256 mismatch"
+          }
+
+          $setupBunVersion = (& bun --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $setupBunVersion -ne "1.2.21") {
+            throw "setup Bun identity is not 1.2.21"
+          }
+          $setupBunPath = (Get-Command bun -ErrorAction Stop).Source
+          $setupBunSha = (Get-FileHash -LiteralPath $setupBunPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($setupBunSha -notmatch '^[a-f0-9]{64}$') { throw "setup Bun SHA-256 is invalid" }
+
+          $rustcIdentity = ((& rustc -Vv) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or $rustcIdentity -notmatch '^rustc 1\.89\.0') {
+            throw "rustc identity is not 1.89.0"
+          }
+          $activeToolchain = (& rustup show active-toolchain).Trim()
+          if ($LASTEXITCODE -ne 0 -or $activeToolchain -notmatch '^1\.89(?:\.0)?-') {
+            throw "active Rust toolchain is not 1.89"
+          }
+          foreach ($name in @("RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion")) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "runner identity is missing $name"
+            }
+          }
+
+          $version = [string](Get-Content ".\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json).version
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "Tauri bundle version is missing" }
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { throw "GitHub source identity is missing" }
+          foreach ($name in @("FIREFOX_ARCHIVE_SHA256", "FIREFOX_EXECUTABLE_SHA256")) {
+            if ([Environment]::GetEnvironmentVariable($name) -notmatch '^[a-f0-9]{64}$') {
+              throw "GhosterAnti Firefox provenance output is invalid: $name"
+            }
+          }
+
+          $toolchainIdentity = @(
+            "setup-bun=1.2.21:$setupBunSha"
+            "baseline-bun=1.2.21:$baselineSha"
+            "rustc=$rustcIdentity"
+            "rust-toolchain=$activeToolchain"
+            "runner=$env:RUNNER_OS/$env:RUNNER_ARCH/$env:ImageOS/$env:ImageVersion"
+            "build-recipe=windows-nsis-zlib-v1"
+          ) -join "`n"
+          $externalIdentity = @(
+            "node-win-x64=22.23.2:1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97"
+            "ghosteranti-firefox-source=aliasmode/aliasmode-firefox@$env:GHOSTERANTI_FIREFOX_BUILD_SHA"
+            "ghosteranti-firefox-version=156.0.1-beta.36"
+            "ghosteranti-firefox-archive-sha256=$env:FIREFOX_ARCHIVE_SHA256"
+            "ghosteranti-firefox-executable-sha256=$env:FIREFOX_EXECUTABLE_SHA256"
+          ) -join "`n"
+          $keyOutput = @(
+            & bun scripts/windows-product-key.ts `
+              --repo-root $env:GITHUB_WORKSPACE `
+              --version $version `
+              --toolchain $toolchainIdentity `
+              --external $externalIdentity
+          )
+          if ($LASTEXITCODE -ne 0 -or $keyOutput.Count -ne 1) {
+            throw "Windows product key computation failed"
+          }
+          $productKey = ([string]$keyOutput[0]).Trim()
+          if ($productKey -notmatch '^[a-f0-9]{64}$') { throw "Windows product key is invalid" }
+
+          "baseline_bun_sha=$baselineSha" | Add-Content $env:GITHUB_OUTPUT
+          "firefox_archive_sha256=$env:FIREFOX_ARCHIVE_SHA256" | Add-Content $env:GITHUB_OUTPUT
+          "firefox_executable_sha256=$env:FIREFOX_EXECUTABLE_SHA256" | Add-Content $env:GITHUB_OUTPUT
+          "product_key=$productKey" | Add-Content $env:GITHUB_OUTPUT
+          "source=$env:GITHUB_SHA" | Add-Content $env:GITHUB_OUTPUT
+          "version=$version" | Add-Content $env:GITHUB_OUTPUT
+      - name: Restore exact Windows candidate cache
+        id: candidate_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: artifacts/windows-candidate
+          key: ghosteranti-windows-candidate-v2-${{ steps.provenance.outputs.product_key }}
+      - name: Normalize candidate cache result
+        id: cache_status
+        shell: pwsh
+        env:
+          RESTORED_CACHE_HIT: ${{ steps.candidate_cache.outputs.cache-hit }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:RESTORED_CACHE_HIT -eq "true") {
+            $cacheHit = "true"
+          } elseif ([string]::IsNullOrEmpty($env:RESTORED_CACHE_HIT) -or $env:RESTORED_CACHE_HIT -eq "false") {
+            $cacheHit = "false"
+          } else {
+            throw "candidate cache returned an invalid result"
+          }
+          "cache_hit=$cacheHit" | Add-Content $env:GITHUB_OUTPUT
+      - name: Verify cached Windows candidate
+        if: steps.cache_status.outputs.cache_hit == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ steps.provenance.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ steps.provenance.outputs.source }}
+          WINDOWS_VERSION: ${{ steps.provenance.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $candidate = ".\artifacts\windows-candidate"
+          $fullName = "GhosterAnti_$($env:WINDOWS_VERSION)_x64-offline-setup.exe"
+          $slimName = "GhosterAnti_$($env:WINDOWS_VERSION)_x64-setup.exe"
+          $payloadNames = @($fullName, $slimName, "browser.json", "SHA256SUMS.txt", "size-report.json")
+          $requiredNames = @($payloadNames + "artifact-manifest.json") | Sort-Object
+          $entries = @(Get-ChildItem -LiteralPath $candidate -Force)
+          if ($entries.Count -ne 6 -or @($entries | Where-Object {
+            $_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+          }).Count -ne 0) {
+            throw "cached candidate must contain exactly six regular files"
+          }
+          $actualNames = @($entries | ForEach-Object Name | Sort-Object)
+          if (($actualNames -join "`n") -cne ($requiredNames -join "`n")) {
+            throw "cached candidate files did not match the required installer set"
+          }
+
+          $manifest = Get-Content (Join-Path $candidate "artifact-manifest.json") -Raw | ConvertFrom-Json
+          $originalSource = [string]$manifest.source
+          if ($manifest.schema -ne 1 -or $manifest.role -cne "candidate" -or
+              $manifest.version -cne $env:WINDOWS_VERSION -or
+              $manifest.productKey -cne $env:WINDOWS_PRODUCT_KEY -or
+              $originalSource -notmatch '^[a-f0-9]{40}$') {
+            throw "cached candidate provenance is invalid"
+          }
+          $originalArguments = @(
+            $candidate,
+            "--role", "candidate",
+            "--source", $originalSource,
+            "--version", $env:WINDOWS_VERSION,
+            "--product-key", $env:WINDOWS_PRODUCT_KEY
+          )
+          foreach ($name in $payloadNames) { $originalArguments += @("--file", $name) }
+          & bun scripts/windows-artifact-manifest.ts verify @originalArguments
+          if ($LASTEXITCODE -ne 0) { throw "cached candidate manifest verification failed" }
+
+          $currentArguments = @(
+            $candidate,
+            "--role", "candidate",
+            "--source", $env:WINDOWS_SOURCE,
+            "--version", $env:WINDOWS_VERSION,
+            "--product-key", $env:WINDOWS_PRODUCT_KEY
+          )
+          foreach ($name in $payloadNames) { $currentArguments += @("--file", $name) }
+          & bun scripts/windows-artifact-manifest.ts create @currentArguments
+          if ($LASTEXITCODE -ne 0) { throw "cached candidate provenance promotion failed" }
+          & bun scripts/windows-artifact-manifest.ts verify @currentArguments
+          if ($LASTEXITCODE -ne 0) { throw "promoted candidate manifest verification failed" }
+
+          $installers = @(
+            (Join-Path $candidate $fullName),
+            (Join-Path $candidate $slimName)
+          )
+          foreach ($installer in $installers) {
+            $stream = [IO.File]::OpenRead($installer)
+            try {
+              if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+                throw "cached installer must be a Windows PE file"
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          $checksums = @{}
+          $checksumLines = @([IO.File]::ReadAllLines((Join-Path $candidate "SHA256SUMS.txt")))
+          foreach ($line in $checksumLines) {
+            if ($line -notmatch '^([a-f0-9]{64})  ([^\\/]+)$' -or $checksums.ContainsKey($Matches[2])) {
+              throw "cached candidate checksum manifest is malformed"
+            }
+            $checksums[$Matches[2]] = $Matches[1]
+          }
+          if ($checksums.Count -ne 2 -or -not $checksums.ContainsKey($fullName) -or -not $checksums.ContainsKey($slimName)) {
+            throw "cached candidate checksum manifest must contain exactly both installers"
+          }
+          foreach ($installer in $installers) {
+            $name = Split-Path $installer -Leaf
+            $actual = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $checksums[$name]) { throw "cached candidate installer SHA-256 mismatch: $name" }
+          }
+
+          $fullSize = (Get-Item -LiteralPath $installers[0]).Length
+          $slimSize = (Get-Item -LiteralPath $installers[1]).Length
+          $sizeReport = Get-Content (Join-Path $candidate "size-report.json") -Raw | ConvertFrom-Json
+          if ($sizeReport.full.name -cne $fullName -or $sizeReport.slim.name -cne $slimName -or
+              $sizeReport.full.bytes -ne $fullSize -or $sizeReport.slim.bytes -ne $slimSize -or
+              $sizeReport.deltaBytes -ne ($fullSize - $slimSize) -or $sizeReport.deltaBytes -lt 100MB) {
+            throw "cached candidate installer size report is inconsistent"
+          }
+          # The installer carries no CloakBrowser; the app downloads it on first use.
+          $metadata = Get-Content (Join-Path $candidate "browser.json") -Raw | ConvertFrom-Json
+          if ($null -ne $metadata.executable -or [string]$metadata.firefox.sha256 -notmatch '^[a-f0-9]{64}$') {
+            throw "cached candidate browser metadata is invalid"
+          }
+      - name: Upload cached Windows candidate
+        if: steps.cache_status.outputs.cache_hit == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-candidate
+          path: artifacts/windows-candidate
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  windows_synthetic_successor:
+    name: Windows unsigned synthetic successor
+    needs: windows_cache
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows_full
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-firefox-windows-x64
+          path: artifacts/firefox
+      - run: bun install --frozen-lockfile
+      - name: Build and verify unsigned synthetic successor
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ needs.windows_cache.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ needs.windows_cache.outputs.source }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+          GHOSTERANTI_FIREFOX_ARCHIVE: ${{ github.workspace }}\artifacts\firefox\aliasmode-156.0.1-beta.36-win.x86_64.zip
+          GHOSTERANTI_FIREFOX_ARCHIVE_SHA256: ${{ needs.windows_cache.outputs.firefox_archive_sha256 }}
+          GHOSTERANTI_FIREFOX_EXECUTABLE_SHA256: ${{ needs.windows_cache.outputs.firefox_executable_sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            $sourceSemantic = [Management.Automation.SemanticVersion]::Parse($env:WINDOWS_VERSION)
+            $successorVersion = if ($env:WINDOWS_VERSION.Contains("-")) {
+              "$($env:WINDOWS_VERSION).acceptance.1"
+            } else {
+              "$($sourceSemantic.Major).$($sourceSemantic.Minor).$($sourceSemantic.Patch + 1)-acceptance.1"
+            }
+            $successorSemantic = [Management.Automation.SemanticVersion]::Parse($successorVersion)
+            if ($successorSemantic -le $sourceSemantic -or $successorSemantic.ToString() -cne $successorVersion) {
+              throw "synthetic successor version is not canonical and newer"
+            }
+
+            $versionFiles = @(
+              ".\package.json",
+              ".\version.ts",
+              ".\src-tauri\tauri.conf.json",
+              ".\src-tauri\Cargo.toml",
+              ".\src-tauri\Cargo.lock"
+            )
+            foreach ($path in $versionFiles) {
+              $text = [IO.File]::ReadAllText($path)
+              if ([regex]::Matches($text, [regex]::Escape($env:WINDOWS_VERSION)).Count -ne 1) {
+                throw "synthetic successor version replacement is ambiguous: $path"
+              }
+              [IO.File]::WriteAllText(
+                $path,
+                $text.Replace($env:WINDOWS_VERSION, $successorVersion),
+                [Text.UTF8Encoding]::new($false)
+              )
+            }
+
+            $bunZip = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline.zip"
+            $bunRoot = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline"
+            Invoke-WebRequest "https://github.com/oven-sh/bun/releases/download/bun-v1.2.21/bun-windows-x64-baseline.zip" -OutFile $bunZip
+            $expectedBunSha = "23f2df1f40d963e5b6104e1a565df992aab8968da5004f460617073843b8b8be"
+            if ((Get-FileHash -LiteralPath $bunZip -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedBunSha) {
+              throw "official baseline Bun archive SHA-256 mismatch"
+            }
+            Expand-Archive $bunZip $bunRoot -Force
+            $bunCandidates = @(Get-ChildItem $bunRoot -Recurse -File -Filter "bun.exe")
+            if ($bunCandidates.Count -ne 1) { throw "official baseline Bun archive must contain exactly one bun.exe" }
+            $baselineBun = $bunCandidates[0].FullName
+            $baselineVersion = (& $baselineBun --version).Trim()
+            if ($LASTEXITCODE -ne 0 -or $baselineVersion -cne "1.2.21") {
+              throw "official baseline Bun version is incorrect"
+            }
+
+            & $baselineBun scripts/prepare-windows-bundle.ts
+            if ($LASTEXITCODE -ne 0) { throw "synthetic successor bundle preparation failed" }
+            $artifact = Join-Path $env:RUNNER_TEMP "windows-unsigned-synthetic-successor"
+            & .\scripts\build-windows-installer.ps1 -Flavor slim -OutputDirectory $artifact
+            if ($LASTEXITCODE -ne 0) { throw "synthetic successor build failed" }
+
+            $name = "GhosterAnti_${successorVersion}_x64-setup.exe"
+            $installer = Join-Path $artifact $name
+            if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+              throw "synthetic successor installer is missing"
+            }
+            $stream = [IO.File]::OpenRead($installer)
+            try {
+              if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+                throw "synthetic successor installer must be a Windows PE file"
+              }
+            } finally {
+              $stream.Dispose()
+            }
+            if ([string](Get-AuthenticodeSignature -LiteralPath $installer).Status -cne "NotSigned") {
+              throw "synthetic successor installer must be unsigned"
+            }
+
+            $arguments = @(
+              $artifact,
+              "--role", "unsigned-synthetic-successor",
+              "--source", $env:WINDOWS_SOURCE,
+              "--version", $successorVersion,
+              "--product-key", $env:WINDOWS_PRODUCT_KEY,
+              "--file", $name
+            )
+            & bun scripts/windows-artifact-manifest.ts create @arguments
+            if ($LASTEXITCODE -ne 0) { throw "unsigned synthetic successor manifest creation failed" }
+            & bun scripts/windows-artifact-manifest.ts verify @arguments
+            if ($LASTEXITCODE -ne 0) { throw "unsigned synthetic successor manifest verification failed" }
+
+            $requiredNames = @($name, "artifact-manifest.json") | Sort-Object
+            $entries = @(Get-ChildItem -LiteralPath $artifact -Force)
+            $actualNames = @($entries | ForEach-Object Name | Sort-Object)
+            if (
+              $entries.Count -ne 2 -or
+              @($entries | Where-Object {
+                $_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+              }).Count -ne 0 -or
+              ($actualNames -join "`n") -cne ($requiredNames -join "`n")
+            ) {
+              throw "unsigned synthetic successor must contain exactly two regular files"
+            }
+          } finally {
+            Remove-Item -LiteralPath ".\artifacts\firefox" -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath ".\src-tauri\resources\firefox" -Recurse -Force -ErrorAction SilentlyContinue
+            & git checkout -- .
+            if ($LASTEXITCODE -ne 0) { throw "synthetic successor source restoration failed" }
+            $checkedOut = (& git rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $checkedOut -cne $env:WINDOWS_SOURCE) {
+              throw "synthetic successor checkout source is not exact"
+            }
+            $status = @(& git status --porcelain --untracked-files=all)
+            if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) {
+              throw "synthetic successor checkout is not exact and clean"
+            }
+          }
+      - name: Upload unsigned synthetic successor
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-unsigned-synthetic-successor
+          path: ${{ runner.temp }}/windows-unsigned-synthetic-successor
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  windows_prepare:
+    name: Windows prepared bundle inputs
+    needs: windows_cache
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-firefox-windows-x64
+          path: artifacts/firefox
+      - run: bun install --frozen-lockfile
+      - name: Prepare bundle with verified official baseline Bun
+        shell: pwsh
+        env:
+          EXPECTED_BASELINE_SHA: ${{ needs.windows_cache.outputs.baseline_bun_sha }}
+          GHOSTERANTI_FIREFOX_ARCHIVE: ${{ github.workspace }}\artifacts\firefox\aliasmode-156.0.1-beta.36-win.x86_64.zip
+          GHOSTERANTI_FIREFOX_ARCHIVE_SHA256: ${{ needs.windows_cache.outputs.firefox_archive_sha256 }}
+          GHOSTERANTI_FIREFOX_EXECUTABLE_SHA256: ${{ needs.windows_cache.outputs.firefox_executable_sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pinnedSha = "23f2df1f40d963e5b6104e1a565df992aab8968da5004f460617073843b8b8be"
+          if ($env:EXPECTED_BASELINE_SHA -ne $pinnedSha) { throw "baseline Bun provenance is inconsistent" }
+          $zip = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline.zip"
+          $root = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline"
+          Invoke-WebRequest "https://github.com/oven-sh/bun/releases/download/bun-v1.2.21/bun-windows-x64-baseline.zip" -OutFile $zip
+          $actualSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -ne $env:EXPECTED_BASELINE_SHA) { throw "official baseline Bun archive SHA-256 mismatch" }
+          Expand-Archive $zip $root -Force
+          $baselineCandidates = @(Get-ChildItem $root -Recurse -File -Filter "bun.exe")
+          if ($baselineCandidates.Count -ne 1) { throw "official baseline Bun archive must contain exactly one bun.exe" }
+          $baselineBun = $baselineCandidates[0].FullName
+          $baselineVersion = (& $baselineBun --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $baselineVersion -ne "1.2.21") { throw "official baseline Bun version is incorrect" }
+          & $baselineBun scripts/prepare-windows-bundle.ts
+          if ($LASTEXITCODE -ne 0) { throw "baseline bundle preparation failed" }
+      - name: Archive prepared bundle inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($directory in @(
+            ".\src-tauri\binaries",
+            ".\src-tauri\generated",
+            ".\src-tauri\resources"
+          )) {
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+              throw "prepared bundle directory is missing: $directory"
+            }
+          }
+          $artifact = ".\artifacts\windows-prepared"
+          New-Item -ItemType Directory -Force $artifact | Out-Null
+          $archive = Join-Path $artifact "windows-prepared.zip"
+          & tar.exe -a -cf $archive -C ".\src-tauri" binaries generated resources
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "prepared bundle archive failed"
+          }
+      - name: Create and verify prepared-input manifest
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ needs.windows_cache.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ needs.windows_cache.outputs.source }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $arguments = @(
+            ".\artifacts\windows-prepared",
+            "--role", "prepared",
+            "--source", $env:WINDOWS_SOURCE,
+            "--version", $env:WINDOWS_VERSION,
+            "--product-key", $env:WINDOWS_PRODUCT_KEY,
+            "--file", "windows-prepared.zip"
+          )
+          & bun scripts/windows-artifact-manifest.ts create @arguments
+          if ($LASTEXITCODE -ne 0) { throw "prepared-input manifest creation failed" }
+          & bun scripts/windows-artifact-manifest.ts verify @arguments
+          if ($LASTEXITCODE -ne 0) { throw "prepared-input manifest verification failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-prepared
+          path: artifacts/windows-prepared
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  windows_full:
+    name: Windows full offline package
+    needs: windows_cache
+    if: needs.windows_cache.outputs.cache_hit == 'false'
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-firefox-windows-x64
+          path: artifacts/firefox
+      - run: bun install --frozen-lockfile
+      - name: Prepare bundle with verified official baseline Bun
+        shell: pwsh
+        env:
+          EXPECTED_BASELINE_SHA: ${{ needs.windows_cache.outputs.baseline_bun_sha }}
+          GHOSTERANTI_FIREFOX_ARCHIVE: ${{ github.workspace }}\artifacts\firefox\aliasmode-156.0.1-beta.36-win.x86_64.zip
+          GHOSTERANTI_FIREFOX_ARCHIVE_SHA256: ${{ needs.windows_cache.outputs.firefox_archive_sha256 }}
+          GHOSTERANTI_FIREFOX_EXECUTABLE_SHA256: ${{ needs.windows_cache.outputs.firefox_executable_sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pinnedSha = "23f2df1f40d963e5b6104e1a565df992aab8968da5004f460617073843b8b8be"
+          if ($env:EXPECTED_BASELINE_SHA -ne $pinnedSha) { throw "baseline Bun provenance is inconsistent" }
+          $zip = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline.zip"
+          $root = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline"
+          Invoke-WebRequest "https://github.com/oven-sh/bun/releases/download/bun-v1.2.21/bun-windows-x64-baseline.zip" -OutFile $zip
+          $actualSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -ne $env:EXPECTED_BASELINE_SHA) { throw "official baseline Bun archive SHA-256 mismatch" }
+          Expand-Archive $zip $root -Force
+          $baselineCandidates = @(Get-ChildItem $root -Recurse -File -Filter "bun.exe")
+          if ($baselineCandidates.Count -ne 1) { throw "official baseline Bun archive must contain exactly one bun.exe" }
+          $baselineBun = $baselineCandidates[0].FullName
+          $baselineVersion = (& $baselineBun --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $baselineVersion -ne "1.2.21") { throw "official baseline Bun version is incorrect" }
+          & $baselineBun scripts/prepare-windows-bundle.ts
+          if ($LASTEXITCODE -ne 0) { throw "baseline bundle preparation failed" }
+      - name: Build full offline installer with zlib
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\scripts\build-windows-installer.ps1 -Flavor full -OutputDirectory ".\artifacts\windows-full"
+      - name: Create and verify full-package manifest
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ needs.windows_cache.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ needs.windows_cache.outputs.source }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $directory = ".\artifacts\windows-full"
+          $installerName = "GhosterAnti_$($env:WINDOWS_VERSION)_x64-offline-setup.exe"
+          $installer = Join-Path $directory $installerName
+          Copy-Item ".\src-tauri\generated\browser.json" (Join-Path $directory "browser.json")
+          "$((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant())  $installerName" |
+            Set-Content (Join-Path $directory "SHA256SUMS.txt") -Encoding utf8
+          $arguments = @(
+            $directory,
+            "--role", "full",
+            "--source", $env:WINDOWS_SOURCE,
+            "--version", $env:WINDOWS_VERSION,
+            "--product-key", $env:WINDOWS_PRODUCT_KEY,
+            "--file", $installerName,
+            "--file", "browser.json",
+            "--file", "SHA256SUMS.txt"
+          )
+          & bun scripts/windows-artifact-manifest.ts create @arguments
+          if ($LASTEXITCODE -ne 0) { throw "full-package manifest creation failed" }
+          & bun scripts/windows-artifact-manifest.ts verify @arguments
+          if ($LASTEXITCODE -ne 0) { throw "full-package manifest verification failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-full
+          path: artifacts/windows-full
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  windows_slim:
+    name: Windows slim updater package
+    needs: [windows_cache, windows_prepare]
+    if: needs.windows_cache.outputs.cache_hit == 'false'
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-prepared
+          path: artifacts/windows-prepared
+      - name: Verify and extract prepared inputs
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ needs.windows_cache.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ needs.windows_cache.outputs.source }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & bun scripts/windows-artifact-manifest.ts verify ".\artifacts\windows-prepared" `
+            --role prepared `
+            --source $env:WINDOWS_SOURCE `
+            --version $env:WINDOWS_VERSION `
+            --product-key $env:WINDOWS_PRODUCT_KEY `
+            --file windows-prepared.zip
+          if ($LASTEXITCODE -ne 0) { throw "prepared-input manifest verification failed" }
+          & tar.exe -xf ".\artifacts\windows-prepared\windows-prepared.zip" -C ".\src-tauri"
+          if ($LASTEXITCODE -ne 0) { throw "prepared-input extraction failed" }
+      - name: Build slim updater installer with zlib (--config src-tauri/tauri.updater.conf.json)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\scripts\build-windows-installer.ps1 -Flavor slim -OutputDirectory ".\artifacts\windows-slim"
+      - name: Create and verify slim-package manifest
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ needs.windows_cache.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ needs.windows_cache.outputs.source }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $directory = ".\artifacts\windows-slim"
+          $installerName = "GhosterAnti_$($env:WINDOWS_VERSION)_x64-setup.exe"
+          $arguments = @(
+            $directory,
+            "--role", "slim",
+            "--source", $env:WINDOWS_SOURCE,
+            "--version", $env:WINDOWS_VERSION,
+            "--product-key", $env:WINDOWS_PRODUCT_KEY,
+            "--file", $installerName
+          )
+          & bun scripts/windows-artifact-manifest.ts create @arguments
+          if ($LASTEXITCODE -ne 0) { throw "slim-package manifest creation failed" }
+          & bun scripts/windows-artifact-manifest.ts verify @arguments
+          if ($LASTEXITCODE -ne 0) { throw "slim-package manifest verification failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-slim
+          path: artifacts/windows-slim
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  windows_source:
+    name: Windows source tests and checks
+    needs: [windows_cache, windows_prepare]
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-prepared
+          path: artifacts/windows-prepared
+      - name: Verify and extract prepared inputs
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ needs.windows_cache.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ needs.windows_cache.outputs.source }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & bun scripts/windows-artifact-manifest.ts verify ".\artifacts\windows-prepared" `
+            --role prepared `
+            --source $env:WINDOWS_SOURCE `
+            --version $env:WINDOWS_VERSION `
+            --product-key $env:WINDOWS_PRODUCT_KEY `
+            --file windows-prepared.zip
+          if ($LASTEXITCODE -ne 0) { throw "prepared-input manifest verification failed" }
+          & tar.exe -xf ".\artifacts\windows-prepared\windows-prepared.zip" -C ".\src-tauri"
+          if ($LASTEXITCODE -ne 0) { throw "prepared-input extraction failed" }
+      - name: Verify owned GhosterAnti Firefox runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = Get-Content ".\src-tauri\generated\browser.json" -Raw | ConvertFrom-Json
+          if (
+            $metadata.firefox.version -cne "156.0.1-beta.36" -or
+            [string]$metadata.firefox.sha256 -notmatch '^[a-f0-9]{64}$' -or
+            [string]$metadata.firefox.archiveSha256 -notmatch '^[a-f0-9]{64}$' -or
+            [string]::IsNullOrWhiteSpace([string]$metadata.firefox.executable)
+          ) {
+            throw "GhosterAnti Firefox metadata is invalid"
+          }
+          $firefox = Resolve-Path (Join-Path ".\src-tauri\resources\firefox" $metadata.firefox.executable)
+          $actualSha = (Get-FileHash -LiteralPath $firefox -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -cne $metadata.firefox.sha256) {
+            throw "packaged GhosterAnti Firefox SHA-256 mismatch"
+          }
+          $stdoutPath = Join-Path $env:RUNNER_TEMP "firefox-version-stdout.txt"
+          $stderrPath = Join-Path $env:RUNNER_TEMP "firefox-version-stderr.txt"
+          $process = Start-Process -FilePath $firefox.Path -ArgumentList "--version" -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+          $version = [IO.File]::ReadAllText($stdoutPath)
+          if ($process.ExitCode -ne 0 -or $version -notmatch '156\.0\.1') {
+            Write-Host "Firefox version probe exited $($process.ExitCode): $version"
+            Write-Host ([IO.File]::ReadAllText($stderrPath))
+            throw "owned GhosterAnti Firefox did not report Firefox 156.0.1"
+          }
+      - name: Prove packaged Firefox Launcher persistence and portable handoff
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = Get-Content ".\src-tauri\generated\browser.json" -Raw | ConvertFrom-Json
+          $browser = Resolve-Path (Join-Path ".\src-tauri\resources\firefox" $metadata.firefox.executable)
+          $env:GHOSTERANTI_PLAYWRIGHT_RUNTIME = (Resolve-Path ".\src-tauri\resources\playwright").Path
+          $proof = Join-Path $env:RUNNER_TEMP "firefox-launcher-packaged-$([guid]::NewGuid().ToString('N'))"
+          bun scripts/firefox-launcher-acceptance.ts $browser $proof $metadata.firefox.sha256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - run: bun run rust:test
+      - name: Smoke-test compiled sidecar CDP runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $smoke = Join-Path $env:RUNNER_TEMP "ghosteranti-sidecar-smoke"
+          New-Item -ItemType Directory -Force $smoke | Out-Null
+          Copy-Item ".\src-tauri\binaries\ghosteranti-sidecar-x86_64-pc-windows-msvc.exe" "$smoke\ghosteranti-sidecar.exe"
+          $env:GHOSTERANTI_PLAYWRIGHT_RUNTIME = (Resolve-Path ".\src-tauri\resources\playwright").Path
+          $env:GHOSTERANTI_SESSION_LAUNCH = "0"
+          foreach ($name in @("CLOAKBROWSER_BINARY_PATH", "CLOAKBROWSER_BINARY_SHA256")) {
+            [Environment]::SetEnvironmentVariable($name, $null, "Process")
+          }
+          # No CloakBrowser is bundled: the first Cloud profile downloads the pinned build on first use.
+          Push-Location $smoke
+          try {
+            & ".\ghosteranti-sidecar.exe" __cloud-launcher-smoke --headless --state-root "$smoke\cloud-state"
+            if ($LASTEXITCODE -ne 0) { throw "Cloud launcher smoke exited with code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+          $browserPath = Get-Item -LiteralPath "$smoke\cloud-state\runtimes\cloakbrowser-146.0.7680.177.5\chrome.exe"
+          $browserSha256 = (Get-FileHash -LiteralPath $browserPath.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($browserSha256 -cne "03f53661a5c47e7b0a661bee2bce8a0d302b7a60834c328df417561fa0636d80") {
+            throw "downloaded CloakBrowser does not match its pin"
+          }
+          if (@(Get-ChildItem -LiteralPath "$smoke\cloud-state\runtimes" -Force | Where-Object Name -Like ".*").Count -ne 0) {
+            throw "CloakBrowser download left a partial or temporary file"
+          }
+          $browser = Start-Process -PassThru $browserPath.FullName -ArgumentList @(
+            "--headless=new",
+            "--disable-gpu",
+            "--no-first-run",
+            "--remote-debugging-port=9222",
+            "--user-data-dir=$smoke\browser-profile"
+          )
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              try {
+                Invoke-RestMethod "http://127.0.0.1:9222/json/version" | Out-Null
+                $ready = $true
+                break
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if (-not $ready) { throw "CloakBrowser CDP endpoint did not become ready" }
+            Push-Location $smoke
+            try {
+              & ".\ghosteranti-sidecar.exe" __sidecar-smoke --cdp-endpoint "http://127.0.0.1:9222" --state-root "$smoke\state"
+              if ($LASTEXITCODE -ne 0) { throw "compiled sidecar smoke exited with code $LASTEXITCODE" }
+            } finally {
+              Pop-Location
+            }
+          } finally {
+            if (-not $browser.HasExited) {
+              Stop-Process -Id $browser.Id -Force
+              Wait-Process -Id $browser.Id -ErrorAction SilentlyContinue
+            }
+          }
+          # Later runs reuse that download instead of fetching it again.
+          $env:CLOAKBROWSER_BINARY_PATH = $browserPath.FullName
+          $env:CLOAKBROWSER_BINARY_SHA256 = $browserSha256
+          Push-Location $smoke
+          try {
+            & ".\ghosteranti-sidecar.exe" __cloud-launcher-smoke --proxy-mismatch --headless --state-root "$smoke\proxy-mismatch-state"
+            if ($LASTEXITCODE -ne 0) { throw "deterministic proxy mismatch smoke exited with code $LASTEXITCODE" }
+            # A Cloud V3 payload must download and open the Chromium 155 beta, not CloakBrowser.
+            & ".\ghosteranti-sidecar.exe" __cloud-launcher-smoke --chromium-runtime ghosteranti --headless --state-root "$smoke\cloud-beta-state"
+            if ($LASTEXITCODE -ne 0) { throw "Cloud Chromium 155 beta smoke exited with code $LASTEXITCODE" }
+            if (-not (Test-Path -LiteralPath "$smoke\cloud-beta-state\runtimes\chromium-155.0.8059.85-aliasmode.2\155.0.8059.85.manifest" -PathType Leaf)) {
+              throw "Cloud Chromium 155 beta smoke did not install the beta runtime"
+            }
+          } finally {
+            Pop-Location
+          }
+      - name: Smoke-test authenticated Cloud proxies
+        if: github.repository != 'GhosterAI/GhosterAnti'
+        shell: pwsh
+        env:
+          GHOSTERANTI_LIVE_PROXY_HOST: ${{ secrets.GHOSTERANTI_LIVE_PROXY_HOST }}
+          GHOSTERANTI_LIVE_PROXY_PORT: ${{ secrets.GHOSTERANTI_LIVE_PROXY_PORT }}
+          GHOSTERANTI_LIVE_PROXY_USER: ${{ secrets.GHOSTERANTI_LIVE_PROXY_USER }}
+          GHOSTERANTI_LIVE_PROXY_PASS: ${{ secrets.GHOSTERANTI_LIVE_PROXY_PASS }}
+          GHOSTERANTI_LIVE_PROXY_IP: ${{ secrets.GHOSTERANTI_LIVE_PROXY_IP }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:GHOSTERANTI_LIVE_PROXY_HOST)) {
+            Write-Host "Authenticated Cloud proxy smoke skipped: no temporary test proxy configured"
+            exit 0
+          }
+          $runtimes = Join-Path $env:RUNNER_TEMP "ghosteranti-live-runtimes"
+          $browserPath = (& bun -e "import { ensureCloakBrowser } from './ghosteranti-chromium.ts'; console.log(await ensureCloakBrowser(process.argv[1]))" $runtimes | Select-Object -Last 1)
+          if ($LASTEXITCODE -ne 0) { throw "CloakBrowser download failed" }
+          $env:GHOSTERANTI_PLAYWRIGHT_RUNTIME = (Resolve-Path ".\src-tauri\resources\playwright").Path
+          $env:GHOSTERANTI_LIVE_BROWSER = $browserPath
+          $env:GHOSTERANTI_LIVE_BROWSER_SHA256 = "03f53661a5c47e7b0a661bee2bce8a0d302b7a60834c328df417561fa0636d80"
+          $env:GHOSTERANTI_LIVE_HEADFUL = "1"
+          bun test --silent proxy-live.test.ts -t "real Cloud lifecycle"
+          if ($LASTEXITCODE -ne 0) { throw "authenticated Cloud proxy smoke exited with code $LASTEXITCODE" }
+
+  windows_candidate:
+    name: Windows candidate assembly
+    needs: [windows_cache, windows_full, windows_slim]
+    if: >-
+      ${{
+        always() &&
+        needs.windows_cache.result == 'success' &&
+        needs.windows_cache.outputs.cache_hit == 'false' &&
+        needs.windows_full.result == 'success' &&
+        needs.windows_slim.result == 'success'
+      }}
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-full
+          path: artifacts/windows-full
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-slim
+          path: artifacts/windows-slim
+      - name: Verify package manifests and assemble candidate
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ needs.windows_cache.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ needs.windows_cache.outputs.source }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $fullName = "GhosterAnti_$($env:WINDOWS_VERSION)_x64-offline-setup.exe"
+          $slimName = "GhosterAnti_$($env:WINDOWS_VERSION)_x64-setup.exe"
+          & bun scripts/windows-artifact-manifest.ts verify ".\artifacts\windows-full" `
+            --role full `
+            --source $env:WINDOWS_SOURCE `
+            --version $env:WINDOWS_VERSION `
+            --product-key $env:WINDOWS_PRODUCT_KEY `
+            --file $fullName `
+            --file browser.json `
+            --file SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { throw "full-package manifest verification failed" }
+          & bun scripts/windows-artifact-manifest.ts verify ".\artifacts\windows-slim" `
+            --role slim `
+            --source $env:WINDOWS_SOURCE `
+            --version $env:WINDOWS_VERSION `
+            --product-key $env:WINDOWS_PRODUCT_KEY `
+            --file $slimName
+          if ($LASTEXITCODE -ne 0) { throw "slim-package manifest verification failed" }
+
+          $candidate = ".\artifacts\windows-candidate"
+          New-Item -ItemType Directory -Force $candidate | Out-Null
+          $fullInstaller = Join-Path $candidate $fullName
+          $slimInstaller = Join-Path $candidate $slimName
+          Copy-Item (Join-Path ".\artifacts\windows-full" $fullName) $fullInstaller
+          Copy-Item (Join-Path ".\artifacts\windows-slim" $slimName) $slimInstaller
+          Copy-Item ".\artifacts\windows-full\browser.json" (Join-Path $candidate "browser.json")
+
+          foreach ($installer in @($fullInstaller, $slimInstaller)) {
+            $stream = [IO.File]::OpenRead($installer)
+            try {
+              if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+                throw "candidate installer must be a Windows PE file"
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          }
+          $fullSize = (Get-Item -LiteralPath $fullInstaller).Length
+          $slimSize = (Get-Item -LiteralPath $slimInstaller).Length
+          $sizeDelta = $fullSize - $slimSize
+          if ($sizeDelta -lt 100MB) { throw "full installer must exceed updater installer by at least 100 MiB" }
+          [ordered]@{
+            full = [ordered]@{ name = $fullName; bytes = $fullSize }
+            slim = [ordered]@{ name = $slimName; bytes = $slimSize }
+            deltaBytes = $sizeDelta
+          } | ConvertTo-Json | Set-Content (Join-Path $candidate "size-report.json") -Encoding utf8
+          @($fullInstaller, $slimInstaller) |
+            ForEach-Object { "$((Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant())  $(Split-Path $_ -Leaf)" } |
+            Set-Content (Join-Path $candidate "SHA256SUMS.txt") -Encoding utf8
+
+          # The installer carries no CloakBrowser; the app downloads it on first use.
+          $metadata = Get-Content (Join-Path $candidate "browser.json") -Raw | ConvertFrom-Json
+          if ($null -ne $metadata.executable -or [string]$metadata.firefox.sha256 -notmatch '^[a-f0-9]{64}$') {
+            throw "candidate browser metadata is invalid"
+          }
+          $requiredNames = @($fullName, $slimName, "browser.json", "SHA256SUMS.txt", "size-report.json") | Sort-Object
+          $entries = @(Get-ChildItem -LiteralPath $candidate -Force)
+          $actualNames = @($entries | ForEach-Object Name | Sort-Object)
+          if ($entries.Count -ne 5 -or @($entries | Where-Object {
+            $_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+          }).Count -ne 0 -or ($actualNames -join "`n") -cne ($requiredNames -join "`n")) {
+            throw "candidate must contain exactly the five required regular files"
+          }
+
+          $arguments = @(
+            $candidate,
+            "--role", "candidate",
+            "--source", $env:WINDOWS_SOURCE,
+            "--version", $env:WINDOWS_VERSION,
+            "--product-key", $env:WINDOWS_PRODUCT_KEY
+          )
+          foreach ($name in $requiredNames) { $arguments += @("--file", $name) }
+          & bun scripts/windows-artifact-manifest.ts create @arguments
+          if ($LASTEXITCODE -ne 0) { throw "candidate manifest creation failed" }
+          & bun scripts/windows-artifact-manifest.ts verify @arguments
+          if ($LASTEXITCODE -ne 0) { throw "candidate manifest verification failed" }
+      - name: Upload assembled Windows candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-candidate
+          path: artifacts/windows-candidate
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  windows_accept_runtime:
+    name: Windows installed ${{ matrix.shard }} acceptance
+    needs: [windows_cache, windows_full]
+    if: >-
+      ${{
+        always() &&
+        needs.windows_cache.result == 'success' &&
+        (
+          needs.windows_cache.outputs.cache_hit == 'true' ||
+          (needs.windows_cache.outputs.cache_hit == 'false' && needs.windows_full.result == 'success')
+        )
+      }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [runtime-protocol, runtime-ownership, runtime-desktop]
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - if: needs.windows_cache.outputs.cache_hit == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-candidate
+          path: package
+      - if: needs.windows_cache.outputs.cache_hit == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-full
+          path: package
+      - name: Run installed ${{ matrix.shard }} acceptance
+        shell: pwsh
+        env:
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\scripts\windows-installed-acceptance.ps1 `
+            -Shard ${{ matrix.shard }} `
+            -InstallerPath ".\package\GhosterAnti_$($env:WINDOWS_VERSION)_x64-offline-setup.exe" `
+            -ChecksumsPath ".\package\SHA256SUMS.txt" `
+            -BrowserMetadataPath ".\package\browser.json" `
+            -DiagnosticsPath ".\diagnostics\${{ matrix.shard }}.json"
+      - name: Upload ${{ matrix.shard }} acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-${{ matrix.shard }}-diagnostics-${{ github.run_attempt }}
+          path: diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+  windows_accept_browser:
+    name: Windows installed browser acceptance
+    needs: [windows_cache, windows_full]
+    if: >-
+      ${{
+        always() &&
+        needs.windows_cache.result == 'success' &&
+        (
+          needs.windows_cache.outputs.cache_hit == 'true' ||
+          (needs.windows_cache.outputs.cache_hit == 'false' && needs.windows_full.result == 'success')
+        )
+      }}
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - if: needs.windows_cache.outputs.cache_hit == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-candidate
+          path: package
+      - if: needs.windows_cache.outputs.cache_hit == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-full
+          path: package
+      - name: Run installed browser acceptance
+        shell: pwsh
+        env:
+          GHOSTERANTI_LIVE_PROXY_HOST: ${{ secrets.GHOSTERANTI_LIVE_PROXY_HOST }}
+          GHOSTERANTI_LIVE_PROXY_PORT: ${{ secrets.GHOSTERANTI_LIVE_PROXY_PORT }}
+          GHOSTERANTI_LIVE_PROXY_USER: ${{ secrets.GHOSTERANTI_LIVE_PROXY_USER }}
+          GHOSTERANTI_LIVE_PROXY_PASS: ${{ secrets.GHOSTERANTI_LIVE_PROXY_PASS }}
+          GHOSTERANTI_LIVE_PROXY_IP: ${{ secrets.GHOSTERANTI_LIVE_PROXY_IP }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\scripts\windows-installed-acceptance.ps1 `
+            -Shard browser `
+            -InstallerPath ".\package\GhosterAnti_$($env:WINDOWS_VERSION)_x64-offline-setup.exe" `
+            -ChecksumsPath ".\package\SHA256SUMS.txt" `
+            -BrowserMetadataPath ".\package\browser.json" `
+            -DiagnosticsPath ".\diagnostics\browser.json"
+      - name: Upload browser acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-browser-diagnostics-${{ github.run_attempt }}
+          path: diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+  windows_accept_cloud:
+    name: Windows installed Cloud acceptance
+    needs: [windows_cache, windows_full]
+    if: >-
+      ${{
+        always() &&
+        needs.windows_cache.result == 'success' &&
+        (
+          needs.windows_cache.outputs.cache_hit == 'true' ||
+          (needs.windows_cache.outputs.cache_hit == 'false' && needs.windows_full.result == 'success')
+        )
+      }}
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - if: needs.windows_cache.outputs.cache_hit == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-candidate
+          path: package
+      - if: needs.windows_cache.outputs.cache_hit == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-full
+          path: package
+      - name: Run installed Cloud acceptance
+        shell: pwsh
+        env:
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\scripts\windows-installed-acceptance.ps1 `
+            -Shard cloud `
+            -InstallerPath ".\package\GhosterAnti_$($env:WINDOWS_VERSION)_x64-offline-setup.exe" `
+            -ChecksumsPath ".\package\SHA256SUMS.txt" `
+            -BrowserMetadataPath ".\package\browser.json" `
+            -DiagnosticsPath ".\diagnostics\cloud.json"
+      - name: Upload Cloud acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghosteranti-windows-cloud-diagnostics-${{ github.run_attempt }}
+          path: diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+  windows_cache_save:
+    name: Save accepted Windows candidate cache
+    needs:
+      - windows_cache
+      - windows_source
+      - windows_candidate
+      - windows_accept_runtime
+      - windows_accept_browser
+      - windows_accept_cloud
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        needs.windows_cache.result == 'success' &&
+        needs.windows_cache.outputs.cache_hit == 'false' &&
+        needs.windows_source.result == 'success' &&
+        needs.windows_candidate.result == 'success' &&
+        needs.windows_accept_runtime.result == 'success' &&
+        needs.windows_accept_browser.result == 'success' &&
+        needs.windows_accept_cloud.result == 'success'
+      }}
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghosteranti-windows-candidate
+          path: artifacts/windows-candidate
+      - name: Verify accepted candidate before caching
+        shell: pwsh
+        env:
+          WINDOWS_PRODUCT_KEY: ${{ needs.windows_cache.outputs.product_key }}
+          WINDOWS_SOURCE: ${{ needs.windows_cache.outputs.source }}
+          WINDOWS_VERSION: ${{ needs.windows_cache.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $fullName = "GhosterAnti_$($env:WINDOWS_VERSION)_x64-offline-setup.exe"
+          $slimName = "GhosterAnti_$($env:WINDOWS_VERSION)_x64-setup.exe"
+          $arguments = @(
+            ".\artifacts\windows-candidate",
+            "--role", "candidate",
+            "--source", $env:WINDOWS_SOURCE,
+            "--version", $env:WINDOWS_VERSION,
+            "--product-key", $env:WINDOWS_PRODUCT_KEY,
+            "--file", $fullName,
+            "--file", $slimName,
+            "--file", "browser.json",
+            "--file", "SHA256SUMS.txt",
+            "--file", "size-report.json"
+          )
+          & bun scripts/windows-artifact-manifest.ts verify @arguments
+          if ($LASTEXITCODE -ne 0) { throw "accepted candidate manifest verification failed" }
+      - name: Save exact Windows candidate cache
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts/windows-candidate
+          key: ghosteranti-windows-candidate-v2-${{ needs.windows_cache.outputs.product_key }}
+
+  windows:
+    name: Windows NSIS installer
+    needs:
+      - windows_firefox
+      - windows_cache
+      - windows_synthetic_successor
+      - windows_prepare
+      - windows_full
+      - windows_slim
+      - windows_source
+      - windows_candidate
+      - windows_accept_runtime
+      - windows_accept_browser
+      - windows_accept_cloud
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce Windows DAG result
+        env:
+          WINDOWS_PIPELINE: ${{ github.event_name == 'workflow_dispatch' || inputs.client_ci_reusable_call == true }}
+          FIREFOX_RESULT: ${{ needs.windows_firefox.result }}
+          CACHE_HIT: ${{ needs.windows_cache.outputs.cache_hit }}
+          CACHE_RESULT: ${{ needs.windows_cache.result }}
+          SUCCESSOR_RESULT: ${{ needs.windows_synthetic_successor.result }}
+          PREPARE_RESULT: ${{ needs.windows_prepare.result }}
+          FULL_RESULT: ${{ needs.windows_full.result }}
+          SLIM_RESULT: ${{ needs.windows_slim.result }}
+          SOURCE_RESULT: ${{ needs.windows_source.result }}
+          CANDIDATE_RESULT: ${{ needs.windows_candidate.result }}
+          RUNTIME_RESULT: ${{ needs.windows_accept_runtime.result }}
+          BROWSER_RESULT: ${{ needs.windows_accept_browser.result }}
+          CLOUD_RESULT: ${{ needs.windows_accept_cloud.result }}
+        run: |
+          set -euo pipefail
+          require_result() {
+            local job="$1"
+            local actual="$2"
+            local expected="$3"
+            if [[ "$actual" != "$expected" ]]; then
+              printf '%s result was %s; expected %s\n' "$job" "$actual" "$expected" >&2
+              exit 1
+            fi
+          }
+
+          if [[ "$WINDOWS_PIPELINE" != "true" ]]; then
+            # A push or pull request: no Windows job may have run.
+            for result in "$FIREFOX_RESULT" "$CACHE_RESULT" "$SUCCESSOR_RESULT" "$PREPARE_RESULT" "$FULL_RESULT" "$SLIM_RESULT" "$SOURCE_RESULT" "$CANDIDATE_RESULT" "$RUNTIME_RESULT" "$BROWSER_RESULT" "$CLOUD_RESULT"; do
+              require_result "Windows pipeline job" "$result" skipped
+            done
+            echo "The Windows pipeline runs only on a manual dispatch. Run Client CI on main before a release."
+            exit 0
+          fi
+
+          require_result windows_firefox "$FIREFOX_RESULT" success
+          require_result windows_cache "$CACHE_RESULT" success
+          require_result windows_synthetic_successor "$SUCCESSOR_RESULT" success
+          require_result windows_prepare "$PREPARE_RESULT" success
+          require_result windows_source "$SOURCE_RESULT" success
+          require_result windows_accept_runtime "$RUNTIME_RESULT" success
+          require_result windows_accept_browser "$BROWSER_RESULT" success
+          require_result windows_accept_cloud "$CLOUD_RESULT" success
+
+          case "$CACHE_HIT" in
+            true)
+              require_result windows_full "$FULL_RESULT" skipped
+              require_result windows_slim "$SLIM_RESULT" skipped
+              require_result windows_candidate "$CANDIDATE_RESULT" skipped
+              ;;
+            false)
+              require_result windows_full "$FULL_RESULT" success
+              require_result windows_slim "$SLIM_RESULT" success
+              require_result windows_candidate "$CANDIDATE_RESULT" success
+              ;;
+            *)
+              printf 'windows_cache returned invalid cache_hit value: %s\n' "$CACHE_HIT" >&2
+              exit 1
+              ;;
+          esac
