@@ -107,13 +107,22 @@ jobs:
           if (-not $installer) { throw "installer was not produced" }
           $signature = "$($installer.FullName).sig"
           if (-not (Test-Path $signature)) { throw "installer signature was not produced" }
-          $manifest = Get-ChildItem "src-tauri/target/release/bundle" -Filter "latest*.json" -Recurse | Select-Object -First 1
-          if (-not $manifest) { throw "updater manifest was not produced" }
-          Copy-Item $manifest.FullName (Join-Path $bundle "latest-v2.json") -Force
           New-Item -ItemType Directory -Force release-assets | Out-Null
           Copy-Item $installer.FullName release-assets/
           Copy-Item $signature release-assets/
-          Copy-Item (Join-Path $bundle "latest-v2.json") release-assets/
+
+          $tag = "v$env:VERSION"
+          $manifest = [ordered]@{
+            version = $env:VERSION
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content $signature -Raw).Trim()
+                url = "https://github.com/GhosterAI/GhosterAnti/releases/download/$tag/$($installer.Name)"
+              }
+            }
+          }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) "release-assets/latest-v2.json"), ($manifest | ConvertTo-Json -Depth 5))
           Get-ChildItem release-assets | Select-Object Name, Length
 
       - name: Publish the release
