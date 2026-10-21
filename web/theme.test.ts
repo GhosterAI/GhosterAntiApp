@@ -10,7 +10,10 @@ test("theme cookie survives loopback port changes and wins over local storage", 
 test("theme selection falls back safely when the cookie is absent or invalid", () => {
   expect(readThemeChoice("", "dark")).toBe("dark");
   expect(readThemeChoice("ghosteranti.shell.theme=invalid", "system")).toBe("system");
-  expect(readThemeChoice("ghosteranti.shell.theme=invalid", "invalid")).toBe("light");
+  // Dark-first: a first launch or a corrupt cookie opens the palette the shell
+  // is designed around, never the light fallback.
+  expect(readThemeChoice("ghosteranti.shell.theme=invalid", "invalid")).toBe("dark");
+  expect(readThemeChoice("", null)).toBe("dark");
 });
 
 test("theme cookie is host-only, persistent, and valid on the loopback HTTP origin", () => {

@@ -7,14 +7,14 @@
 >
   <path
     d="M128 400V240C128 169 185 112 256 112C327 112 384 169 384 240V400L352 368L320 400L288 368L256 400L224 368L192 400L160 368Z"
-    stroke="#111827"
+    stroke="currentColor"
     stroke-width="64"
     stroke-linecap="round"
     stroke-linejoin="round"
   />
   <path
     d="M216 256V288M296 256V288"
-    stroke="#2457D6"
+    stroke="currentColor"
     stroke-width="64"
     stroke-linecap="round"
     stroke-linejoin="round"

@@ -758,21 +758,17 @@ export async function handleUiRequest(
     if (rejected) return rejected;
     try {
       const body = await req.json() as { mode?: unknown };
-      if (body.mode !== "local" && body.mode !== "cloud") {
-        return Response.json({ ok: false, error: "mode must be local or cloud" }, { status: 400 });
-      }
-      const cloudUrl = options.defaultCloudUrl;
-      if (body.mode === "cloud" && !cloudUrl) {
+      if (body.mode === "cloud") {
         return Response.json(
-          { ok: false, error: "GhosterAnti Cloud is not configured in this build" },
-          { status: 503 },
+          { ok: false, error: "Cloud mode is discontinued. Only Local mode is supported." },
+          { status: 400 },
         );
       }
-      const config = options.appConfig.setMode(body.mode, cloudUrl);
+      const config = options.appConfig.setMode("local");
       return Response.json({
         ok: true,
         config,
-        restartRequired: options.runtimeMode ? config.mode !== options.runtimeMode : true,
+        restartRequired: options.runtimeMode ? config.mode !== options.runtimeMode : false,
       });
     } catch (error) {
       return Response.json({ ok: false, error: msg(error) }, { status: 400 });

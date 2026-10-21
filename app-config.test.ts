@@ -5,52 +5,43 @@ import { join } from "node:path";
 import { AppConfigStore, legacyHubUrl, parseAppConfig } from "./app-config.ts";
 
 describe("GhosterAnti app config", () => {
-  test("fresh installs remain unconfigured with Local analytics disabled", () => {
+  test("fresh installs default to Local mode with Local analytics disabled", () => {
     const root = mkdtempSync(join(tmpdir(), "ghosteranti-config-"));
     expect(new AppConfigStore(join(root, "config.json")).read()).toEqual({
       version: 1,
-      mode: "unconfigured",
+      mode: "local",
       localAnalytics: false,
     });
   });
 
-  test("Cloud mode requires HTTPS except for loopback development", () => {
-    expect(() => parseAppConfig({ version: 1, mode: "cloud", cloudUrl: "http://example.com", localAnalytics: false }))
-      .toThrow("Cloud URL must use HTTPS");
-    expect(parseAppConfig({ version: 1, mode: "cloud", cloudUrl: "http://127.0.0.1:54321", localAnalytics: false }).cloudUrl)
-      .toBe("http://127.0.0.1:54321");
+  test("config parsing always enforces local mode", () => {
+    expect(parseAppConfig({ version: 1, mode: "cloud", cloudUrl: "http://example.com", localAnalytics: false })).toEqual({
+      version: 1,
+      mode: "local",
+      localAnalytics: false,
+    });
   });
 
   test("writes normalized config atomically", () => {
     const root = mkdtempSync(join(tmpdir(), "ghosteranti-config-"));
     const path = join(root, "config.json");
     const store = new AppConfigStore(path);
-    expect(store.setMode("cloud", "https://cloud.ghosteranti.test/")).toEqual({
+    expect(store.setMode("local")).toEqual({
       version: 1,
-      mode: "cloud",
-      cloudUrl: "https://cloud.ghosteranti.test",
+      mode: "local",
       localAnalytics: false,
     });
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(store.read());
   });
 
-  test("switching to Local removes the Cloud endpoint", () => {
+  test("switching mode always maintains Local mode", () => {
     const root = mkdtempSync(join(tmpdir(), "ghosteranti-config-"));
     const store = new AppConfigStore(join(root, "config.json"));
-    store.setMode("cloud", "https://cloud.ghosteranti.test");
     expect(store.setMode("local")).toEqual({ version: 1, mode: "local", localAnalytics: false });
   });
 
-  test("legacy HUB_URL never handles an explicit Local or Cloud selection", () => {
+  test("legacy HUB_URL is disabled in local mode", () => {
     const env = { HUB_URL: "https://legacy-hub.example" };
-    expect(legacyHubUrl({ version: 1, mode: "unconfigured", localAnalytics: false }, env))
-      .toBe("https://legacy-hub.example");
     expect(legacyHubUrl({ version: 1, mode: "local", localAnalytics: false }, env)).toBeUndefined();
-    expect(legacyHubUrl({
-      version: 1,
-      mode: "cloud",
-      cloudUrl: "https://cloud.ghosteranti.test",
-      localAnalytics: false,
-    }, env)).toBeUndefined();
   });
 });

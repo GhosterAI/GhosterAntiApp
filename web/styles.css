@@ -41,89 +41,88 @@
 :root {
   color-scheme: light;
 
-  /* Surfaces. The app sits on a warm stone canvas and floats pure-white cards
-     on top of it — warm neutrals keep long sessions easier on the eye than the
-     blue-grey greys most dashboards default to. */
-  --bg: #ecebe7;
+  /* Monochrome palette, after Donut Mono. Light is the neutral counterpart of
+     the dark block below: white cards on a light grey canvas, near-black ink,
+     black as the only accent. Nothing in the chrome carries a hue — the three
+     status colours are the whole exception — so data reads first and the
+     interface stays one material. */
+  --bg: #f4f4f4;
   --surface: #ffffff;
-  --surface-sunken: #f8f7f5;
-  --surface-hover: #f3f2ef;
-  --surface-active: #e9e7e2;
+  --surface-sunken: #fafafa;
+  --surface-hover: #f0f0f0;
+  --surface-active: #e6e6e6;
 
-  /* Ink, from headings down to placeholder text. Warm near-black, not navy. */
-  --ink: #1b1a18;
-  --ink-soft: #45423d;
-  --muted: #76736d;
-  --faint: #a5a19a;
+  --ink: #0a0a0a;
+  --ink-soft: #3f3f3f;
+  --muted: #737373;
+  --faint: #9a9a9a;
 
   /* Hairlines. --line separates regions, --line-soft separates list rows. */
-  --line: #e6e3dd;
-  --line-soft: #f0efeb;
-  --line-strong: #d3cfc7;
+  --line: #e5e5e5;
+  --line-soft: #ededed;
+  --line-strong: #cfcfcf;
 
-  /* GhosterAnti brand blue — the exact accent the live beta42 dashboard ships
-     (#3366e6 with its #eef3ff wash, #c5d6fb line and #284a9e ink), so the
-     redesign keeps the colour operators already know. One accent drives every
-     primary action, link and selected state. */
-  --accent: #3366e6;
-  --accent-hover: #2a58cf;
-  --accent-press: #2349ad;
-  --accent-soft: #eef3ff;
-  --accent-soft-hover: #dfe9fd;
-  --accent-line: #c5d6fb;
-  --accent-ink: #284a9e;
-  /* Filled-control blue: the flat #3366e6 the live build paints, shared by
-     BOTH themes so the brand colour never shifts between light and dark. */
-  --accent-fill: #3366e6;
-  --accent-fill-hover: #2a58cf;
-  --accent-fill-press: #2349ad;
+  /* One accent: black in light, white in dark. Primary actions are a solid
+     fill, and every selected/active state is a quiet step of the same neutral,
+     which is how a monochrome UI points without tinting. */
+  --accent: #0a0a0a;
+  --accent-hover: #262626;
+  --accent-press: #000000;
+  --accent-soft: #f2f2f2;
+  --accent-soft-hover: #e8e8e8;
+  --accent-line: #dcdcdc;
+  --accent-ink: #0a0a0a;
+  --accent-fill: #0a0a0a;
+  --accent-fill-hover: #262626;
+  --accent-fill-press: #000000;
   --on-fill: #ffffff;
-  /* Soft colored halo under filled accent controls — quiet at rest, a touch
-     stronger on hover. This is the only decorative shadow in the system. */
-  --glow: 0 4px 14px rgba(51, 102, 230, .22);
-  --glow-strong: 0 6px 18px rgba(51, 102, 230, .32);
+  --on-fill-muted: rgba(255, 255, 255, .72);
+  /* A monochrome control earns emphasis from contrast, not from a coloured
+     halo: the only shadow left under a filled button is black. */
+  --glow: 0 1px 2px rgba(0, 0, 0, .16);
+  --glow-strong: 0 2px 6px rgba(0, 0, 0, .22);
 
-  /* The brand's companion accent (--peach on the site). It is not decoration:
-     blue marks things you can DO (buttons, links, active tabs) and peach marks
-     IDENTITY — who this workspace belongs to and which numbers the operator
-     chose. That split means a second colour adds meaning instead of noise. */
-  --accent-2: #ff9e7a;
-  --accent-2-hover: #f8875d;
-  --accent-2-soft: #ffeee6;
-  --accent-2-line: #ffd5c2;
-  --accent-2-ink: #a4451f;
+  /* The second accent is gone with the brand hue. The aliases stay so the few
+     identity marks (custom NO., avatars) resolve to the accent instead of a
+     leftover orange. */
+  --accent-2: var(--accent);
+  --accent-2-hover: var(--accent-hover);
+  --accent-2-soft: var(--accent-soft);
+  --accent-2-line: var(--accent-line);
+  --accent-2-ink: var(--accent-ink);
 
-  --success: #12a150;
-  --success-soft: #eefaf2;
-  --success-line: #bde9cf;
-  --success-ink: #0d7a3d;
+  --success: #16a34a;
+  --success-soft: #f0faf3;
+  --success-line: #c2e9cf;
+  --success-ink: #14743a;
 
-  --danger: #dc3b32;
-  --danger-hover: #bd2a22;
-  /* Filled-control red, theme-stable for the same reason as --accent-fill. */
-  --danger-fill: #dc3b32;
-  --danger-fill-hover: #bd2a22;
+  --danger: #d93a30;
+  --danger-hover: #b92c24;
+  --danger-fill: #d93a30;
+  --danger-fill-hover: #b92c24;
   --danger-soft: #fdf3f2;
-  --danger-line: #f7cbc7;
-  --danger-ink: #b32620;
+  --danger-line: #f4cdc9;
+  --danger-ink: #ab2a22;
   --danger-lift: #e5544b;
 
-  --warn: #d98324;
+  --warn: #c9861f;
   --warn-soft: #fdf7ec;
-  --warn-line: #f2ddb5;
-  --warn-ink: #a3611a;
+  --warn-line: #efdcb6;
+  --warn-ink: #8a5a14;
 
-  --r-xs: 6px;
-  --r-sm: 8px;
-  --r-md: 10px;
-  --r-lg: 14px;
-  --r-xl: 18px;
+  /* Tighter radii than the previous build: 10px on cards and dialogs, 8px on
+     controls, 6px on the small stuff — the Donut scale. */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 10px;
+  --r-xl: 12px;
   --r-pill: 999px;
 
-  /* Raised-control fill. On light this is a near-white gradient; the dark theme
-     swaps it for a lifted grey, which is how dark UIs express elevation. */
-  --ctl: linear-gradient(180deg, #ffffff, #fbfaf8);
-  --ctl-hover: linear-gradient(180deg, #fbfaf8, #f2f1ee);
+  /* Flat fills. A monochrome surface expresses elevation with one hairline and
+     a small step in lightness instead of a gradient. */
+  --ctl: #ffffff;
+  --ctl-hover: #f5f5f5;
   --ctl-border: var(--line);
   /* Everything painted on top of a filled surface: button labels, chip counts
      inside an active nav item. Flips to the dark surface in dark mode. */
@@ -132,31 +131,31 @@
 
   /* Shadow ink. Dark themes get almost nothing from drop shadows, so the dark
      block dials these down and leans on borders and --raised instead. */
-  --shadow-rgb: 27, 26, 24;
-  --shadow-a1: 0.04;
-  --shadow-a2: 0.07;
-  --shadow-a3: 0.13;
-  --shadow-a4: 0.22;
+  --shadow-rgb: 0, 0, 0;
+  --shadow-a1: 0.05;
+  --shadow-a2: 0.08;
+  --shadow-a3: 0.12;
+  --shadow-a4: 0.18;
 
   /* Control shadow: a 1px hairline plus a soft drop, so a raised control reads
      as a physical surface instead of an outlined rectangle. */
-  --sh-ctl: 0 1px 1px rgba(var(--shadow-rgb), var(--shadow-a1)), 0 1px 2px rgba(var(--shadow-rgb), 0.05);
-  --sh-ctl-hover: 0 1px 2px rgba(var(--shadow-rgb), 0.05), 0 3px 6px rgba(var(--shadow-rgb), var(--shadow-a2));
-  --sh-xs: 0 1px 2px rgba(var(--shadow-rgb), 0.05);
+  --sh-ctl: 0 1px 2px rgba(var(--shadow-rgb), var(--shadow-a1));
+  --sh-ctl-hover: 0 1px 2px rgba(var(--shadow-rgb), var(--shadow-a1)), 0 2px 6px rgba(var(--shadow-rgb), var(--shadow-a2));
+  --sh-xs: 0 1px 2px rgba(var(--shadow-rgb), var(--shadow-a1));
   --sh-sm: 0 1px 2px rgba(var(--shadow-rgb), var(--shadow-a1)), 0 6px 16px rgba(var(--shadow-rgb), 0.05);
   --sh-md: 0 4px 14px rgba(var(--shadow-rgb), var(--shadow-a2)), 0 1px 3px rgba(var(--shadow-rgb), 0.05);
   --sh-pop: 0 14px 36px rgba(var(--shadow-rgb), var(--shadow-a3)), 0 2px 6px rgba(var(--shadow-rgb), 0.06);
   --sh-modal: 0 30px 74px rgba(var(--shadow-rgb), var(--shadow-a4)), 0 4px 12px rgba(var(--shadow-rgb), 0.10);
-  --sh-field: inset 0 1px 1.5px rgba(var(--shadow-rgb), 0.03);
-  --scroll-thumb: #d3cfc7;
-  --scroll-thumb-hover: #b3aea5;
-  --backdrop: rgba(27, 26, 24, .40);
+  --sh-field: none;
+  --scroll-thumb: #d4d4d4;
+  --scroll-thumb-hover: #b4b4b4;
+  --backdrop: rgba(10, 10, 10, .45);
   /* The select chevron is a data URI, so its colour cannot be a var — the dark
      block swaps the whole image instead. */
-  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2376736d' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23737373' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
 
-  --ring: 0 0 0 3px rgba(51, 102, 230, 0.18);
-  --ring-danger: 0 0 0 3px rgba(220, 59, 50, 0.15);
+  --ring: 0 0 0 3px rgba(10, 10, 10, 0.14);
+  --ring-danger: 0 0 0 3px rgba(217, 58, 48, 0.15);
   --ease: cubic-bezier(.2, .8, .3, 1);
 
   --sidebar-w: 232px;
@@ -165,13 +164,15 @@
   --mono: ui-monospace, "Cascadia Mono", SFMono-Regular, "SF Mono", "JetBrains Mono",
     Menlo, Consolas, "Liberation Mono", monospace;
 
-  /* Type scale. Every size in the product comes from one of these. */
-  --t-2xs: 10.5px;   /* eyebrow labels, tag pills */
-  --t-xs: 11.5px;    /* chips, badges, captions */
-  --t-sm: 12.5px;    /* controls, secondary rows */
-  --t-base: 13.5px;  /* body, table cells */
+  /* Type scale. Every size in the product comes from one of these. Donut's
+     scale is one step tighter than a marketing page: 11px labels, 12px
+     controls, 13px body, 15px titles — density is the point. */
+  --t-2xs: 10px;     /* eyebrow labels, tag pills */
+  --t-xs: 11px;      /* chips, badges, captions */
+  --t-sm: 12px;      /* controls, secondary rows */
+  --t-base: 13px;    /* body, table cells */
   --t-md: 15px;      /* dialog titles */
-  --t-lg: 21px;      /* page title */
+  --t-lg: 16px;      /* page title */
 }
 
 * { box-sizing: border-box; }
@@ -235,7 +236,7 @@ button:disabled { cursor: default; }
   background: var(--ctl);
   border: 1px solid var(--ctl-border); border-radius: var(--r-md);
   box-shadow: var(--sh-ctl);
-  font-size: var(--t-sm); font-weight: 600; letter-spacing: -0.005em; white-space: nowrap;
+  font-size: var(--t-sm); font-weight: 550; letter-spacing: 0; white-space: nowrap;
   transition: background .13s var(--ease), border-color .13s var(--ease),
     color .13s var(--ease), box-shadow .13s var(--ease), transform .08s var(--ease);
 }
@@ -250,8 +251,9 @@ button:disabled { cursor: default; }
 .btn .icon { color: var(--muted); transition: color .13s var(--ease); }
 .btn:hover:not(:disabled) .icon { color: currentColor; }
 
-/* The filled primary is flat — the live build's exact blue, identical in both
-   themes; the glow is its only decoration. */
+/* The filled primary is flat — a solid accent with an inverted label. In light
+   the accent is near-black, in dark it is white; nothing else about the control
+   changes between the two themes. */
 .btn.primary {
   color: var(--on-fill); background: var(--accent-fill);
   border-color: var(--accent-fill);
@@ -308,10 +310,10 @@ button:disabled { cursor: default; }
 
 .input, .select {
   height: 32px; padding: 0 10px;
-  color: var(--ink); background: var(--surface);
+  color: var(--ink); background: var(--surface-sunken);
   border: 1px solid var(--line); border-radius: var(--r-md);
   box-shadow: var(--sh-field);
-  outline: none; transition: border-color .13s var(--ease), box-shadow .13s var(--ease);
+  outline: none; transition: border-color .13s var(--ease), box-shadow .13s var(--ease), background .13s var(--ease);
 }
 .input::placeholder { color: var(--faint); }
 .fld input::placeholder, .fld textarea::placeholder { color: var(--faint); font-weight: 400; }
@@ -340,40 +342,26 @@ button:disabled { cursor: default; }
 
 .chip {
   display: inline-flex; align-items: center; gap: 5px; max-width: 100%; height: 22px;
-  padding: 0 9px; border-radius: var(--r-pill);
+  padding: 0 8px; border-radius: var(--r-sm);
   color: var(--ink-soft); background: var(--surface-hover); border: 1px solid var(--line);
-  font-size: 11.5px; font-weight: 550; line-height: 1; white-space: nowrap;
+  font-size: 11px; font-weight: 550; line-height: 1; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
 }
 .chip .icon { width: 12px; height: 12px; }
 
-.platform-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-soft); white-space: nowrap; }
+.platform-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-soft); white-space: nowrap; }
+/* Platform marks are neutral: the glyph's letter already says which network it
+   is, and a column of brand gradients was the loudest thing on a monochrome
+   row. One neutral tile, one hairline, no hue. */
 .platform-pill .glyph {
   display: inline-flex; align-items: center; justify-content: center;
   width: 20px; height: 20px; flex: 0 0 auto; border-radius: var(--r-xs);
-  color: #fff; font-size: 10px; font-weight: 700;
-  box-shadow: inset 0 0 0 1px rgba(27, 26, 24, .08);
+  color: var(--muted); background: var(--surface-active);
+  box-shadow: inset 0 0 0 1px var(--line);
+  font-size: 10px; font-weight: 700; letter-spacing: .02em;
 }
 /* Real brand marks are filled, not stroked like the rest of the icon set. */
 .brandmark { width: 12px; height: 12px; display: block; fill: currentColor; stroke: none; }
-.platform-pill .glyph.pm-x { background: #0b0b0b; }
-.platform-pill .glyph.pm-telegram { background: linear-gradient(180deg, #37bbfe, #007dbb); }
-.platform-pill .glyph.pm-instagram { background: linear-gradient(45deg, #f9ce34, #ee2a7b 55%, #6228d7); }
-.platform-pill .glyph.pm-facebook { background: #0866ff; }
-.platform-pill .glyph.pm-tiktok { background: #0b0b0b; }
-.platform-pill .glyph.pm-linkedin { background: #0a66c2; }
-.platform-pill .glyph.pm-reddit { background: #ff4500; }
-.platform-pill .glyph.pm-youtube { background: #ff0000; }
-.platform-pill .glyph.pm-threads { background: #0b0b0b; }
-.platform-pill .glyph.pm-pinterest { background: #bd081c; }
-.platform-pill .glyph.pm-snapchat { background: #fffc00; color: #0b0b0b; }
-.platform-pill .glyph.pm-discord { background: #5865f2; }
-.platform-pill .glyph.pm-twitch { background: #9146ff; }
-.platform-pill .glyph.pm-gmail { background: #ea4335; }
-.platform-pill .glyph.pm-amazon { background: #232f3e; }
-.platform-pill .glyph.pm-ebay { background: #e53238; }
-.platform-pill .glyph.pm-etsy { background: #f16521; }
-.platform-pill .glyph.pm-other { background: var(--faint); }
 
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #cbd5e1; }
 .dot.on { background: var(--success); box-shadow: 0 0 0 3px var(--success-soft); }
@@ -455,14 +443,15 @@ button:disabled { cursor: default; }
   position: relative;
   flex: 0 0 var(--sidebar-w); width: var(--sidebar-w);
   display: flex; flex-direction: column; min-height: 0;
-  padding: 14px 12px 14px;
+  padding: 10px 10px 10px;
   background: var(--surface); border-right: 1px solid var(--line);
   transition: flex-basis .18s var(--ease), width .18s var(--ease);
 }
 
 /* Collapsed rail: icons only. Labels are removed from the flow rather than
-   hidden, so nothing reflows oddly at the narrow width. */
-.sidebar.collapsed { --sidebar-w: 64px; padding-left: 8px; padding-right: 8px; }
+   hidden, so nothing reflows oddly at the narrow width. 56px is Donut's rail —
+   one 36px hit target plus the padding on either side. */
+.sidebar.collapsed { --sidebar-w: 56px; padding-left: 10px; padding-right: 10px; }
 .sidebar.collapsed .navlabel,
 .sidebar.collapsed .appversion,
 .sidebar.collapsed .sidesection,
@@ -474,7 +463,7 @@ button:disabled { cursor: default; }
    controlling height and squash the button. */
 .sidebar.collapsed .newrow .newbtn { flex: 0 0 36px; width: 100%; padding: 0; }
 .sidebar.collapsed .newrow .importbtn { width: 100%; }
-.sidebar.collapsed .navitem { justify-content: center; padding: 8px 0; }
+.sidebar.collapsed .navitem { justify-content: center; padding: 0; }
 .sidebar.collapsed .sidefoot { padding-top: 10px; }
 /* The rail is too narrow for a label, so the tooltip carries it — and it has to
    sit beside the item, not under it. */
@@ -495,23 +484,24 @@ button:disabled { cursor: default; }
 
 /* Toggle sits on the seam between the rail and the content, like a window edge. */
 .rail-toggle {
-  position: absolute; top: 22px; right: -11px; z-index: 5;
+  position: absolute; top: 20px; right: -10px; z-index: 5;
   display: inline-flex; align-items: center; justify-content: center;
-  width: 22px; height: 22px; padding: 0;
-  color: var(--muted); background: var(--surface);
+  width: 20px; height: 20px; padding: 0;
+  color: var(--faint); background: var(--surface);
   border: 1px solid var(--line); border-radius: 50%;
   box-shadow: var(--sh-ctl);
   transition: color .12s var(--ease), background .12s var(--ease), border-color .12s var(--ease);
 }
-.rail-toggle:hover { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+.rail-toggle:hover { color: var(--ink); border-color: var(--line-strong); background: var(--surface-hover); }
 
-.brandrow { display: flex; align-items: center; gap: 8px; padding: 0 6px 14px; }
+.brandrow { display: flex; align-items: center; gap: 8px; padding: 2px 6px 14px; }
 .brand {
-  display: inline-flex; align-items: center; gap: 9px; min-width: 0;
-  color: var(--ink); font-size: 16px; font-weight: 700; letter-spacing: -0.03em;
+  display: inline-flex; align-items: center; gap: 8px; min-width: 0;
+  color: var(--ink); font-size: var(--t-md); font-weight: 650; letter-spacing: -0.02em;
 }
-/* Inline Alias Loop mark: the dark arm rides currentColor so it stays visible
-   on a dark surface; the loop arm follows the accent (the logo's own blue). */
+/* Inline Alias Loop mark: the arm rides currentColor and the eyes follow the
+   accent, which is white in dark and near-black in light — the mark carries the
+   same two values as the rest of the monochrome shell. */
 .ghost-mark { flex: 0 0 auto; display: block; fill: none; color: var(--ink); }
 .ghost-mark path { stroke-width: 64; stroke-linecap: round; stroke-linejoin: round; }
 .ghost-mark .ghost-eyes { stroke: var(--accent); }
@@ -532,21 +522,24 @@ button:disabled { cursor: default; }
 /* Rail tooltips extend past the navigation box. */
 .sidebar.collapsed .sidenav { overflow: visible; }
 .navitem {
-  display: flex; align-items: center; gap: 10px; width: 100%;
-  padding: 8px 10px; border: 0; border-radius: var(--r-md);
-  color: var(--ink-soft); background: none;
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  height: 34px; padding: 0 9px; border: 0; border-radius: var(--r-md);
+  color: var(--muted); background: none;
   font-size: var(--t-base); font-weight: 500; text-align: left;
   transition: background .12s ease, color .12s ease;
 }
 a.navitem { box-sizing: border-box; text-decoration: none; cursor: pointer; }
-.navitem .icon { color: var(--muted); }
+.navitem .icon { color: var(--faint); }
 .navitem:hover:not(:disabled) { background: var(--surface-hover); color: var(--ink); }
 .navitem:hover:not(:disabled) .icon { color: var(--ink-soft); }
+/* Selected: a quiet white wash plus a hairline. In monochrome the state is the
+   step in lightness, not a colour, so the row still reads as the current page
+   without competing with the data. */
 .navitem.active {
-  background: var(--accent-soft); color: var(--accent-ink); font-weight: 650;
-  box-shadow: inset 0 0 0 1px rgba(51, 102, 230, .12);
+  background: var(--accent-soft); color: var(--ink); font-weight: 550;
+  box-shadow: inset 0 0 0 1px var(--accent-line);
 }
-.navitem.active .icon { color: var(--accent); }
+.navitem.active .icon { color: var(--ink); }
 .navitem:disabled { opacity: .5; }
 .navitem .cnt {
   margin-left: auto; min-width: 22px; padding: 1px 6px; border-radius: var(--r-pill);
@@ -554,19 +547,6 @@ a.navitem { box-sizing: border-box; text-decoration: none; cursor: pointer; }
   font-size: 11px; font-weight: 600; text-align: center; font-variant-numeric: tabular-nums;
 }
 .navitem.active .cnt { color: var(--accent-ink); background: var(--raised); }
-/* Buy-proxies cart beside the Proxies item. A sibling of the button, since a
-   link cannot nest inside one. */
-.navrow { position: relative; }
-.navbuy {
-  position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
-  display: grid; place-items: center; width: 26px; height: 26px;
-  color: var(--accent); border-radius: var(--r-sm);
-  transition: background .12s ease, color .12s ease;
-}
-.navbuy:hover { color: var(--on-fill); background: var(--accent-fill); }
-.navbuy:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.sidebar.collapsed .navbuy { display: none; }
-
 .sidesection { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 2px; margin-top: 16px; padding: 0 2px; }
 /* Keep two folder rows usable; navigation gives up height first. */
 .sidesection:has(.folders) { min-height: 140px; }
@@ -585,14 +565,14 @@ a.navitem { box-sizing: border-box; text-decoration: none; cursor: pointer; }
 .folders-empty { padding: 8px 10px; color: var(--faint); font-size: 12px; }
 .folder {
   display: flex; align-items: center; gap: 8px;
-  padding: 7px 10px; border-radius: var(--r-md); cursor: pointer;
-  color: var(--ink-soft); font-size: var(--t-sm);
+  height: 30px; padding: 0 9px; border-radius: var(--r-md); cursor: pointer;
+  color: var(--muted); font-size: var(--t-sm);
   transition: background .12s ease, color .12s ease;
 }
 .folder .icon { color: var(--faint); }
 .folder:hover { background: var(--surface-hover); color: var(--ink); }
-.folder.active { background: var(--accent-soft); color: var(--accent-ink); font-weight: 650; box-shadow: inset 0 0 0 1px rgba(51, 102, 230, .12); }
-.folder.active .icon { color: var(--accent); }
+.folder.active { background: var(--accent-soft); color: var(--ink); font-weight: 550; box-shadow: inset 0 0 0 1px var(--accent-line); }
+.folder.active .icon { color: var(--ink); }
 .folder .fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder .cnt {
   min-width: 20px; padding: 1px 6px; border-radius: var(--r-pill);
@@ -660,15 +640,15 @@ button.newgroup:disabled { color: var(--faint); border-color: var(--line); backg
 .projectlink .brandmark { width: 13px; height: 13px; }
 .projectlink:hover { color: var(--accent-ink); background: var(--accent-soft); }
 
-/* The site's footer wordmark, scaled to the rail: brand blue clipped to the
-   glyphs. The gradient bottoms out well above zero — fading it to nothing made
-   the word look cut off by the window edge rather than deliberately faint. */
+/* The site's footer wordmark, set as a micro-label rather than a display line:
+   at 10px caps it is a credit, not a second brand block competing with the
+   sidebar's logo. Flat neutral at low opacity keeps the rail monochrome. */
 .footer-mark {
   grid-column: 1 / -1;
-  margin: 6px 0 0; padding: 0;
-  background-image: linear-gradient(180deg, rgba(51, 102, 230, .34), rgba(51, 102, 230, .12));
-  -webkit-background-clip: text; background-clip: text; color: transparent;
-  font-size: 23px; font-weight: 800; letter-spacing: -.045em; line-height: 1.15;
+  margin: 8px 0 0; padding: 0;
+  color: var(--faint); opacity: .55;
+  font-size: 10px; font-weight: 600; letter-spacing: .18em; line-height: 1.4;
+  text-transform: uppercase;
   text-align: center; white-space: nowrap; user-select: none;
 }
 
@@ -680,35 +660,41 @@ button.newgroup:disabled { color: var(--faint); border-color: var(--line); backg
 
 .pagehead {
   display: flex; align-items: center; gap: 10px;
-  padding: 0 18px; height: 60px; flex: 0 0 auto;
+  padding: 0 16px; height: 56px; flex: 0 0 auto;
   background: var(--surface); border-bottom: 1px solid var(--line);
 }
-.pagehead h1 { margin: 0; font-size: var(--t-lg); font-weight: 700; letter-spacing: -0.035em; }
-.pagehead .pagesub { color: var(--faint); font-size: var(--t-sm); font-variant-numeric: tabular-nums; }
+/* The header title is a label, not a display headline: 15px/650 with the
+   subtitle beside it. Weight and spacing carry the hierarchy, which is how a
+   dense tool header stays out of the way of the table below it. */
+.pagehead h1 { margin: 0; font-size: var(--t-md); font-weight: 650; letter-spacing: -0.015em; }
+.pagehead .pagesub {
+  padding-left: 10px; border-left: 1px solid var(--line);
+  color: var(--faint); font-size: var(--t-sm); font-variant-numeric: tabular-nums;
+}
 .pagehead .headactions { display: flex; align-items: center; gap: 6px; }
 
-/* Account chip, top-right. */
+/* Account chip, top-right. A control-shaped button rather than a pill: in a
+   monochrome shell the capsule was the last "consumer app" tell in the chrome. */
 .account-button {
-  display: inline-flex; align-items: center; gap: 9px; max-width: 230px;
-  height: 38px; padding: 0 10px 0 5px;
+  display: inline-flex; align-items: center; gap: 8px; max-width: 270px;
+  height: 32px; padding: 0 8px 0 4px;
   color: var(--ink-soft); background: var(--surface);
-  border: 1px solid var(--line); border-radius: var(--r-pill);
-  box-shadow: var(--sh-ctl); text-align: left;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  box-shadow: none; text-align: left;
   transition: background .13s var(--ease), border-color .13s var(--ease), box-shadow .13s var(--ease);
 }
 .account-button { background: var(--surface-sunken); }
-.account-button:hover { background: var(--surface-hover); border-color: var(--line-strong); box-shadow: var(--sh-ctl-hover); }
+.account-button:hover { background: var(--surface-hover); border-color: var(--line-strong); box-shadow: var(--sh-ctl); }
 .account-button:active { transform: translateY(.5px); }
 .account-button .avatar {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 28px; height: 28px; flex: 0 0 auto; border-radius: 50%;
-  color: var(--on-accent); background: linear-gradient(150deg, var(--accent), var(--accent-2));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .3), 0 1px 2px rgba(51, 102, 230, .28);
+  width: 24px; height: 24px; flex: 0 0 auto; border-radius: var(--r-xs);
+  color: var(--on-accent); background: var(--ink);
 }
-.account-button .avatar .icon { width: 15px; height: 15px; }
+.account-button .avatar .icon { width: 14px; height: 14px; }
 .account-button .who { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
 .account-button .who b { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.account-button .who span { color: var(--faint); font-size: 10.5px; }
+.account-button .who span { color: var(--faint); font-size: 10px; }
 .account-button > .icon { color: var(--faint); }
 
 /* Filter row + selection toolbar live on one raised card with the table.
@@ -717,17 +703,17 @@ button.newgroup:disabled { color: var(--faint); border-color: var(--line); backg
    column and the action buttons drift apart. Symmetric canvas on both sides
    reads deliberate; one giant gap inside the table reads broken. */
 .workspace {
-  flex: 1; min-height: 0; margin: 14px auto 16px;
-  width: min(1440px, 100% - 32px);
+  flex: 1; min-height: 0; margin: 12px auto 14px;
+  width: min(1440px, 100% - 24px);
   display: flex; flex-direction: column;
   background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--r-xl); box-shadow: var(--sh-sm); overflow: hidden;
+  border-radius: var(--r-xl); box-shadow: none; overflow: hidden;
 }
 /* The filter row is part of the card head, so it carries no fill of its own. */
 
 .filterbar {
   display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
-  padding: 13px 14px; border-bottom: 1px solid var(--line-soft);
+  padding: 10px 12px; border-bottom: 1px solid var(--line);
 }
 .filterbar .group-filter { width: 168px; flex: 0 0 auto; }
 .filterbar .searchfield { max-width: 420px; }
@@ -795,17 +781,16 @@ button.newgroup:disabled { color: var(--faint); border-color: var(--line); backg
 }
 .identity-avatar {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 46px; height: 46px; flex: 0 0 auto; border-radius: 50%;
-  color: var(--on-accent); background: linear-gradient(150deg, var(--accent), var(--accent-2));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .3), 0 1px 3px rgba(51, 102, 230, .26);
+  width: 44px; height: 44px; flex: 0 0 auto; border-radius: var(--r-md);
+  color: var(--on-accent); background: var(--ink);
 }
 .identity-lines { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
-.identity-lines b { color: var(--ink); font-size: 14px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.identity-lines > span { color: var(--muted); font-size: 12.5px; }
+.identity-lines b { color: var(--ink); font-size: var(--t-base); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.identity-lines > span { color: var(--muted); font-size: var(--t-sm); }
 
 .pagefoot {
   display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
-  padding: 12px 20px; border-top: 1px solid var(--line-soft); background: var(--surface-sunken);
+  padding: 10px 14px; border-top: 1px solid var(--line); background: var(--surface);
 }
 
 /* Table -------------------------------------------------------------------- */
@@ -819,21 +804,21 @@ button.newgroup:disabled { color: var(--faint); border-color: var(--line); backg
 
 .profile-table thead th {
   position: sticky; top: 0; z-index: 2;
-  padding: 0 12px; height: 38px;
-  background: var(--surface-sunken); border-bottom: 1px solid var(--line);
-  color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase;
+  padding: 0 12px; height: 34px;
+  background: var(--surface); border-bottom: 1px solid var(--line);
+  color: var(--faint); font-size: var(--t-2xs); font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase;
   text-align: left; white-space: nowrap; user-select: none;
 }
 .profile-table thead th.sortable { cursor: pointer; }
-.profile-table thead th.sortable:hover { color: var(--ink); background: var(--surface-active); }
+.profile-table thead th.sortable:hover { color: var(--ink); background: var(--surface-hover); }
 .profile-table thead th .th-inner { display: inline-flex; align-items: center; gap: 4px; }
 .profile-table thead th .sortglyph { color: var(--faint); opacity: 0; transition: opacity .12s ease; }
 .profile-table thead th.sortable:hover .sortglyph { opacity: .55; }
-.profile-table thead th.sorted { color: var(--accent-ink); }
-.profile-table thead th.sorted .sortglyph { color: var(--accent); opacity: 1; }
+.profile-table thead th.sorted { color: var(--ink); }
+.profile-table thead th.sorted .sortglyph { color: var(--ink); opacity: 1; }
 
 .profile-table tbody td {
-  padding: 0 12px; height: 46px;
+  padding: 0 12px; height: 44px;
   border-bottom: 1px solid var(--line-soft);
   vertical-align: middle; white-space: nowrap;
 }
@@ -841,27 +826,28 @@ button.newgroup:disabled { color: var(--faint); border-color: var(--line); backg
    stray ellipsis next to the checkbox cell. */
 td.col-no, td.col-name, td.col-group, td.col-tags, td.col-proxy { overflow: hidden; text-overflow: ellipsis; }
 .profile-table tbody tr { transition: background .1s ease; }
-.profile-table tbody tr:hover td { background: var(--surface-sunken); }
+.profile-table tbody tr:hover td { background: var(--surface-hover); }
 .profile-table tbody tr.selected td { background: var(--accent-soft); }
 .profile-table tbody tr.selected:hover td { background: var(--accent-soft-hover); }
-/* An open browser gets a green rail; a selected row gets a blue one. */
-.profile-table tbody tr.running td:first-child { box-shadow: inset 3px 0 0 0 var(--success); }
-.profile-table tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 0 var(--accent); }
+/* Running and selected rows carry a 2px rail instead of a tinted row: the mark
+   survives monochrome and leaves the surface free for the data. */
+.profile-table tbody tr.running td:first-child { box-shadow: inset 2px 0 0 0 var(--success); }
+.profile-table tbody tr.selected td:first-child { box-shadow: inset 2px 0 0 0 var(--accent); }
 
-th.chk, td.chk { width: 44px; padding-left: 14px; padding-right: 0; }
-th.chk input, td.chk input { width: 15px; height: 15px; cursor: pointer; accent-color: var(--accent); }
+th.chk, td.chk { width: 40px; padding-left: 12px; padding-right: 0; }
+th.chk input, td.chk input { width: 14px; height: 14px; cursor: pointer; accent-color: var(--accent); }
 
 td.col-no .no-text {
   min-width: 0; overflow: hidden; text-overflow: ellipsis;
-  color: var(--muted); font-size: 12px; font-weight: 650; font-variant-numeric: tabular-nums;
+  color: var(--muted); font-size: var(--t-sm); font-weight: 600; font-variant-numeric: tabular-nums;
 }
-/* A custom NO. is operator-set, so it takes the identity accent to separate it
-   from the serial the store assigned. */
-td.col-no .no-text.custom { color: var(--accent-2-ink); }
+/* A custom NO. is operator-set, so it keeps the identity accent — in the
+   monochrome build that is the accent itself, differentiated by weight. */
+td.col-no .no-text.custom { color: var(--accent-ink); font-weight: 700; }
 
 .name-cell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-.name-cell .n { color: var(--ink); font-weight: 600; font-size: var(--t-base); letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; }
-.name-cell .sub { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: 11.5px; font-family: var(--mono); letter-spacing: -0.01em; }
+.name-cell .n { color: var(--ink); font-weight: 550; font-size: var(--t-base); letter-spacing: -0.005em; overflow: hidden; text-overflow: ellipsis; }
+.name-cell .sub { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: var(--t-xs); font-family: var(--mono); letter-spacing: -0.01em; }
 .name-cell .sub .live { display: inline-flex; align-items: center; gap: 4px; color: var(--success-ink); font-family: var(--font); font-weight: 600; }
 .name-cell .sub .lockedby {
   display: inline-flex; align-items: center; gap: 4px;
@@ -878,8 +864,8 @@ th.col-action, td.col-action {
   position: sticky; right: 0; z-index: 1; text-align: right;
   background: var(--surface);
 }
-.profile-table thead th.col-action { z-index: 3; background: var(--surface-sunken); }
-.profile-table tbody tr:hover td.col-action { background: var(--surface-sunken); z-index: 2; }
+.profile-table thead th.col-action { z-index: 3; background: var(--surface); }
+.profile-table tbody tr:hover td.col-action { background: var(--surface-hover); z-index: 2; }
 .profile-table tbody tr.selected td.col-action { background: var(--accent-soft); }
 .profile-table tbody tr.selected:hover td.col-action { background: var(--accent-soft-hover); }
 /* Only cast the edge shadow while there is something scrolled underneath. */
@@ -902,9 +888,8 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 .emptystate { display: flex; flex-direction: column; align-items: center; gap: 6px; color: var(--muted); }
 .emptystate .glyph {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 52px; height: 52px; margin-bottom: 6px; border-radius: var(--r-xl);
-  color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-line);
-  box-shadow: 0 0 0 6px rgba(37, 99, 235, .05);
+  width: 48px; height: 48px; margin-bottom: 6px; border-radius: var(--r-lg);
+  color: var(--muted); background: var(--surface-sunken); border: 1px solid var(--line);
 }
 .emptystate .glyph .icon { width: 22px; height: 22px; }
 .emptystate b { color: var(--ink); font-size: 14px; font-weight: 600; }
@@ -916,8 +901,8 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 
 .statusbar {
   display: flex; align-items: center; gap: 12px; flex: 0 0 auto; flex-wrap: wrap;
-  padding: 9px 14px; border-top: 1px solid var(--line-soft);
-  background: var(--surface-sunken); color: var(--muted); font-size: 12.5px;
+  padding: 8px 12px; border-top: 1px solid var(--line);
+  background: var(--surface); color: var(--muted); font-size: var(--t-sm);
 }
 .statusbar .stat { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .statusbar .stat b { color: var(--ink-soft); font-weight: 650; font-variant-numeric: tabular-nums; }
@@ -948,9 +933,9 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 .error, .update-banner {
   display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
   /* Tracks the workspace card's cap so banner and card edges line up. */
-  margin: 14px auto -2px; padding: 11px 14px;
-  width: min(1440px, 100% - 32px);
-  border-radius: var(--r-lg); font-size: 12.5px;
+  margin: 12px auto -2px; padding: 10px 12px;
+  width: min(1440px, 100% - 24px);
+  border-radius: var(--r-lg); font-size: var(--t-sm);
 }
 .error { color: var(--danger-ink); background: var(--danger-soft); border: 1px solid var(--danger-line); }
 .error .icon { color: var(--danger); }
@@ -1004,31 +989,6 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 .proxy-check-result.unstable { color: var(--warn-ink); background: var(--warn-soft); border-color: var(--warn-line); }
 .proxy-check-result.failed { color: var(--danger-ink); background: var(--danger-soft); border-color: var(--danger-line); }
 .proxy-check-result.unavailable { color: var(--muted); background: var(--surface-sunken); border-color: var(--line); }
-.proxy-referral {
-  display: flex; align-items: center; gap: 11px;
-  padding: 10px 12px; color: var(--ink); background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--r-md); text-decoration: none;
-  transition: background .12s ease, border-color .12s ease;
-}
-.proxy-referral:hover { background: var(--accent-soft); border-color: var(--accent-line); }
-.proxy-referral:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.proxy-referral-icon {
-  display: grid; place-items: center; flex: 0 0 32px; height: 32px;
-  color: var(--accent); background: var(--accent-soft); border-radius: var(--r-sm);
-}
-.proxy-referral:hover .proxy-referral-icon { background: var(--raised); }
-.proxy-referral-text { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; }
-.proxy-referral-text strong { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 12.5px; font-weight: 650; }
-.proxy-referral-text small { color: var(--muted); font-size: 11.5px; line-height: 1.45; }
-.proxy-referral-tag {
-  padding: 1px 7px; color: var(--accent-ink); background: var(--accent-soft); border: 1px solid var(--accent-line);
-  border-radius: var(--r-pill); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap;
-}
-.proxy-referral-go { color: var(--muted); font-size: 14px; }
-/* Offer shown above the profile list after an import, with a dismiss button. */
-.import-offer { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; padding: 0 14px 12px; }
-.import-offer .proxy-referral { flex: 1; min-width: 0; }
-.proxy-referral:hover .proxy-referral-go { color: var(--accent); }
 
 /* Remote MCP settings card (Cloud mode). Fields/buttons reuse .fld and .btn;
    only the status pill and connect guide need their own rules. */
@@ -1049,9 +1009,9 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 .notice {
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 60;
   display: flex; align-items: center; gap: 8px;
-  padding: 9px 15px; border-radius: var(--r-pill);
+  padding: 8px 12px; border-radius: var(--r-md);
   color: var(--success-ink); background: var(--surface); border: 1px solid var(--success-line);
-  font-size: 12.5px; font-weight: 550; box-shadow: var(--sh-pop);
+  font-size: var(--t-sm); font-weight: 550; box-shadow: var(--sh-pop);
   animation: notice-in .18s cubic-bezier(.2, .8, .3, 1);
 }
 @keyframes notice-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
@@ -1059,9 +1019,10 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 .dropzone {
   position: fixed; inset: 0; z-index: 50;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
-  background: rgba(37, 99, 235, .08); backdrop-filter: blur(2px);
-  border: 3px dashed var(--accent); color: var(--accent-ink);
-  font-size: 16px; font-weight: 600; pointer-events: none;
+  /* A neutral scrim: the drop target should dim the app, not tint it. */
+  background: rgba(128, 128, 128, .14); backdrop-filter: blur(2px);
+  border: 2px dashed var(--ink); color: var(--ink);
+  font-size: var(--t-md); font-weight: 600; pointer-events: none;
 }
 .dropzone .icon { width: 34px; height: 34px; }
 
@@ -1080,16 +1041,18 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 .modal {
   width: 100%; max-width: 560px; max-height: calc(100vh - 48px);
   display: flex; flex-direction: column; overflow: hidden;
-  background: var(--surface); border-radius: var(--r-xl); box-shadow: var(--sh-modal);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xl); box-shadow: var(--sh-modal);
   animation: modal-in .16s cubic-bezier(.2, .8, .3, 1);
 }
 @keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: none; } }
 
 .modal-head {
   display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
-  padding: 16px 20px; border-bottom: 1px solid var(--line);
+  padding: 14px 18px; border-bottom: 1px solid var(--line);
   background: var(--surface);
-  font-size: var(--t-md); font-weight: 650; letter-spacing: -0.02em;
+  font-size: var(--t-md); font-weight: 600; letter-spacing: -0.01em;
 }
 .modal-head .mono { color: var(--faint); font-weight: 500; }
 .modal-head > .icon { color: var(--muted); }
@@ -1119,7 +1082,7 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 .fld > span .muted { color: var(--faint); font-weight: 400; }
 .fld input, .fld select {
   height: 34px; padding: 0 10px;
-  color: var(--ink); background: var(--surface);
+  color: var(--ink); background: var(--surface-sunken);
   border: 1px solid var(--line); border-radius: var(--r-md); outline: none;
   box-shadow: var(--sh-field);
   transition: border-color .13s var(--ease), box-shadow .13s var(--ease);
@@ -1129,7 +1092,7 @@ td.col-tags .chip + .chip { margin-left: 4px; }
   background-repeat: no-repeat; background-position: right 8px center; }
 .fld textarea {
   width: 100%; min-height: 104px; padding: 10px; resize: vertical;
-  color: var(--ink); background: var(--surface);
+  color: var(--ink); background: var(--surface-sunken);
   border: 1px solid var(--line); border-radius: var(--r-md); outline: none;
   box-shadow: var(--sh-field);
   font: 12px/1.6 var(--mono);
@@ -1237,10 +1200,13 @@ td.col-tags .chip + .chip { margin-left: 4px; }
   transition: transform .15s ease;
 }
 .fingerprint-settings[open] > summary::before { transform: rotate(90deg) translateX(-1px); }
+/* "Automatic" describes a mode, not a health check: it rides the neutral
+   surface tokens. Green is reserved for the fingerprint badge that reports a
+   real verification result. */
 .automatic-badge {
   margin-left: auto; padding: 2px 8px; border-radius: var(--r-pill);
-  color: var(--success-ink); background: var(--success-soft); border: 1px solid var(--success-line);
-  font-size: 10.5px; font-weight: 650;
+  color: var(--muted); background: var(--surface); border: 1px solid var(--line);
+  font-size: var(--t-2xs); font-weight: 600;
 }
 .fingerprint-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 14px 13px; border-top: 1px solid var(--line); }
 .fingerprint-grid .hint { grid-column: 1 / -1; }
@@ -1334,9 +1300,9 @@ td.col-tags .chip + .chip { margin-left: 4px; }
   color: var(--warn-ink); background: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: var(--r-lg);
   font-size: 12.5px; line-height: 1.6;
 }
-.persona-warning strong { display: flex; align-items: center; gap: 7px; color: #92400e; font-size: 13px; }
+.persona-warning strong { display: flex; align-items: center; gap: 7px; color: var(--warn-ink); font-size: var(--t-base); }
 .persona-convert { align-self: flex-start; color: var(--on-accent); background: var(--warn); border-color: var(--warn); }
-.persona-convert:hover:not(:disabled) { background: #b45309; border-color: #b45309; color: var(--on-accent); }
+.persona-convert:hover:not(:disabled) { background: var(--warn); border-color: var(--warn); color: var(--on-accent); filter: brightness(.94); }
 
 /* Settings modal ----------------------------------------------------------- */
 
@@ -1401,56 +1367,58 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 
 .onboarding {
   min-height: 100%; display: grid; place-items: center; padding: 24px;
-  background: radial-gradient(120% 90% at 50% 0%, #fbfaf8 0%, var(--bg) 62%);
+  /* A single soft lift from the card colour to the canvas at the top; no hue,
+     no glow — the monochrome shell does not get a tinted spotlight. */
+  background: radial-gradient(120% 90% at 50% 0%, var(--surface) 0%, var(--bg) 62%);
 }
 .onboarding-card {
-  width: min(640px, 100%); padding: 40px;
+  width: min(640px, 100%); padding: 36px;
   background: var(--surface); border: 1px solid var(--line);
-  border-radius: 20px; box-shadow: var(--sh-md);
+  border-radius: var(--r-xl); box-shadow: var(--sh-md);
 }
-.onboarding-brand { display: flex; align-items: center; gap: 9px; color: var(--ink); font-size: 15px; font-weight: 700; letter-spacing: -0.025em; }
+.onboarding-brand { display: flex; align-items: center; gap: 9px; color: var(--ink); font-size: var(--t-md); font-weight: 650; letter-spacing: -0.02em; }
 .onboarding-brand .ghost-mark { width: 24px; height: 24px; }
-.onboarding-brand span { color: var(--faint); font-size: 12px; font-weight: 500; letter-spacing: 0; }
-.onboarding-card h1 { margin: 26px 0 8px; font-size: 28px; line-height: 1.15; font-weight: 700; letter-spacing: -0.035em; }
-.onboarding-card > p { max-width: 460px; margin: 0 0 24px; color: var(--muted); font-size: 14px; line-height: 1.65; }
+.onboarding-brand span { color: var(--faint); font-size: var(--t-sm); font-weight: 500; letter-spacing: 0; }
+.onboarding-card h1 { margin: 24px 0 8px; font-size: 26px; line-height: 1.15; font-weight: 650; letter-spacing: -0.03em; }
+.onboarding-card > p { max-width: 46ch; margin: 0 0 24px; color: var(--muted); font-size: var(--t-base); line-height: 1.65; }
 
-.mode-options { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.mode-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .mode-option {
   display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
-  min-height: 148px; padding: 20px; text-align: left;
+  min-height: 140px; padding: 18px; text-align: left;
   color: var(--ink); background: var(--surface);
   border: 1px solid var(--line); border-radius: var(--r-xl);
-  transition: border-color .12s ease, background .12s ease, box-shadow .12s ease, transform .12s ease;
+  transition: border-color .12s ease, background .12s ease, box-shadow .12s ease;
 }
-.mode-option:hover:not(:disabled) { border-color: var(--accent-line); background: var(--accent-soft); box-shadow: var(--sh-sm); transform: translateY(-1px); }
+.mode-option:hover:not(:disabled) { border-color: var(--line-strong); background: var(--surface-hover); }
 .mode-option .badge {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 34px; height: 34px; border-radius: var(--r-md);
-  color: var(--accent); background: var(--accent-soft);
+  width: 32px; height: 32px; border-radius: var(--r-md);
+  color: var(--ink); background: var(--surface-active);
 }
-.mode-option strong { font-size: 15px; font-weight: 650; letter-spacing: -0.015em; }
-.mode-option span { color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+.mode-option strong { font-size: var(--t-md); font-weight: 600; letter-spacing: -0.01em; }
+.mode-option span { color: var(--muted); font-size: var(--t-sm); line-height: 1.6; }
 .mode-option.primary { color: var(--on-fill); background: var(--accent-fill); border-color: var(--accent-fill); }
 .mode-option.primary:hover:not(:disabled) { background: var(--accent-fill-hover); border-color: var(--accent-fill-hover); }
-/* Literal light blue: the tile's fill is the same in both themes, so its
-   secondary text must not follow the theme-dependent accent-line. */
-.mode-option.primary span { color: #c5d6fb; }
-.mode-option.primary .badge { color: var(--on-fill); background: rgba(255, 255, 255, .18); }
+/* The filled tile flips between black (light) and white (dark), so its
+   secondary text and badge ride the on-fill tokens instead of a literal blue. */
+.mode-option.primary span { color: var(--on-fill-muted); }
+.mode-option.primary .badge { color: var(--on-fill); background: rgba(128, 128, 128, .24); }
 .mode-option:disabled { opacity: .6; cursor: wait; }
 
 .mode-primary {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  height: 38px; padding: 0 18px;
+  height: 36px; padding: 0 16px;
   color: var(--on-fill); background: var(--accent-fill); border: 1px solid var(--accent-fill); border-radius: var(--r-md);
-  font-size: 13px; font-weight: 600; box-shadow: var(--glow);
+  font-size: var(--t-base); font-weight: 550; box-shadow: var(--glow);
 }
 .mode-primary:hover:not(:disabled) { background: var(--accent-fill-hover); border-color: var(--accent-fill-hover); box-shadow: var(--glow-strong); }
 .mode-primary:disabled { opacity: .55; cursor: default; }
 .mode-secondary {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  height: 38px; padding: 0 16px;
+  height: 36px; padding: 0 14px;
   color: var(--ink-soft); background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md);
-  font-size: 13px; font-weight: 600;
+  font-size: var(--t-base); font-weight: 550;
 }
 .mode-secondary:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--line-strong); }
 .mode-secondary:disabled { opacity: .55; cursor: default; }
@@ -1538,89 +1506,88 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  /* Neutral charcoal, not a tinted navy. Pushing the brand blue into the
-     surfaces would make every panel look faintly blue and muddy the accent it
-     is meant to echo — on a neutral ground the blue actually reads as blue.
-     The canvas sits two steps below the cards: dark mode needs the same
-     "cards floating on a canvas" hierarchy the light theme gets from stone
-     vs. white, or every region melts into one dark field. */
-  --bg: #0a0a0e;
-  --surface: #1a1a21;
-  --surface-sunken: #15151a;
-  --surface-hover: #24242c;
-  --surface-active: #2d2d37;
+  /* Donut Mono. The canvas sits at #070707 and cards lift one step to #0e0e0e;
+     borders are white at 6%, not grey, so an edge keeps the same weight over
+     any surface. Elevation is that step plus the hairline — drop shadows barely
+     register on near-black, so the theme spends its contrast on borders. */
+  --bg: #070707;
+  --surface: #0e0e0e;
+  --surface-sunken: #0b0b0b;
+  --surface-hover: #161616;
+  --surface-active: #1f1f1f;
 
-  --ink: #f1f1f4;
-  --ink-soft: #c9c9d2;
-  --muted: #90909d;
-  --faint: #66666f;
+  --ink: #ffffff;
+  --ink-soft: #e4e4e4;
+  --muted: #a0a0a0;
+  --faint: #6b6b6b;
 
-  --line: #2e2e38;
-  --line-soft: #26262e;
-  --line-strong: #41414e;
+  --line: rgba(255, 255, 255, .06);
+  --line-soft: rgba(255, 255, 255, .045);
+  --line-strong: rgba(255, 255, 255, .12);
 
-  /* The accent lifts on dark: #3366e6 is too dense against a near-black ground
-     to read as the same colour the light theme uses. */
-  --accent: #5e88f0;
-  --accent-hover: #7a9df4;
-  --accent-press: #4b74e8;
-  /* The fill itself stays the light theme's #3366e6 — only its hover flips
-     LIGHTER, because darker-on-hover sinks into a dark ground. */
-  --accent-fill-hover: #4573e9;
-  --accent-fill-press: #2a58cf;
-  --accent-soft: #151f38;
-  --accent-soft-hover: #1b2949;
-  --accent-line: #2b3f6e;
-  --accent-ink: #b3c6f8;
-  /* Dark glows can afford a little more presence — they replace the drop
-     shadows this theme barely renders. */
-  --glow: 0 4px 16px rgba(94, 136, 240, .30);
-  --glow-strong: 0 6px 20px rgba(94, 136, 240, .42);
+  /* The accent flips to white: primary buttons are white with near-black text,
+     and every active state is a translucent white wash. */
+  --accent: #ffffff;
+  --accent-hover: #e6e6e6;
+  --accent-press: #d4d4d4;
+  --accent-soft: rgba(255, 255, 255, .07);
+  --accent-soft-hover: rgba(255, 255, 255, .11);
+  --accent-line: rgba(255, 255, 255, .14);
+  --accent-ink: #ffffff;
+  --accent-fill: #ffffff;
+  --accent-fill-hover: #e8e8e8;
+  --accent-fill-press: #d6d6d6;
+  --on-fill: #070707;
+  --on-fill-muted: rgba(7, 7, 7, .62);
+  --glow: 0 0 0 1px rgba(255, 255, 255, .08);
+  --glow-strong: 0 0 0 1px rgba(255, 255, 255, .16);
 
-  --accent-2: #ff9e7a;
-  --accent-2-hover: #ffb497;
-  --accent-2-soft: #2b1c15;
-  --accent-2-line: #4d3226;
-  --accent-2-ink: #ffb69b;
+  --accent-2: var(--accent);
+  --accent-2-hover: var(--accent-hover);
+  --accent-2-soft: var(--accent-soft);
+  --accent-2-line: var(--accent-line);
+  --accent-2-ink: var(--accent-ink);
 
-  --success: #35c97d;
-  --success-soft: #12261a;
-  --success-line: #24523a;
-  --success-ink: #6fe0a4;
+  /* Status colours are the only hue in the product — Donut's own values. */
+  --success: #61c554;
+  --success-soft: rgba(97, 197, 84, .12);
+  --success-line: rgba(97, 197, 84, .28);
+  --success-ink: #7fd873;
 
-  --danger: #f0584d;
-  --danger-hover: #d94439;
-  --danger-lift: #ff6d63;
-  --danger-soft: #2a1615;
-  --danger-line: #542825;
-  --danger-ink: #ff9a92;
+  --danger: #ec6a5e;
+  --danger-hover: #d9574b;
+  --danger-fill: #ec6a5e;
+  --danger-fill-hover: #d9574b;
+  --danger-soft: rgba(236, 106, 94, .12);
+  --danger-line: rgba(236, 106, 94, .28);
+  --danger-ink: #f08d84;
+  --danger-lift: #ff8a7f;
 
-  --warn: #e59a3d;
-  --warn-soft: #2a1f10;
-  --warn-line: #543d1c;
-  --warn-ink: #f3c07a;
+  --warn: #f4be4f;
+  --warn-soft: rgba(244, 190, 79, .12);
+  --warn-line: rgba(244, 190, 79, .28);
+  --warn-ink: #f6cb74;
 
-  /* Elevation without drop shadows: a raised control is simply lighter. The
-     gradient and border stay close in value — a high-contrast rim made every
-     dark button read as a harsh outlined box. */
-  --ctl: linear-gradient(180deg, #2a2a32, #232329);
-  --ctl-hover: linear-gradient(180deg, #31313b, #2a2a32);
-  --ctl-border: #32323c;
-  --on-accent: #0a1220;
-  --raised: #2f2f39;
+  /* Flat control fills: a raised control is one step lighter than the surface
+     it sits on, because a gradient would read as a lit object. */
+  --ctl: #161616;
+  --ctl-hover: #1f1f1f;
+  --ctl-border: rgba(255, 255, 255, .08);
+  --on-accent: #070707;
+  --raised: #1a1a1a;
 
   --shadow-rgb: 0, 0, 0;
-  --shadow-a1: 0.22;
-  --shadow-a2: 0.34;
-  --shadow-a3: 0.52;
-  --shadow-a4: 0.66;
-  --sh-field: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-a1: 0.35;
+  --shadow-a2: 0.50;
+  --shadow-a3: 0.65;
+  --shadow-a4: 0.80;
+  --sh-field: none;
 
-  --scroll-thumb: #3a3a44;
-  --scroll-thumb-hover: #4b4b58;
-  --backdrop: rgba(6, 6, 8, .66);
-  --ring: 0 0 0 3px rgba(94, 136, 240, 0.32);
-  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2390909d' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  --scroll-thumb: #2a2a2a;
+  --scroll-thumb-hover: #3d3d3d;
+  --backdrop: rgba(0, 0, 0, .66);
+  --ring: 0 0 0 2px rgba(255, 255, 255, .20);
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23a0a0a0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
 }
 
 
@@ -1628,48 +1595,21 @@ td.col-tags .chip + .chip { margin-left: 4px; }
 :root[data-theme="dark"] .btn.primary .icon,
 :root[data-theme="dark"] .btn.solid-danger .icon { color: currentColor; }
 
-/* Three brand marks are near-black and would vanish against a dark row. */
-:root[data-theme="dark"] .platform-pill .glyph.pm-x,
-:root[data-theme="dark"] .platform-pill .glyph.pm-tiktok,
-:root[data-theme="dark"] .platform-pill .glyph.pm-threads {
-  background: #f4f4f5; color: #0b0b0b;
-}
-
 /* Chips drop their hairline on dark: a border-and-fill box per tag made every
    row read as clutter. The tint alone carries the shape. */
 :root[data-theme="dark"] .chip { background: var(--surface-hover); border-color: transparent; }
 :root[data-theme="dark"] .filechip { border-color: transparent; }
 
-/* The tooltip is ink-on-surface; inverted it would be invisible. */
-:root[data-theme="dark"] .tip::after { background: var(--surface-active); color: var(--ink); }
-:root[data-theme="dark"] .tip::before { border-bottom-color: var(--surface-active); }
-:root[data-theme="dark"] .sidebar.collapsed .navitem[data-tip]::after,
-:root[data-theme="dark"] .sidebar.collapsed .newrow .btn[data-tip]::after {
-  background: var(--surface-active); color: var(--ink);
-}
-
-/* The wordmark reads as a faint glow rather than a faint shadow. */
-:root[data-theme="dark"] .footer-mark {
-  background-image: linear-gradient(180deg, rgba(94, 136, 240, .55), rgba(94, 136, 240, .16));
-}
-
-:root[data-theme="dark"] .onboarding {
-  background: radial-gradient(120% 90% at 50% 0%, #1e1e25 0%, var(--bg) 62%);
-}
-:root[data-theme="dark"] .dropzone { background: rgba(94, 136, 240, .12); }
-:root[data-theme="dark"] .navitem:hover:not(:disabled),
-:root[data-theme="dark"] .folder:hover { background: var(--surface-hover); }
-
 /* Fingerprint attestation: whether a relaunched browser still measures the same
    as the export it came from. Absent entirely when nothing was imported to
    check against — "unknown" must not read as "verified". */
 .fpbadge {
-  display: inline-block; margin-left: 7px; padding: 1px 7px; border-radius: 999px;
-  font-size: 10.5px; font-weight: 600; letter-spacing: .2px; vertical-align: middle;
+  display: inline-block; margin-left: 7px; padding: 1px 7px; border-radius: var(--r-sm);
+  font-size: var(--t-2xs); font-weight: 600; letter-spacing: .2px; vertical-align: middle;
   cursor: help;
 }
-.fpbadge.ok { background: var(--green-soft); color: var(--green); border: 1px solid #cbe9d5; }
-.fpbadge.warn { background: #fdf3e2; color: var(--amber); border: 1px solid #f0dcb8; }
+.fpbadge.ok { background: var(--success-soft); color: var(--success-ink); border: 1px solid var(--success-line); }
+.fpbadge.warn { background: var(--warn-soft); color: var(--warn-ink); border: 1px solid var(--warn-line); }
 .hint-note { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line-soft); color: var(--muted); }
 
 /* Local scripts -------------------------------------------------------------- */

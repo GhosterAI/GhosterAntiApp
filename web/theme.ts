@@ -14,7 +14,10 @@ export function readThemeChoice(cookieHeader: string, stored: string | null): Th
     const value = cookie.slice(prefix.length);
     if (validTheme(value)) return value;
   }
-  return validTheme(stored) ? stored : "light";
+  // Dark is the out-of-the-box theme: the shell is designed dark-first, and a
+  // first launch that opened light would show the palette the product is not
+  // built around. Light and follow-the-OS System stay one click away.
+  return validTheme(stored) ? stored : "dark";
 }
 
 export function themeCookie(choice: ThemeChoice): string {

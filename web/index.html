@@ -6,7 +6,24 @@
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
     <title>GhosterAnti</title>
+    <script>
+      // Resolve the palette before the first paint. The shell is dark-first, so
+      // without this the window flashes the light fallback while the module
+      // graph loads and then repaints — the one flicker nobody misses. Keep the
+      // logic in sync with web/theme.ts: cookie wins, then localStorage, then dark.
+      try {
+        var m = document.cookie.match(/(?:^|;\s*)ghosteranti\.shell\.theme=([^;]+)/);
+        var choice = m ? decodeURIComponent(m[1]) : localStorage.getItem("ghosteranti.shell.theme");
+        var theme = choice === "light" || choice === "dark" ? choice
+          : choice === "system" ? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+          : "dark";
+        document.documentElement.dataset.theme = theme;
+      } catch (e) {
+        document.documentElement.dataset.theme = "dark";
+      }
+    </script>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>

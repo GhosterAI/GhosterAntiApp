@@ -206,7 +206,8 @@ test("proxy check uses Bun fetch through a real loopback relay", async () => {
       user: "",
       pass: "",
     }, {
-      endpoints: [`http://127.0.0.1:${egress.port}/ip`],
+      direct,
+      endpoints: [`http://proxy-check-target.test:${egress.port}/ip`],
       timeoutMs: 2_000,
     })).resolves.toMatchObject({
       status: "working",

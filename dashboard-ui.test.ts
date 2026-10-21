@@ -28,14 +28,10 @@ test("dashboard renders the approved GhosterAnti logo and it survives dark mode"
   }
 });
 
-test("dashboard exposes account settings and confirms mode switching", () => {
+test("dashboard exposes account settings and confirms local mode", () => {
   expect(app).toContain('aria-label={t("Open Account and Settings")}');
-  expect(app).toContain("<ModeSwitchConfirmation");
-  expect(app).toContain("Cloud profiles will not appear until you switch back");
-  expect(app).toContain("does not upload them to Cloud automatically");
-  expect(app).toContain("Accept and continue to Cloud");
-  expect(app).not.toContain(">Stay Local</button>");
-  expect(app).toContain('t("Switch to {target}", { target: isCloudMode ? t("Local") : t("Cloud") })');
+  expect(app).toContain("const isCloudMode = false;");
+  expect(app).toContain("No account · profile data stays on this computer");
   expect(app).toContain('invoke("restart_after_mode_change")');
 });
 
@@ -62,7 +58,6 @@ test("dashboard shows curated desktop update notes and live progress", () => {
   expect(app).toContain("Saving and closing browsers…");
   expect(app).toContain("Installing and restarting…");
   expect(app).toContain('{desktopUpdateErr && <span className="modal-err" role="alert">{desktopUpdateErr}</span>}');
-  expect(app).toContain('disabled={modeBusy || desktopUpdateInstalling}');
   expect(app).toContain('className="update-banner"');
   expect(styles).toContain(".update-banner");
   expect(styles).toContain(".update-highlights");
@@ -196,36 +191,22 @@ test("dashboard lists the supported profile platforms", () => {
   }
 });
 
-test("New and Edit profile dialogs check proxies and show only relevant provider offers", () => {
+test("New and Edit profile dialogs check proxies without third-party advertisements", () => {
   const createModal = app.slice(app.indexOf("{showCreate && ("), app.indexOf("{editId && ("));
   const editModal = app.slice(app.indexOf("{editId && ("), app.indexOf("{showBulk && ("));
 
-  expect(proxyOffer).toContain('const PROXY_PROVIDER_URL = "https://nobleproxy.com/t/ghosteranti";');
-  // Every link names its placement, so NobleProxy can report which one sells.
-  expect(proxyOffer).toContain('url.searchParams.set("src", placement);');
-  expect(app).not.toContain("<ProxyProviderOffer />");
-  expect(app).not.toContain("<ProxyProviderOffer replacement />");
-  expect(proxyOffer).toContain("replacement ?");
+  expect(app).not.toContain("nobleproxy.com");
+  expect(app).not.toContain("NobleProxy");
+  expect(app).not.toContain("Buy Static Residential Proxy");
+  expect(app).not.toContain("Buy Replacement Proxy");
   expect(app).not.toContain("outreachproxy.com");
   expect(app).not.toContain("OutreachProxy");
+  expect(app).not.toContain("<ProxyProviderOffer");
+  expect(app).not.toContain('className="navbuy"');
   for (const modal of [createModal, editModal]) {
     expect(modal).toContain("Check proxy");
     expect(modal).toContain("<ProxyCheckFeedback");
   }
-  expect(proxyOffer).toContain('target="_blank"');
-  expect(proxyOffer).toContain('rel="noreferrer"');
-  // A profile that already has a proxy keeps the offer, so Edit profile shows it too.
-  expect(app).toContain('if (!result) return <ProxyProviderOffer placement="profile-dialog" />;');
-  // In the desktop app the shell plugin cancels outside-link clicks that reach <body>.
-  // The root stops them first, so the shell's allowlist opens the link.
-  expect(app).toContain(`if (event.target instanceof Element && event.target.closest('a[target="_blank"]')) event.stopPropagation();`);
-  expect(proxyOffer).toContain('aria-label={t("Buy static residential proxies from NobleProxy at the GhosterAnti user price (opens externally)")}');
-  expect(proxyOffer).toContain('replacement ? t("Buy Replacement Proxy") : t("Buy Static Residential Proxy")');
-  // The offer is an GhosterAnti-only price, not a sale banner.
-  expect(proxyOffer).toContain("GhosterAnti price");
-  expect(proxyOffer).toContain("Only GhosterAnti users pay 40% less");
-  expect(proxyOffer).not.toContain("40% OFF");
-  expect(proxyOffer).not.toContain("Need a proxy?");
   expect(app).toContain('if (k === "proxyType" || k === "host" || k === "port" || k === "user" || k === "pass")');
   expect(app).toContain('if (k === "proxy" || k === "proxyType") {\n      resetEditProxyCheck();');
   expect(app).toContain("generation === createProxyCheckGeneration.current");
@@ -237,19 +218,9 @@ test("New and Edit profile dialogs check proxies and show only relevant provider
   for (const tone of ["working", "unstable", "failed", "unavailable"]) {
     expect(styles).toContain(`.proxy-check-result.${tone}`);
   }
-  expect(styles).toContain(".proxy-referral {");
-  expect(styles).toContain(".proxy-referral:focus-visible");
-  // Both Proxies tools (check and replace) show the offer, and the page names
-  // how many profiles have no proxy. That count is Local-mode only.
   const proxiesPage = readFileSync(join(import.meta.dir, "web", "proxies.tsx"), "utf8");
-  expect(proxiesPage.match(/<ProxyProviderOffer /g)).toHaveLength(3);
-  expect(proxiesPage).toContain('<ProxyProviderOffer placement="proxies-no-proxy" missing={profilesWithoutProxy} />');
-  expect(app).toContain("const profilesWithoutProxy = isCloudMode ? 0 : profiles.filter((p) => !p.proxy?.trim()).length;");
-  expect(app).toContain('<ProxyProviderOffer placement="import-no-proxy" missing={profilesWithoutProxy} />');
-  // Sidebar cart beside Proxies opens the same offer; the icon rail hides it.
-  expect(app).toContain('className="navbuy"');
-  expect(app).toContain('href={proxyOfferUrl("sidebar-cart", language)}');
-  expect(styles).toContain(".sidebar.collapsed .navbuy { display: none; }");
+  expect(proxiesPage).not.toContain("<ProxyProviderOffer");
+  expect(proxiesPage).not.toContain("nobleproxy.com");
 });
 
 test("dashboard selects browser for new profiles", () => {
@@ -746,9 +717,10 @@ test("roster columns declare their own width and never collapse", () => {
   expect(app).toContain("const CHECKBOX_COLUMN_WIDTH = 44;");
   expect(app).toContain("const tableMinWidth = CHECKBOX_COLUMN_WIDTH + shownColumns.reduce((total, column) => total + column.width, 0);");
   expect(app).toContain('style={{ minWidth: tableMinWidth }}');
-  // Every column declares a width, so a wide window's extra space spreads
-  // proportionally across all of them — no single column hoards it.
-  expect(app).toContain("const style = { width: column.width } as CSSProperties;");
+  // Name is the one flexible column: it absorbs a wide window's spare space,
+  // while every other column keeps its declared width and the trailing Action
+  // cell stays compact instead of stretching into a dead gutter.
+  expect(app).toContain('const style = column.key === "name" ? undefined : ({ width: column.width } as CSSProperties);');
   // The Action column shows no header text — its buttons explain themselves.
   expect(app).toContain('const label = column.key === "action" ? ""');
   // Widths live in the registry only — a stray CSS width would silently win.
@@ -784,9 +756,9 @@ test("the Action column stays reachable while the roster scrolls sideways", () =
   expect(styles).toContain("position: sticky; right: 0;");
   // A sticky cell has no row behind it, so every row state repaints its own.
   expect(styles).toContain(".profile-table tbody tr.selected td.col-action { background: var(--accent-soft); }");
-  expect(styles).toContain(".profile-table thead th.col-action { z-index: 3; background: var(--surface-sunken); }");
+  expect(styles).toContain(".profile-table thead th.col-action { z-index: 3; background: var(--surface); }");
   // Hover labels must paint above the next row's sticky Action cell.
-  expect(styles).toContain(".profile-table tbody tr:hover td.col-action { background: var(--surface-sunken); z-index: 2; }");
+  expect(styles).toContain(".profile-table tbody tr:hover td.col-action { background: var(--surface-hover); z-index: 2; }");
   // The edge shadow only appears once there is content underneath it.
   expect(app).toContain("onScroll={(event) => setTableScrolled(event.currentTarget.scrollLeft > 0)}");
   expect(styles).toContain(".tablewrap.scrolled td.col-action::before");
@@ -801,7 +773,7 @@ test("small windows keep navigation and dialogs keep typed input", () => {
   // On a big monitor the WHOLE shell caps and centers as one frame — sidebar,
   // header and roster together — a six-column app cannot fill 2500px gracefully.
   expect(styles).toContain("max-width: 1704px; margin: 0 auto;");
-  expect(styles).toContain("width: min(1440px, 100% - 32px);");
+  expect(styles).toContain("width: min(1440px, 100% - 24px);");
   // Escape closes the open dialog; a stray backdrop click never discards a form.
   expect(app).toContain('if (event.key !== "Escape") return;');
   expect(app).not.toContain('className="modal-backdrop" onClick={closeCreate}');
@@ -835,27 +807,33 @@ test("no legacy arrow glyphs survive in place of icons", () => {
   }
 });
 
-test("the second accent marks identity, and the credit matches the website", () => {
-  // Two accents only work if each means something: the live build's brand blue
-  // (#3366e6) marks actions, peach marks identity. A peach button or a blue
-  // custom NO. would break that split.
-  expect(styles).toContain("--accent: #3366e6;");
-  expect(styles).toContain("--accent-2: #ff9e7a;");
-  expect(styles).toContain("td.col-no .no-text.custom { color: var(--accent-2-ink); }");
-  expect(styles).toContain("linear-gradient(150deg, var(--accent), var(--accent-2))");
+test("the palette is monochrome, and the credit matches the website", () => {
+  // One accent, no hue: near-black in light, white in dark. Identity marks (a
+  // custom NO., an avatar tile) use the same accent and separate themselves by
+  // weight instead of by a second colour.
+  expect(styles).toContain("--accent: #0a0a0a;");
+  expect(styles).toContain("--accent-fill: #0a0a0a;");
+  expect(styles).toContain("--accent-2: var(--accent);");
+  expect(styles).toContain("td.col-no .no-text.custom { color: var(--accent-ink); font-weight: 700; }");
   expect(styles).not.toMatch(/\.btn\.primary \{[^}]*--accent-2/);
-  // The accent is the logo's blue, and no trace of the old violet survives.
-  expect(logo).toContain('stroke="#2457D6"');
-  expect(styles).not.toContain("#6d4aff");
-  expect(styles).not.toContain("#8b6dff");
+  expect(styles).not.toMatch(/linear-gradient\(1[0-9]{2}deg, var\(--accent\)/);
+  // No brand blue or peach survives anywhere: the stylesheet, the inline mark
+  // and the packaged asset all carry currentColor and the neutral accent.
+  for (const retired of ["#3366e6", "#2457D6", "#ff9e7a", "#6d4aff", "#8b6dff"]) {
+    expect(styles).not.toContain(retired);
+  }
+  expect(app).not.toContain('stroke="#2457D6"');
+  expect(logo).toContain('stroke="currentColor"');
+  expect(logo).not.toContain("#2457D6");
 
   // The footer credits the project itself: no third-party agency link survives.
   expect(app).not.toContain("Developed by");
   expect(app).not.toContain("xreacher.com");
   expect(styles).not.toContain(".watermark");
-  // The footer wordmark is painted as a clipped gradient, not flat text.
+  // The footer wordmark is flat neutral text, not a clipped brand gradient.
   expect(app).toContain('<p className="footer-mark" aria-hidden="true">GhosterAnti</p>');
-  expect(styles).toContain("-webkit-background-clip: text; background-clip: text; color: transparent;");
+  expect(styles).toContain("color: var(--faint); opacity: .55;");
+  expect(styles).not.toContain("-webkit-background-clip: text");
   // It is a credit, not a control: it must not survive into the icon rail.
   expect(styles).toContain(".sidebar.collapsed .sidecredit { display: none; }");
 });
@@ -892,9 +870,11 @@ test("the dark theme is a token swap, and native controls follow it", () => {
   const rules = styles.slice(styles.indexOf("\n}", styles.indexOf(":root {")));
   expect(rules).not.toContain("linear-gradient(180deg, #ffffff");
   expect(rules).not.toMatch(/background: #fff/);
-  // Two near-black brand tiles would vanish on a dark row.
-  expect(styles).toContain(':root[data-theme="dark"] .platform-pill .glyph.pm-x');
-  // Light is the out-of-the-box default; Dark and follow-the-OS System are
+  // The platform marks are monochrome now: one neutral tile for every network,
+  // no brand gradients to keep a dark-row override for.
+  expect(styles).toContain(".platform-pill .glyph {");
+  expect(styles).not.toMatch(/\.platform-pill \.glyph\.pm-/);
+  // Dark is the out-of-the-box default; Light and follow-the-OS System are
   // opt-in from Settings. A host-only cookie survives the desktop app's changing port.
   expect(app).toContain('import { THEME_KEY, readThemeChoice, themeCookie, type ThemeChoice } from "./theme.ts";');
   expect(app).toContain("return readThemeChoice(cookies, stored);");

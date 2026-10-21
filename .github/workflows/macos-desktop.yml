@@ -120,10 +120,7 @@ jobs:
           sleep 5
           screencapture -x "$RUNNER_TEMP/evidence/dashboard.png"
 
-          # A click on an outside link must open the default browser. The offer host is turned off
-          # on this runner, so Safari keeps the full address and NobleProxy counts no visit.
-          echo "127.0.0.1 nobleproxy.com" | sudo tee -a /etc/hosts >/dev/null
-          sudo dscacheutil -flushcache
+          # A click on an outside link must open the default browser.
           ui() {
             DESKTOP_PID="$(jq -er .desktopPid "$data/agent-runtime.json")" ACTION="$1" WANTED="$2" osascript -l JavaScript -e '
               ObjC.import("stdlib");
@@ -160,18 +157,14 @@ jobs:
             for attempt in $(seq 1 20); do pgrep -x Safari >/dev/null || return 0; sleep 1; done
             return 1
           }
-          ui click 'uiElements.byName("Buy proxies from NobleProxy'
-          browser_shows "https://nobleproxy.com/t/ghosteranti?src=sidebar-cart"
-          screencapture -x "$RUNNER_TEMP/evidence/link-sidebar.png"
+          ui click 'uiElements.byName("Support")'
+          browser_shows "https://github.com/GhosterAI/GhosterAntiApp/issues"
+          screencapture -x "$RUNNER_TEMP/evidence/link-support.png"
           close_browser
           ui click 'buttons.byName("New Profile")'
           sleep 2
           # A new Chrome profile on a Mac uses Chromium 155, and the help text must say so.
           ui find 'buttons.byName("Chrome: Chromium 155 beta")'
-          ui click 'uiElements.byName("Buy static residential proxies from NobleProxy'
-          browser_shows "https://nobleproxy.com/t/ghosteranti?src=profile-dialog"
-          screencapture -x "$RUNNER_TEMP/evidence/link-new-profile.png"
-          close_browser
           ui click 'buttons.byName("Cancel")'
 
           created="$("$helper" profiles create --name ci-firefox --temporary --engine firefox)"

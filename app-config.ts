@@ -2,7 +2,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
-export type AppMode = "unconfigured" | "local" | "cloud";
+export type AppMode = "local" | "cloud" | "unconfigured";
 
 export interface AppConfig {
   version: 1;
@@ -13,7 +13,7 @@ export interface AppConfig {
 
 const DEFAULT_CONFIG: AppConfig = {
   version: 1,
-  mode: "unconfigured",
+  mode: "local",
   localAnalytics: false,
 };
 
@@ -33,24 +33,18 @@ export function parseAppConfig(value: unknown): AppConfig {
   if (!value || typeof value !== "object") throw new Error("GhosterAnti config must be an object");
   const raw = value as Record<string, unknown>;
   if (raw.version !== 1) throw new Error("unsupported GhosterAnti config version");
-  if (raw.mode !== "unconfigured" && raw.mode !== "local" && raw.mode !== "cloud") {
-    throw new Error("invalid GhosterAnti mode");
-  }
-  const cloudUrl = normalizeCloudUrl(raw.cloudUrl);
-  if (raw.mode === "cloud" && !cloudUrl) throw new Error("Cloud mode requires a Cloud URL");
   return {
     version: 1,
-    mode: raw.mode,
-    ...(cloudUrl ? { cloudUrl } : {}),
+    mode: "local",
     localAnalytics: raw.localAnalytics === true,
   };
 }
 
 export function legacyHubUrl(
-  config: AppConfig,
-  env: Record<string, string | undefined> = process.env,
+  _config: AppConfig,
+  _env: Record<string, string | undefined> = process.env,
 ): string | undefined {
-  return config.mode === "unconfigured" ? env.HUB_URL : undefined;
+  return undefined;
 }
 
 export class AppConfigStore {
@@ -74,8 +68,8 @@ export class AppConfigStore {
     return normalized;
   }
 
-  setMode(mode: Exclude<AppMode, "unconfigured">, cloudUrl?: string): AppConfig {
+  setMode(mode: AppMode = "local", _cloudUrl?: string): AppConfig {
     const current = this.read();
-    return this.write({ ...current, mode, ...(mode === "cloud" ? { cloudUrl } : { cloudUrl: undefined }) });
+    return this.write({ ...current, mode: "local", cloudUrl: undefined });
   }
 }

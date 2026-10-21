@@ -431,13 +431,11 @@ jobs:
             echo "the app did not open $1 (it opened: $(tr '\n' ' ' < "$OPENED"))"
             return 1
           }
-          click "$(wait_element "css selector" 'a[href*="src=sidebar-cart"]')"
-          opened "https://nobleproxy.com/t/ghosteranti?src=sidebar-cart"
+          click "$(wait_element "css selector" 'a[href*="GhosterAntiApp/issues"]')"
+          opened "https://github.com/GhosterAI/GhosterAntiApp/issues"
           click "$(wait_element xpath "//button[normalize-space()='New Profile']")"
           # A new Chrome profile on Linux starts on Chromium 155, and the help text must say so.
           wait_element "css selector" 'button[aria-label="Chrome: Chromium 155 beta"]' >/dev/null
-          click "$(wait_element "css selector" 'a[href*="src=profile-dialog"]')"
-          opened "https://nobleproxy.com/t/ghosteranti?src=profile-dialog"
           import -window root "$evidence/link-new-profile.png" || true
           cat "$OPENED"
           desktop="$(jq -er .desktopPid "$data/agent-runtime.json")"

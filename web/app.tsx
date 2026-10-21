@@ -4,7 +4,6 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 import "./proxies.css";
 import { ProxiesPage } from "./proxies.tsx";
-import { CartIcon, ProxyProviderOffer, proxyOfferUrl } from "./proxy-offer.tsx";
 import { TrashPage } from "./trash.tsx";
 import { parsePastedProxy } from "./proxy-input.ts";
 import { ScriptRunPanel, ScriptsPage } from "./scripts.tsx";
@@ -151,11 +150,10 @@ const PAGE_TITLES: Record<"profiles" | "scripts" | "settings" | "extensions" | "
 
 const SETTINGS_TABS = [
   { key: "account", label: "Account" },
-  { key: "team", label: "Workspace" },
   { key: "advanced", label: "Advanced" },
 ] as const;
 
-type SettingsTab = (typeof SETTINGS_TABS)[number]["key"];
+type SettingsTab = "account" | "team" | "advanced";
 
 /** Mirrors MAX_CUSTOM_NO_LENGTH in parse.ts — the server rejects anything longer. */
 const MAX_CUSTOM_NO = 12;
@@ -416,13 +414,14 @@ function useDismiss<T extends HTMLElement>(open: boolean, close: () => void) {
 /**
  * The GhosterAnti mark, inlined so it can follow the theme: the outline is
  * near-black in the packaged SVG and would vanish on a dark surface, so here it
- * takes currentColor (the theme's ink) and the eyes take the accent.
+ * takes currentColor (the theme's ink) and the eyes take the accent — white on
+ * dark, near-black on light, matching the monochrome shell.
  */
 function GhostMark({ className }: { className?: string }) {
   return (
     <svg className={className ? `ghost-mark ${className}` : "ghost-mark"} viewBox="0 0 512 512" aria-hidden="true">
       <path d="M128 400V240C128 169 185 112 256 112C327 112 384 169 384 240V400L352 368L320 400L288 368L256 400L224 368L192 400L160 368Z" stroke="currentColor" />
-      <path className="ghost-eyes" d="M216 256V288M296 256V288" stroke="#2457D6" />
+      <path className="ghost-eyes" d="M216 256V288M296 256V288" stroke="currentColor" />
     </svg>
   );
 }
@@ -487,10 +486,11 @@ function HealthSources({ sources }: { sources: HealthSource[] }) {
 }
 
 /**
- * Real brand marks for the platforms a profile can target. A letter in a colored
- * box reads as a placeholder; the actual logo is what makes a row scannable at a
+ * Real brand marks for the platforms a profile can target. A letter in a box
+ * reads as a placeholder; the actual logo is what makes a row scannable at a
  * glance. Paths are the official single-color marks on a 24x24 grid, filled (not
- * stroked) — see .brandmark in styles.css. Tile colors live in CSS as .pm-*.
+ * stroked) — see .brandmark in styles.css. The tile is monochrome (the glyph
+ * letter/logo identifies the network), so no per-platform colour lives in CSS.
  */
 const PLATFORM_MARKS: Record<string, { key: string; path: string }> = {
   "x.com": {
@@ -1062,69 +1062,51 @@ function proxyFailureMessage(t: (s: string) => string, reason: ProxyCheckResult[
 
 function ProxyCheckFeedback({ hasProxy, state }: { hasProxy: boolean; state: ProxyCheckUiState }) {
   const { t } = useTranslation();
-  if (!hasProxy) return <ProxyProviderOffer placement="profile-dialog" />;
+  if (!hasProxy) return null;
   if (state.error) {
     const invalid = state.error === "invalid";
     return (
-      <>
-        <div className={`proxy-check-result ${invalid ? "failed" : "unavailable"}`} role="status">
-          <Icon name={invalid ? "alert" : "activity"} className="sm" />
-          <span>{invalid
-            ? t("Proxy details are invalid. Check them and try again.")
-            : t("Proxy check is unavailable. Try again later.")}</span>
-        </div>
-        {invalid
-          ? <ProxyProviderOffer placement="profile-dialog-check-failed" replacement />
-          : <ProxyProviderOffer placement="profile-dialog" />}
-      </>
+      <div className={`proxy-check-result ${invalid ? "failed" : "unavailable"}`} role="status">
+        <Icon name={invalid ? "alert" : "activity"} className="sm" />
+        <span>{invalid
+          ? t("Proxy details are invalid. Check them and try again.")
+          : t("Proxy check is unavailable. Try again later.")}</span>
+      </div>
     );
   }
   const result = state.result;
-  // A profile that already has a proxy keeps the offer, so it also shows in Edit profile.
-  if (!result) return <ProxyProviderOffer placement="profile-dialog" />;
+  if (!result) return null;
   const location = [result.city, result.region, result.country].filter(Boolean).join(", ");
   const exit = [result.ip ? `Exit IP: ${result.ip}` : "", location].filter(Boolean).join(" · ");
   if (result.status === "working") {
     return (
-      <>
-        <div className="proxy-check-result working" role="status">
-          <Icon name="check" className="sm" />
-          <span><strong>{t("Proxy is working.")}</strong>{exit && <> {exit}.</>}{result.rotating && <> Rotating exit IPs detected.</>}</span>
-        </div>
-        <ProxyProviderOffer placement="profile-dialog" />
-      </>
+      <div className="proxy-check-result working" role="status">
+        <Icon name="check" className="sm" />
+        <span><strong>{t("Proxy is working.")}</strong>{exit && <> {exit}.</>}{result.rotating && <> Rotating exit IPs detected.</>}</span>
+      </div>
     );
   }
   if (result.status === "unstable") {
     return (
-      <>
-        <div className="proxy-check-result unstable" role="status">
-          <Icon name="warning" className="sm" />
-          <span><strong>{t("Proxy checks were mixed.")}</strong> {result.successes} of {result.attempts} succeeded.</span>
-        </div>
-        <ProxyProviderOffer placement="profile-dialog-check-failed" replacement />
-      </>
+      <div className="proxy-check-result unstable" role="status">
+        <Icon name="warning" className="sm" />
+        <span><strong>{t("Proxy checks were mixed.")}</strong> {result.successes} of {result.attempts} succeeded.</span>
+      </div>
     );
   }
   if (result.status === "failed") {
     return (
-      <>
-        <div className="proxy-check-result failed" role="status">
-          <Icon name="alert" className="sm" />
-          <span>{proxyFailureMessage(t, result.reason)}</span>
-        </div>
-        <ProxyProviderOffer placement="profile-dialog-check-failed" replacement />
-      </>
+      <div className="proxy-check-result failed" role="status">
+        <Icon name="alert" className="sm" />
+        <span>{proxyFailureMessage(t, result.reason)}</span>
+      </div>
     );
   }
   return (
-    <>
-      <div className="proxy-check-result unavailable" role="status">
-        <Icon name="activity" className="sm" />
-        <span>{t("Proxy check is unavailable. Try again later.")}</span>
-      </div>
-      <ProxyProviderOffer placement="profile-dialog" />
-    </>
+    <div className="proxy-check-result unavailable" role="status">
+      <Icon name="activity" className="sm" />
+      <span>{t("Proxy check is unavailable. Try again later.")}</span>
+    </div>
   );
 }
 
@@ -1313,8 +1295,6 @@ function App() {
   // One source at a time: two full-height inputs stacked made it ambiguous which
   // one the Import button would actually read.
   const [bulkSource, setBulkSource] = useState<"file" | "paste">("file");
-  // After an import, offer proxies for the profiles that have none, until dismissed.
-  const [showImportOffer, setShowImportOffer] = useState(false);
   const bulkFileRef = useRef<HTMLInputElement>(null);
   const authGeneration = useRef(0);
   const remoteMcpInFlight = useRef<Promise<void> | null>(null);
@@ -1324,13 +1304,12 @@ function App() {
   const restoreInFlight = useRef(false);
   const savedSessionRestoreEnabled = useRef(true);
   const desktopUpdateCheckStarted = useRef(false);
-  const isCloudMode = appMode?.mode === "cloud";
-  // Profiles that need a proxy. Local mode only: a Cloud profile shows no
-  // proxy until its encrypted payload is fetched, so the count would be wrong.
-  const profilesWithoutProxy = isCloudMode ? 0 : profiles.filter((p) => !p.proxy?.trim()).length;
-  const workspaceReady = appMode?.mode === "local" || (isCloudMode && cloudWorkspaceReady(cloudAuth));
-  const canEditCloud = !isCloudMode || cloudAuth?.workspace?.role === "owner" || cloudAuth?.workspace?.role === "admin" ||
-    team?.folders.some((folder) => folder.permission === "edit" && !folder.archivedAt) === true;
+  // Cloud mode is completely removed. Only Local mode is supported.
+  const isCloudMode = false;
+  // Profiles that need a proxy.
+  const profilesWithoutProxy = profiles.filter((p) => !p.proxy?.trim()).length;
+  const workspaceReady = true;
+  const canEditCloud = true;
   const canManageCloudFolders = cloudAuth?.workspace?.role === "owner" || cloudAuth?.workspace?.role === "admin";
 
   // The app resolves "system" itself and stamps the result on <html>, so the
@@ -2444,7 +2423,6 @@ function App() {
       if (r.ok) {
         closeBulk();
         await load();
-        setShowImportOffer(true);
         const issues = r.errors?.length ? ` Reported ${r.errors.length} invalid record(s); invalid proxies were quarantined for repair.` : "";
         alert(`Imported ${r.profiles} profile(s) from ${r.files} file(s).${issues}`);
       }
@@ -3115,14 +3093,9 @@ function App() {
           ) : appMode ? (
             <>
               <h1 id="onboarding-title">How do you want to use GhosterAnti?</h1>
-              <p>Choose where browser profiles live for this installation.</p>
+              <p>GhosterAnti runs locally on this device. Profile data stays on this computer.</p>
               <div className="mode-options">
-                <button className="mode-option primary" type="button" disabled={modeBusy} onClick={() => chooseMode("cloud")}>
-                  <span className="badge"><Icon name="cloud" className="lg" /></span>
-                  <strong>GhosterAnti Cloud</strong>
-                  <span>Sync profiles across authorized devices and work with your team.</span>
-                </button>
-                <button className="mode-option" type="button" disabled={modeBusy} onClick={() => chooseMode("local")}>
+                <button className="mode-option primary" type="button" disabled={modeBusy} onClick={() => chooseMode("local")}>
                   <span className="badge"><Icon name="laptop" className="lg" /></span>
                   <strong>GhosterAnti Local</strong>
                   <span>No account. Profile data stays on this computer and analytics is off.</span>
@@ -3163,9 +3136,11 @@ function App() {
     // and a floating "ACTION" label over a right-aligned cluster read as an
     // empty column. The column chooser still lists it by its registry label.
     const label = column.key === "action" ? "" : column.key === "group" && isCloudMode ? t("Folder") : t(column.label);
-    // Every column declares its width, so a wide window's extra space spreads
-    // proportionally across all of them — an even layout, no dead gap.
-    const style = { width: column.width } as CSSProperties;
+    // Name is the one flexible column: it absorbs a wide window's extra space
+    // so the trailing Action cell stays as narrow as its buttons instead of
+    // stretching into a dead gutter. Every other column keeps its declared
+    // width, and the table's min-width still guarantees none of them collapse.
+    const style = column.key === "name" ? undefined : ({ width: column.width } as CSSProperties);
     if (!column.sort) return <th key={column.key} className={`col-${column.key}`} style={style}>{label}</th>;
     const key = column.key as SortKey;
     return (
@@ -3250,19 +3225,9 @@ function App() {
             <Icon name="user" /><span className="navlabel">{t("Shared with me")}</span><span className="cnt">{sharedProfiles.length}</span>
           </button>}
           {!appMode?.legacyRemote && <>
-            <div className="navrow">
-              <button type="button" className={`navitem${view === "proxies" ? " active" : ""}`} data-tip={t("Proxies")} title={t("Proxies")} onClick={() => setView("proxies")}>
-                <Icon name="activity" /><span className="navlabel">{t("Proxies")}</span>
-              </button>
-              <a
-                className="navbuy"
-                href={proxyOfferUrl("sidebar-cart", language)}
-                target="_blank"
-                rel="noreferrer"
-                title={t("Buy proxies at the GhosterAnti price")}
-                aria-label={t("Buy proxies from NobleProxy at the GhosterAnti user price (opens externally)")}
-              ><CartIcon /></a>
-            </div>
+            <button type="button" className={`navitem${view === "proxies" ? " active" : ""}`} data-tip={t("Proxies")} title={t("Proxies")} onClick={() => setView("proxies")}>
+              <Icon name="activity" /><span className="navlabel">{t("Proxies")}</span>
+            </button>
             <button type="button" className={`navitem${view === "trash" ? " active" : ""}`} data-tip={t("Trash")} title={t("Trash")} onClick={() => setView("trash")}>
               <Icon name="trash" /><span className="navlabel">{t("Trash")}</span>
             </button>
@@ -3483,8 +3448,8 @@ function App() {
           >
             <span className="avatar"><Icon name="user" /></span>
             <span className="who">
-              <b>{isCloudMode ? cloudAuth?.user?.email ?? "Cloud account" : "Local workspace"}</b>
-              <span>{isCloudMode ? cloudAuth?.workspace?.role ?? "member" : "No account"}</span>
+              <b>{isCloudMode ? cloudAuth?.user?.email ?? t("Cloud account") : t("Local workspace")}</b>
+              <span>{isCloudMode ? cloudAuth?.workspace?.role ?? "member" : t("No account")}</span>
             </span>
             <Icon name="chevronRight" className="sm" />
           </button>
@@ -3563,11 +3528,11 @@ function App() {
         <div className="filterbar">
           <select
             className="select group-filter"
-            aria-label={isCloudMode ? "Folder filter" : "Group filter"}
+            aria-label={t(isCloudMode ? "Folder filter" : "Group filter")}
             value={group}
             onChange={(e) => selectFolder(e.target.value)}
           >
-            <option value="all">All {isCloudMode ? "folders" : "groups"}</option>
+            <option value="all">{t(isCloudMode ? "All folders" : "All groups")}</option>
             {existingGroups.map((g) => <option key={g} value={g}>{g}</option>)}
           </select>
           <div className="searchfield">
@@ -3583,12 +3548,6 @@ function App() {
           </div>
         </div>
 
-        {showImportOffer && profilesWithoutProxy > 0 && (
-          <div className="import-offer">
-            <ProxyProviderOffer placement="import-no-proxy" missing={profilesWithoutProxy} />
-            <button type="button" className="iconbtn" aria-label={t("Dismiss")} onClick={() => setShowImportOffer(false)}><Icon name="close" className="sm" /></button>
-          </div>
-        )}
 
         {filtered.length > 0 && (
           <div className="toolbar" role="status">
@@ -4058,7 +4017,7 @@ function App() {
               className={`tab${settingsTab === tab.key ? " active" : ""}`}
               onClick={() => setSettingsTab(tab.key)}
             >
-              {tab.key === "team" && isCloudMode ? t("Team") : t(tab.label)}
+              {t(tab.label)}
             </button>
           ))}
         </div>
@@ -4178,17 +4137,6 @@ function App() {
               </div>
             </div>
           </section>
-          <section className="settings-card">
-            <header><Icon name={isCloudMode ? "laptop" : "cloud"} className="sm" /><h2>{t("Switch mode")}</h2></header>
-            <div className="card-body settings-mode">
-              <p>{isCloudMode ? t("Local mode keeps this installation offline from GhosterAnti Cloud.") : t("Cloud mode requires an account and does not upload Local profiles automatically.")}</p>
-              <button className="btn" type="button" disabled={modeBusy || desktopUpdateInstalling} onClick={() => requestModeSwitch(isCloudMode ? "local" : "cloud")}>
-                <Icon name={isCloudMode ? "laptop" : "cloud"} className="sm" />
-                {t("Switch to {target}", { target: isCloudMode ? t("Local") : t("Cloud") })}
-              </button>
-            </div>
-          </section>
-          
             </>
           )}
           {settingsTab === "team" && (
@@ -4472,7 +4420,7 @@ function App() {
         <div className="modal-backdrop">
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="create-profile-title" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head" id="create-profile-title">
-              <Icon name="plus" />New profile
+              <Icon name="plus" />{t("New profile")}
               <button type="button" className="modal-close" aria-label={t("Close")} onClick={closeCreate}><Icon name="close" className="sm" /></button>
             </div>
             <div className="modal-body">
