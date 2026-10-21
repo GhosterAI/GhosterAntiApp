@@ -94,7 +94,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: bunx tauri build --bundles nsis --no-sign
+        run: bunx tauri build --bundles nsis
 
       - name: Collect release assets
         shell: pwsh
@@ -107,9 +107,9 @@ jobs:
           if (-not $installer) { throw "installer was not produced" }
           $signature = "$($installer.FullName).sig"
           if (-not (Test-Path $signature)) { throw "installer signature was not produced" }
-          $manifest = Join-Path $bundle "latest.json"
-          if (-not (Test-Path $manifest)) { throw "updater manifest was not produced" }
-          Copy-Item $manifest (Join-Path $bundle "latest-v2.json") -Force
+          $manifest = Get-ChildItem "src-tauri/target/release/bundle" -Filter "latest*.json" -Recurse | Select-Object -First 1
+          if (-not $manifest) { throw "updater manifest was not produced" }
+          Copy-Item $manifest.FullName (Join-Path $bundle "latest-v2.json") -Force
           New-Item -ItemType Directory -Force release-assets | Out-Null
           Copy-Item $installer.FullName release-assets/
           Copy-Item $signature release-assets/
