@@ -8,9 +8,9 @@ use std::{
 
 const FIREFOX_VERSION: &str = "156.0.1-beta.36";
 const FIREFOX_EXECUTABLE_NAME: &str = if cfg!(windows) {
-    "ghosteranti.exe"
+    "aliasmode.exe"
 } else {
-    "ghosteranti"
+    "aliasmode"
 };
 
 /// No installer carries CloakBrowser: the sidecar downloads it on first use.

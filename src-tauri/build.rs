@@ -45,9 +45,9 @@ fn main() {
                 .all(|component| !component.is_empty() && component != "." && component != "..")
             && firefox_executable.split(['/', '\\']).next_back()
                 == Some(if windows {
-                    "ghosteranti.exe"
+                    "aliasmode.exe"
                 } else {
-                    "ghosteranti"
+                    "aliasmode"
                 }),
         "Firefox metadata executable path is unsafe"
     );
