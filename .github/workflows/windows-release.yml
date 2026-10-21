@@ -65,6 +65,16 @@ jobs:
           "GHOSTERANTI_FIREFOX_ARCHIVE_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
           "GHOSTERANTI_FIREFOX_EXECUTABLE_SHA256=acea9ae405d02240a7a610a0048ba7c3fcaf21bd3c6dd6eb4eaf1d58fc87719a" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Reset the Bun cross-compile cache
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          foreach ($root in @("$env:USERPROFILE\.bun\install\cache", "$env:LOCALAPPDATA\bun\install\cache", "$env:BUN_INSTALL\install\cache")) {
+            if ($root -and (Test-Path $root)) {
+              Get-ChildItem $root -Filter "*baseline*" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
       - name: Prepare the desktop bundle
         shell: pwsh
         run: |
